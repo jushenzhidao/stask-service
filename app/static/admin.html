@@ -1,0 +1,672 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex, nofollow">
+<title>stask-service 控制台</title>
+<style>
+  :root {
+    --bg: #f7f7f5; --surface: #fff; --border: #e3e2dd; --border-strong: #c9c8c1;
+    --text: #23231f; --muted: #6b6a64; --faint: #94938c;
+    --up: #c0392b; --down: #1d9e75;
+    --blue: #185fa5; --blue-bg: #e6f1fb;
+    --green: #0f6e56; --green-bg: #e1f5ee;
+    --red: #a32d2d; --red-bg: #fcebeb;
+    --amber: #854f0b; --amber-bg: #faeeda;
+    --gray-bg: #f1efe8;
+    --r: 10px;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font: 14px/1.6 -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC",
+          "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+  }
+  a { color: var(--blue); }
+  .wrap { max-width: 1280px; margin: 0 auto; padding: 24px 20px 64px; }
+  header { display: flex; align-items: center; gap: 12px; margin-bottom: 4px; }
+  h1 { font-size: 17px; font-weight: 500; margin: 0; }
+  h2 { font-size: 14px; font-weight: 500; margin: 0 0 12px; }
+  .sub { color: var(--muted); font-size: 12px; margin-bottom: 20px; }
+  .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+
+  .card {
+    background: var(--surface); border: 1px solid var(--border);
+    border-radius: var(--r); padding: 16px; margin-bottom: 16px;
+  }
+  .grid { display: grid; gap: 12px; }
+  .g4 { grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); }
+  .g2 { grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); }
+
+  .kpi { background: var(--surface); border: 1px solid var(--border);
+         border-radius: var(--r); padding: 14px 16px; }
+  .kpi .label { font-size: 12px; color: var(--muted); display: flex;
+                align-items: center; gap: 6px; }
+  .kpi .value { font-size: 24px; font-weight: 500; margin-top: 6px;
+                letter-spacing: -0.3px; }
+  .kpi .foot { font-size: 12px; color: var(--faint); margin-top: 2px; }
+
+  button {
+    font: inherit; font-size: 13px; padding: 6px 12px; cursor: pointer;
+    background: var(--surface); color: var(--text);
+    border: 1px solid var(--border-strong); border-radius: 7px;
+  }
+  button:hover { background: var(--gray-bg); }
+  button.primary { background: var(--text); color: #fff; border-color: var(--text); }
+  button.primary:hover { opacity: .88; }
+  button:disabled { opacity: .45; cursor: not-allowed; }
+
+  input, select {
+    font: inherit; font-size: 13px; padding: 6px 9px; color: var(--text);
+    background: var(--surface); border: 1px solid var(--border-strong);
+    border-radius: 7px; min-width: 0;
+  }
+  input:focus, select:focus { outline: 2px solid var(--blue-bg); border-color: var(--blue); }
+
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--border); }
+  th { font-weight: 500; color: var(--muted); font-size: 12px;
+       background: var(--gray-bg); position: sticky; top: 0; }
+  tbody tr:hover { background: #fafaf8; }
+  td.num { text-align: right; font-variant-numeric: tabular-nums; }
+
+  .tag { display: inline-block; padding: 1px 8px; border-radius: 20px;
+         font-size: 12px; border: 1px solid transparent; white-space: nowrap; }
+  .t-SUCCESS  { background: var(--green-bg); color: var(--green); }
+  .t-FAILURE  { background: var(--red-bg);   color: var(--red); }
+  .t-CANCELED { background: var(--gray-bg);  color: var(--muted); }
+  .t-SUBMITTED, .t-IN_PROGRESS { background: var(--blue-bg); color: var(--blue); }
+  .t-warn { background: var(--amber-bg); color: var(--amber); }
+
+  .tabs { display: flex; gap: 4px; margin-bottom: 16px; flex-wrap: wrap; }
+  .tabs button { border-radius: 7px; }
+  .tabs button[aria-selected="true"] {
+    background: var(--text); color: #fff; border-color: var(--text);
+  }
+  .panel[hidden] { display: none; }
+
+  .bar { height: 8px; border-radius: 4px; background: var(--gray-bg); overflow: hidden; }
+  .bar > i { display: block; height: 100%; background: var(--blue); }
+
+  .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+  .spread { display: flex; justify-content: space-between; align-items: center; gap: 12px; }
+  .muted { color: var(--muted); }
+  .faint { color: var(--faint); font-size: 12px; }
+  .err { background: var(--red-bg); color: var(--red); padding: 10px 12px;
+         border-radius: 8px; font-size: 13px; margin-bottom: 12px; }
+  .ok { background: var(--green-bg); color: var(--green); padding: 10px 12px;
+        border-radius: 8px; font-size: 13px; margin-bottom: 12px; }
+
+  .cfg { display: grid; grid-template-columns: 1fr auto; gap: 10px 14px;
+         align-items: center; }
+  .cfg .name { font-size: 13px; }
+  .cfg .note { font-size: 12px; color: var(--faint); }
+  .cfg input { width: 150px; text-align: right; }
+  .dot { width: 6px; height: 6px; border-radius: 50%; background: var(--amber);
+         display: inline-block; }
+
+  dialog { border: 1px solid var(--border); border-radius: 12px; padding: 0;
+           max-width: 760px; width: 92vw; }
+  dialog::backdrop { background: rgba(0,0,0,.35); }
+  .dlg-head { padding: 14px 18px; border-bottom: 1px solid var(--border);
+              display: flex; justify-content: space-between; align-items: center; }
+  .dlg-body { padding: 18px; max-height: 68vh; overflow: auto; }
+  .kv { display: grid; grid-template-columns: 190px 1fr; gap: 6px 14px; font-size: 13px; }
+  .kv dt { color: var(--muted); }
+  .kv dd { margin: 0; word-break: break-all; }
+
+  .login { max-width: 380px; margin: 15vh auto; }
+  svg.ic { width: 15px; height: 15px; stroke: currentColor; fill: none;
+           stroke-width: 1.6; stroke-linecap: round; stroke-linejoin: round; }
+</style>
+</head>
+<body>
+
+<div class="wrap" id="login" hidden>
+  <div class="card login">
+    <h2>stask-service 控制台</h2>
+    <p class="faint" style="margin-top:-6px">
+      需要管理密钥（<span class="mono">ST_ADMIN_KEY</span>）。密钥只存本页会话，不写入地址栏。
+    </p>
+    <div id="loginErr"></div>
+    <div class="row">
+      <input type="password" id="keyInput" placeholder="管理密钥" style="flex:1"
+             autocomplete="current-password">
+      <button class="primary" id="loginBtn">进入</button>
+    </div>
+  </div>
+</div>
+
+<div class="wrap" id="app" hidden>
+  <header>
+    <h1>stask-service</h1>
+    <span class="tag t-SUBMITTED mono" id="verTag">-</span>
+    <span style="flex:1"></span>
+    <select id="window">
+      <option value="3600">近 1 小时</option>
+      <option value="21600">近 6 小时</option>
+      <option value="86400" selected>近 24 小时</option>
+      <option value="604800">近 7 天</option>
+    </select>
+    <button id="refreshBtn">
+      <svg class="ic" viewBox="0 0 24 24"><path d="M21 12a9 9 0 1 1-3-6.7"/><path d="M21 4v5h-5"/></svg>
+    </button>
+    <button id="logoutBtn">退出</button>
+  </header>
+  <div class="sub mono" id="envLine">-</div>
+
+  <div id="banner"></div>
+
+  <div class="tabs" role="tablist">
+    <button role="tab" data-tab="ov" aria-selected="true">概览</button>
+    <button role="tab" data-tab="tk" aria-selected="false">任务</button>
+    <button role="tab" data-tab="cf" aria-selected="false">配置</button>
+    <button role="tab" data-tab="op" aria-selected="false">运维</button>
+  </div>
+
+  <section class="panel" id="p-ov">
+    <div class="grid g4" id="kpis"></div>
+    <div class="grid g2">
+      <div class="card">
+        <h2>状态分布</h2>
+        <div id="statusDist"></div>
+      </div>
+      <div class="card">
+        <h2>耗时分位（成功任务）</h2>
+        <div id="durations"></div>
+      </div>
+    </div>
+    <div class="grid g2">
+      <div class="card">
+        <h2>失败原因 Top 10</h2>
+        <div id="topFail"></div>
+      </div>
+      <div class="card">
+        <h2>模型分布 Top 10</h2>
+        <div id="topModel"></div>
+      </div>
+    </div>
+  </section>
+
+  <section class="panel" id="p-tk" hidden>
+    <div class="card">
+      <div class="row" style="margin-bottom:12px">
+        <select id="fStatus">
+          <option value="">全部状态</option>
+          <option>SUBMITTED</option><option>IN_PROGRESS</option>
+          <option>SUCCESS</option><option>FAILURE</option><option>CANCELED</option>
+        </select>
+        <input id="fModel" placeholder="模型" style="width:150px">
+        <select id="fTaskIdMode" title="task_id 匹配方式">
+          <option value="exact" selected>task_id 精确</option>
+          <option value="prefix">task_id 前缀</option>
+        </select>
+        <input id="fTaskId" placeholder="完整 task_id" style="width:190px">
+        <label class="row" style="gap:5px;font-size:13px">
+          <input type="checkbox" id="fRecon" style="min-width:auto"> 仅待对账
+        </label>
+        <button class="primary" id="searchBtn">查询</button>
+        <span style="flex:1"></span>
+        <span class="faint" id="tkTotal"></span>
+      </div>
+      <div class="faint" style="margin:-6px 0 10px">
+        <svg class="ic" viewBox="0 0 24 24" style="vertical-align:-3px">
+          <circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/>
+        </svg>
+        task_id 支持两种检索：<b style="font-weight:500">精确</b>要求完整一致；
+        <b style="font-weight:500">前缀</b>匹配以该串开头的任务（如
+        <span class="mono">img_</span>）。不支持任意片段搜索——那会让 task_id
+        索引失效，全表扫描拖垮看板。
+      </div>
+      <div id="tkErr"></div>
+      <div style="overflow:auto;max-height:62vh">
+        <table>
+          <thead><tr>
+            <th>task_id</th><th>状态</th><th>模型</th><th>路径</th>
+            <th class="num">上游</th><th class="num">耗时</th>
+            <th class="num">字节</th><th>创建</th>
+          </tr></thead>
+          <tbody id="tkBody"></tbody>
+        </table>
+      </div>
+      <div class="row" style="margin-top:12px">
+        <button id="prevBtn">上一页</button>
+        <button id="nextBtn">下一页</button>
+        <span class="faint" id="pageInfo"></span>
+      </div>
+    </div>
+  </section>
+
+  <section class="panel" id="p-cf" hidden>
+    <div class="card">
+      <div class="spread" style="margin-bottom:14px">
+        <div>
+          <h2 style="margin:0">运行时配置</h2>
+          <div class="faint">
+            改动立即生效，无需重启。<span class="dot"></span> 表示该项已被覆盖（不再跟随 .env）。
+            多副本部署时其余进程最多 5 秒后生效。
+          </div>
+        </div>
+        <div class="row">
+          <button id="cfgReload">重新读取</button>
+          <button id="cfgResetAll">全部回落 .env</button>
+          <button class="primary" id="cfgSave">保存改动</button>
+        </div>
+      </div>
+      <div id="cfgErr"></div>
+      <div id="cfgGroups"></div>
+    </div>
+    <div class="card">
+      <h2>只读项（安全边界，不可在此修改）</h2>
+      <div class="faint" style="margin-bottom:10px">
+        这些项要改必须改 <span class="mono">.env</span> 并重启。开放它们等于把安全防线挂到网上。
+      </div>
+      <table><tbody id="immutable"></tbody></table>
+    </div>
+  </section>
+
+  <section class="panel" id="p-op" hidden>
+    <div class="card">
+      <h2>手工触发定时任务</h2>
+      <div class="faint" style="margin-bottom:12px">
+        正常由 scheduler 按 cron 自动执行，这里用于排障时立即跑一轮。
+      </div>
+      <div class="row">
+        <button data-job="reconcile">超时对账</button>
+        <button data-job="stale">卡死任务扫描</button>
+        <button data-job="slots">并发槽校准</button>
+        <button data-job="purge">清理超期结果</button>
+      </div>
+      <pre class="mono" id="jobOut" style="margin:14px 0 0;font-size:12px;
+           background:var(--gray-bg);padding:12px;border-radius:8px;
+           overflow:auto;display:none"></pre>
+    </div>
+    <div class="card">
+      <h2>待对账任务</h2>
+      <div class="faint" style="margin-bottom:10px">
+        超时或卡死的任务在此排队。对账会查消费日志定性：查到扣费补记成功、
+        确认无扣费判失败、查询失败保持挂起。
+      </div>
+      <div style="overflow:auto;max-height:44vh">
+        <table>
+          <thead><tr><th>task_id</th><th>状态</th><th>原因</th><th>创建</th><th></th></tr></thead>
+          <tbody id="reconBody"></tbody>
+        </table>
+      </div>
+    </div>
+  </section>
+</div>
+
+<dialog id="dlg">
+  <div class="dlg-head">
+    <strong class="mono" id="dlgTitle" style="font-weight:500"></strong>
+    <button onclick="document.getElementById('dlg').close()">关闭</button>
+  </div>
+  <div class="dlg-body"><dl class="kv" id="dlgBody"></dl></div>
+</dialog>
+
+<script>
+"use strict";
+const KEY_STORE = "stask_admin_key";
+const $ = (id) => document.getElementById(id);
+// sessionStorage 在无痕模式、沙箱 iframe、file:// 协议下访问会抛 SecurityError。
+// 裸调用会让整个脚本在第一行就停止执行——页面全白、登录框都出不来。
+// 实测症状：agent-browser 里 snapshot 显示 "(empty page)"。
+const store = {
+  get(k) { try { return sessionStorage.getItem(k) || ""; } catch { return ""; } },
+  set(k, v) { try { sessionStorage.setItem(k, v); } catch { /* 降级为仅本页有效 */ } },
+  del(k) { try { sessionStorage.removeItem(k); } catch { /* 同上 */ } },
+};
+let KEY = store.get(KEY_STORE);
+let offset = 0, limit = 50, lastTotal = 0, cfgDirty = {};
+
+const esc = (s) => String(s ?? "").replace(/[&<>"']/g,
+  (c) => ({ "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;" }[c]));
+
+function ago(ts) {
+  if (!ts) return "-";
+  const d = Math.floor(Date.now() / 1000) - ts;
+  if (d < 60) return d + " 秒前";
+  if (d < 3600) return Math.floor(d / 60) + " 分钟前";
+  if (d < 86400) return Math.floor(d / 3600) + " 小时前";
+  return Math.floor(d / 86400) + " 天前";
+}
+function bytes(n) {
+  n = Number(n || 0);
+  if (!n) return "-";
+  if (n < 1024) return n + " B";
+  if (n < 1048576) return (n / 1024).toFixed(1) + " KB";
+  return (n / 1048576).toFixed(2) + " MB";
+}
+function dur(s) { return s ? (s < 60 ? s + "s" : Math.floor(s / 60) + "m" + (s % 60) + "s") : "-"; }
+
+async function api(path, opts = {}) {
+  const res = await fetch("/admin/api" + path, {
+    ...opts,
+    headers: { "X-Admin-Key": KEY, "Content-Type": "application/json", ...(opts.headers || {}) },
+  });
+  if (res.status === 401) { logout("密钥无效或已失效"); throw new Error("unauthorized"); }
+  const text = await res.text();
+  let data = null;
+  try { data = text ? JSON.parse(text) : null; } catch { data = { raw: text }; }
+  if (!res.ok) throw new Error(data?.error?.message || data?.detail || ("HTTP " + res.status));
+  return data;
+}
+
+function banner(msg, kind) {
+  $("banner").innerHTML = msg ? `<div class="${kind || "err"}">${esc(msg)}</div>` : "";
+  if (msg) setTimeout(() => { $("banner").innerHTML = ""; }, 6000);
+}
+
+function logout(msg) {
+  KEY = ""; store.del(KEY_STORE);
+  $("app").hidden = true; $("login").hidden = false;
+  $("loginErr").innerHTML = msg ? `<div class="err">${esc(msg)}</div>` : "";
+}
+
+const ICONS = {
+  total: '<path d="M4 6h16M4 12h16M4 18h10"/>',
+  ok: '<path d="M20 6 9 17l-5-5"/>',
+  active: '<circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/>',
+  warn: '<path d="M12 9v4M12 17h.01"/><path d="M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0Z"/>',
+};
+
+async function loadOverview() {
+  const w = $("window").value;
+  const d = await api("/overview?window=" + w);
+  const s = d.service || {};
+  $("verTag").textContent = "v" + (s.version || "?");
+  $("envLine").textContent =
+    `env=${s.env}  platform=${s.platform}  upstream=${s.upstream_default}` +
+    `  sweep=${s.sweep_enabled ? "on" : "off"}  配置覆盖=${s.override_count}`;
+  if (!s.sweep_enabled) banner("定时任务总开关处于关闭状态：对账、卡死扫描、结果清理均不会运行。", "err");
+
+  const rate = d.success_rate === null || d.success_rate === undefined
+    ? "-" : (d.success_rate * 100).toFixed(1) + "%";
+  const kpi = (label, icon, value, foot) => `
+    <div class="kpi">
+      <div class="label"><svg class="ic" viewBox="0 0 24 24">${icon}</svg>${esc(label)}</div>
+      <div class="value">${esc(value)}</div>
+      <div class="foot">${esc(foot)}</div>
+    </div>`;
+  $("kpis").innerHTML =
+    kpi("窗口内任务", ICONS.total, d.total, "创建于所选时间范围") +
+    kpi("成功率", ICONS.ok, rate, "SUCCESS / (SUCCESS + FAILURE)") +
+    kpi("当前在途", ICONS.active, d.active_total, "SUBMITTED + IN_PROGRESS，全时段") +
+    kpi("待对账", ICONS.warn, d.pending_reconcile,
+        d.pending_reconcile ? "存在超时或卡死任务，需关注" : "无异常挂起");
+
+  const counts = d.status_counts || {};
+  const max = Math.max(1, ...Object.values(counts));
+  const order = ["SUCCESS", "FAILURE", "IN_PROGRESS", "SUBMITTED", "CANCELED"];
+  const keys = order.filter((k) => counts[k]).concat(
+    Object.keys(counts).filter((k) => !order.includes(k)));
+  $("statusDist").innerHTML = keys.length ? keys.map((k) => `
+    <div style="margin-bottom:10px">
+      <div class="spread" style="font-size:13px;margin-bottom:4px">
+        <span class="tag t-${esc(k)}">${esc(k)}</span>
+        <span class="mono">${counts[k]}</span>
+      </div>
+      <div class="bar"><i style="width:${(counts[k] / max * 100).toFixed(1)}%"></i></div>
+    </div>`).join("") : '<div class="faint">窗口内暂无数据</div>';
+
+  const du = d.duration_seconds || {};
+  $("durations").innerHTML = du.count ? `
+    <div class="grid g4" style="gap:8px">
+      ${[["p50", du.p50], ["p95", du.p95], ["p99", du.p99], ["最大", du.max]]
+        .map(([k, v]) => `<div><div class="faint">${k}</div>
+          <div style="font-size:19px;font-weight:500">${dur(v)}</div></div>`).join("")}
+    </div>
+    <div class="faint" style="margin-top:10px">样本 ${du.count} 个成功任务（start → finish）</div>`
+    : '<div class="faint">窗口内暂无成功任务</div>';
+
+  const rank = (rows, keyName, el, empty) => {
+    if (!rows || !rows.length) { $(el).innerHTML = `<div class="faint">${empty}</div>`; return; }
+    const m = Math.max(1, ...rows.map((r) => r.count));
+    $(el).innerHTML = rows.map((r) => `
+      <div style="margin-bottom:9px">
+        <div class="spread" style="font-size:13px;margin-bottom:3px">
+          <span class="mono" style="word-break:break-all">${esc(r[keyName])}</span>
+          <span class="mono">${r.count}</span>
+        </div>
+        <div class="bar"><i style="width:${(r.count / m * 100).toFixed(1)}%"></i></div>
+      </div>`).join("");
+  };
+  rank(d.top_failures, "reason", "topFail", "窗口内无失败任务");
+  rank(d.top_models, "model", "topModel", "窗口内暂无数据");
+}
+
+async function loadTasks() {
+  const q = new URLSearchParams({ limit, offset });
+  if ($("fStatus").value) q.set("status", $("fStatus").value);
+  if ($("fModel").value.trim()) q.set("model", $("fModel").value.trim());
+  const tid = $("fTaskId").value.trim();
+  // 后端契约：task_id 精确匹配、task_id_prefix 前缀匹配，二者互斥。
+  // 旧版无论用户输入什么都发 task_id，片段输入必然空结果。
+  if (tid) q.set($("fTaskIdMode").value === "prefix" ? "task_id_prefix" : "task_id", tid);
+  if ($("fRecon").checked) q.set("reconcile_only", "true");
+  const w = $("window").value;
+  if (w) q.set("since", w);
+
+  $("tkErr").innerHTML = "";
+  let d;
+  try {
+    d = await api("/tasks?" + q);
+  } catch (e) {
+    // 400（含 % 等通配符、超长、参数互斥）就地显示在筛选栏下方，
+    // 不冒泡到 show()/翻页的未捕获拒绝，也不让表格停在过期数据上。
+    if (e.message !== "unauthorized") {
+      $("tkErr").innerHTML = `<div class="err">${esc(e.message)}</div>`;
+    }
+    $("tkBody").innerHTML = '<tr><td colspan="8" class="faint">查询未执行</td></tr>';
+    $("tkTotal").textContent = "";
+    $("pageInfo").textContent = "";
+    $("prevBtn").disabled = offset === 0;
+    $("nextBtn").disabled = true;
+    return;
+  }
+  lastTotal = d.total;
+  $("tkTotal").textContent = `共 ${d.total} 条`;
+  $("tkBody").innerHTML = d.items.length ? d.items.map((t) => `
+    <tr>
+      <td><a href="#" class="mono" data-tid="${esc(t.task_id)}"
+             style="text-decoration:none">${esc(t.task_id.slice(0, 22))}…</a>
+          ${t.reconcile_pending ? '<span class="tag t-warn">待对账</span>' : ""}</td>
+      <td><span class="tag t-${esc(t.status)}">${esc(t.status)}</span></td>
+      <td>${esc(t.model || "-")}</td>
+      <td class="mono faint">${esc(t.request_path || "-")}</td>
+      <td class="num mono">${esc(t.upstream_status || "-")}</td>
+      <td class="num">${dur(t.duration)}</td>
+      <td class="num">${t.result_purged ? '<span class="faint">已清理</span>' : bytes(t.response_bytes)}</td>
+      <td class="faint">${ago(t.created_at)}</td>
+    </tr>`).join("") : '<tr><td colspan="8" class="faint">无匹配任务</td></tr>';
+
+  $("pageInfo").textContent = `${offset + 1} – ${Math.min(offset + limit, d.total)}`;
+  $("prevBtn").disabled = offset === 0;
+  $("nextBtn").disabled = offset + limit >= d.total;
+  $("tkBody").querySelectorAll("a[data-tid]").forEach((a) =>
+    a.onclick = (e) => { e.preventDefault(); showTask(a.dataset.tid); });
+}
+
+async function showTask(id) {
+  const d = await api("/tasks/" + encodeURIComponent(id));
+  $("dlgTitle").textContent = d.task_id;
+  const rows = [
+    ["状态", `<span class="tag t-${esc(d.status)}">${esc(d.status)}</span>` +
+             (d.reconcile_pending ? ' <span class="tag t-warn">待对账</span>' : "")],
+    ["失败原因", d.fail_reason || "-"],
+    ["模型", d.model || "-"],
+    ["请求", `${esc(d.request_method)} ${esc(d.request_path)}${d.request_query ? "?" + esc(d.request_query) : ""}`],
+    ["上游地址", d.upstream_base_url || "-"],
+    ["上游状态码", d.upstream_status || "-"],
+    ["响应类型", d.upstream_content_type || "-"],
+    ["响应大小", d.result_purged ? "已按 TTL 清理" : bytes(d.response_bytes)],
+    ["用户 / 渠道", `${d.user_id} / ${d.channel_id || "未回填"}`],
+    ["创建", d.created_at ? new Date(d.created_at * 1000).toLocaleString() : "-"],
+    ["开始 / 结束", `${d.start_time ? new Date(d.start_time * 1000).toLocaleTimeString() : "-"}
+                    / ${d.finish_time ? new Date(d.finish_time * 1000).toLocaleTimeString() : "-"}`],
+    ["派发轮次", d.dispatch_epoch],
+    ["幂等键", d.idempotency_key || "-"],
+    ["回调", d.callback_url ? `${esc(d.callback_url)}（${d.callback_delivered === true ? "已送达" :
+              d.callback_delivered === false ? "已放弃" : "待推送"}）` : "未配置"],
+    ["对账原因", d.reconcile_reason || "-"],
+    ["扣费记录", d.reconcile_charge_id || "-"],
+    ["令牌会话", d.token_session?.exists
+        ? `存在，剩余 ${d.token_session.ttl_seconds}s` : "不存在（已清理或已过期）"],
+    ["该用户在途占槽", d.slots_in_use],
+  ];
+  let html = rows.map(([k, v]) => `<dt>${esc(k)}</dt><dd>${v}</dd>`).join("");
+  if (d.status === "SUBMITTED" || d.status === "IN_PROGRESS") {
+    html += `<dt>操作</dt><dd>
+      <button id="rq">重投队列</button>
+      <div class="faint" style="margin-top:6px">
+        仅重发队列消息，不清派发锁——锁在意味着可能已调用上游、可能已扣费，
+        worker 会转为待对账而不是再打一次。
+      </div></dd>`;
+  }
+  $("dlgBody").innerHTML = html;
+  const rq = $("rq");
+  if (rq) rq.onclick = async () => {
+    rq.disabled = true;
+    try { await api(`/tasks/${encodeURIComponent(d.task_id)}/requeue`, { method: "POST" });
+          banner("已重投队列", "ok"); $("dlg").close(); loadTasks(); }
+    catch (e) { banner(e.message); rq.disabled = false; }
+  };
+  $("dlg").showModal();
+}
+
+async function loadConfig() {
+  const d = await api("/config");
+  cfgDirty = {};
+  $("cfgGroups").innerHTML = d.groups.map((g) => `
+    <div style="margin-bottom:20px">
+      <div class="spread" style="border-bottom:1px solid var(--border);
+           padding-bottom:6px;margin-bottom:10px">
+        <strong style="font-weight:500;font-size:13px">${esc(g.name)}</strong>
+      </div>
+      <div class="cfg">
+        ${g.items.map((it) => `
+          <div>
+            <div class="name">${esc(it.label)}
+              ${it.overridden ? '<span class="dot" title="已覆盖"></span>' : ""}
+            </div>
+            <div class="note mono">${esc(it.key)}${it.note ? " · " + esc(it.note) : ""}</div>
+          </div>
+          ${it.kind === "bool"
+            ? `<select data-key="${esc(it.key)}">
+                 <option value="true" ${it.value ? "selected" : ""}>开启</option>
+                 <option value="false" ${!it.value ? "selected" : ""}>关闭</option>
+               </select>`
+            : `<input class="mono" data-key="${esc(it.key)}" value="${esc(it.value)}"
+                 ${it.min !== null ? `min="${it.min}"` : ""}
+                 ${it.max !== null ? `max="${it.max}"` : ""}>`}
+        `).join("")}
+      </div>
+    </div>`).join("");
+  $("cfgGroups").querySelectorAll("[data-key]").forEach((el) => {
+    el.addEventListener("change", () => { cfgDirty[el.dataset.key] = el.value; });
+  });
+  $("immutable").innerHTML = d.immutable.map((i) =>
+    `<tr><td class="mono" style="width:230px">${esc(i.key)}</td>
+         <td class="faint">${esc(i.reason)}</td></tr>`).join("");
+}
+
+async function loadReconcile() {
+  const d = await api("/tasks?reconcile_only=true&limit=100");
+  $("reconBody").innerHTML = d.items.length ? d.items.map((t) => `
+    <tr>
+      <td class="mono">${esc(t.task_id.slice(0, 24))}…</td>
+      <td><span class="tag t-${esc(t.status)}">${esc(t.status)}</span></td>
+      <td class="faint">${esc(t.reconcile_reason || "-")}</td>
+      <td class="faint">${ago(t.created_at)}</td>
+      <td><button data-tid="${esc(t.task_id)}">详情</button></td>
+    </tr>`).join("") : '<tr><td colspan="5" class="faint">无待对账任务</td></tr>';
+  $("reconBody").querySelectorAll("button[data-tid]").forEach((b) =>
+    b.onclick = () => showTask(b.dataset.tid));
+}
+
+const LOADERS = { ov: loadOverview, tk: loadTasks, cf: loadConfig, op: loadReconcile };
+let current = "ov";
+
+async function show(tab) {
+  current = tab;
+  document.querySelectorAll('[role="tab"]').forEach((b) =>
+    b.setAttribute("aria-selected", String(b.dataset.tab === tab)));
+  ["ov", "tk", "cf", "op"].forEach((t) => { $("p-" + t).hidden = t !== tab; });
+  try { await LOADERS[tab](); } catch (e) { banner(e.message); }
+}
+
+document.querySelectorAll('[role="tab"]').forEach((b) =>
+  b.onclick = () => show(b.dataset.tab));
+$("refreshBtn").onclick = () => show(current);
+$("window").onchange = () => show(current);
+$("logoutBtn").onclick = () => logout("");
+$("searchBtn").onclick = () => { offset = 0; loadTasks().catch((e) => banner(e.message)); };
+$("prevBtn").onclick = () => { offset = Math.max(0, offset - limit); loadTasks(); };
+$("nextBtn").onclick = () => { if (offset + limit < lastTotal) { offset += limit; loadTasks(); } };
+$("fTaskId").addEventListener("keydown", (e) => { if (e.key === "Enter") $("searchBtn").click(); });
+$("fTaskIdMode").onchange = () => {
+  $("fTaskId").placeholder =
+    $("fTaskIdMode").value === "prefix" ? "task_id 开头，如 img_" : "完整 task_id";
+};
+
+$("cfgReload").onclick = () => loadConfig().catch((e) => banner(e.message));
+$("cfgSave").onclick = async () => {
+  if (!Object.keys(cfgDirty).length) { banner("没有改动", "ok"); return; }
+  $("cfgErr").innerHTML = "";
+  try {
+    await api("/config", { method: "PUT", body: JSON.stringify(cfgDirty) });
+    banner("配置已生效", "ok");
+    await loadConfig();
+  } catch (e) { $("cfgErr").innerHTML = `<div class="err">${esc(e.message)}</div>`; }
+};
+$("cfgResetAll").onclick = async () => {
+  if (!confirm("清空所有运行时覆盖，全部回落 .env 与代码默认值？")) return;
+  try { await api("/config/reset", { method: "POST", body: JSON.stringify(null) });
+        banner("已全部回落", "ok"); await loadConfig(); }
+  catch (e) { banner(e.message); }
+};
+
+document.querySelectorAll("[data-job]").forEach((b) => b.onclick = async () => {
+  b.disabled = true;
+  try {
+    const out = await api("/jobs/" + b.dataset.job, { method: "POST" });
+    $("jobOut").style.display = "block";
+    $("jobOut").textContent = b.textContent.trim() + "  →  " + JSON.stringify(out, null, 2);
+    await loadReconcile();
+  } catch (e) { banner(e.message); } finally { b.disabled = false; }
+});
+
+$("loginBtn").onclick = async () => {
+  const v = $("keyInput").value.trim();
+  if (!v) return;
+  KEY = v;
+  try {
+    await api("/overview?window=3600");
+    store.set(KEY_STORE, v);
+    $("login").hidden = true; $("app").hidden = false;
+    show("ov");
+  } catch (e) {
+    // 401 已由 api() 处理；其余错误留在登录页并显示原因
+    if ($("login").hidden) logout(e.message || "无法连接服务");
+    else $("loginErr").innerHTML = `<div class="err">${esc(e.message)}</div>`;
+  }
+};
+$("keyInput").addEventListener("keydown", (e) => { if (e.key === "Enter") $("loginBtn").click(); });
+
+(async () => {
+  if (!KEY) { $("login").hidden = false; return; }
+  try {
+    await api("/overview?window=3600");
+    $("app").hidden = false;
+    show("ov");
+  } catch (e) {
+    // 401 已由 api() 跳登录页。其余（网络错误/服务未就绪）必须**主动**回登录页
+    // 并给出原因——否则 login 与 app 双双 hidden，用户看到的是白屏。
+    if ($("app").hidden && $("login").hidden) logout(e.message || "无法连接服务");
+  }
+})();
+</script>
+</body>
+</html>

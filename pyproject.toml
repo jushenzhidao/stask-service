@@ -1,0 +1,66 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "stask-service"
+version = "0.1.0"
+description = "同步转异步任务网关：给 new-api 同步生成 API 加 /async 前缀即任务化"
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi==0.115.14",
+    "uvicorn==0.34.0",
+    "gunicorn==23.0.0",
+    "pydantic==2.11.7",
+    "pydantic-settings==2.9.1",
+    "sqlalchemy[asyncio]==2.0.41",
+    "asyncmy==0.2.10",
+    # MySQL 8+ 默认认证插件是 caching_sha2_password，asyncmy 走这条路径时
+    # 必须有 cryptography，否则连接直接抛
+    # RuntimeError: 'cryptography' package is required...
+    # 实测遗漏它的症状是 /healthz/ready 报 db fail: RuntimeError
+    "cryptography==44.0.0",
+    "redis==5.2.1",
+    "httpx[http2]==0.28.1",
+    "taskiq==0.11.18",
+    "taskiq-redis==1.0.2",
+    "loguru==0.7.3",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest==8.3.5",
+    "pytest-asyncio==0.26.0",
+    "ruff==0.11.13",
+    "mypy==1.15.0",
+    "respx==0.22.0",
+]
+
+[tool.setuptools.packages.find]
+include = ["app*"]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "ASYNC", "RUF"]
+# I001 关：import 分组顺序不强制（中文注释块常打断分组）
+# RUF001/2/3：中文全角标点在字符串/docstring/注释里是常态，放行
+ignore = ["I001", "E501", "RUF001", "RUF002", "RUF003"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["B008"]
+"app/routers/*" = ["B008"]        # FastAPI Depends(...) 默认参数惯用法
+"app/deps/*" = ["B008"]
+"app/queue.py" = ["B008"]         # taskiq TaskiqDepends() 同理
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+testpaths = ["tests"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = false
+ignore_missing_imports = true

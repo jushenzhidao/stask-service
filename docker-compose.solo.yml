@@ -1,0 +1,60 @@
+name: stask-solo
+
+# 单容器模式：web + worker + scheduler 跑在同一个进程里（app/standalone.py）。
+# 适合单机试用、小流量生产、本地开发。
+#
+# 什么时候该换回 docker-compose.yml（三容器）：
+#   - 提交 QPS > 200
+#   - 在途任务常态 > 500
+#   - 需要滚动重启 web 而不中断在途任务
+#
+# 与 docker-compose.yml 的另一个区别：这里**不需要 .env 也能起**——
+# 全部配置有内置默认值，只是默认指向 127.0.0.1 的依赖。
+
+services:
+  stask:
+    build: .
+    image: ghcr.io/aichatfire/stask-service:latest
+    restart: unless-stopped
+    command: ["python", "-m", "app.standalone"]
+    ports:
+      - "8000:8000"
+    environment:
+      # 单容器里 Redis 是同 compose 的服务名
+      ST_REDIS_URL: redis://redis:6379/0
+      # 下面三个必须按实际环境改（或改用 env_file）
+      ST_DATABASE_URL: ${ST_DATABASE_URL:-mysql+asyncmy://root:root@host.docker.internal:3306/newapi?charset=utf8mb4}
+      ST_BILLING_SVC_URL: ${ST_BILLING_SVC_URL:-http://host.docker.internal:8080}
+      ST_NEWAPI_BASE_URL: ${ST_NEWAPI_BASE_URL:-http://host.docker.internal:3000}
+      ST_UPSTREAM_ALLOWLIST: ${ST_UPSTREAM_ALLOWLIST:-host.docker.internal:3000,127.0.0.1:3000,newapi:3000}
+      # 留空则整个管理面 404（默认不开启）
+      ST_ADMIN_KEY: ${ST_ADMIN_KEY:-}
+      ST_LOG_LEVEL: ${ST_LOG_LEVEL:-INFO}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"    # Linux 上让容器能回连宿主机
+    depends_on:
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c",
+             "import urllib.request;urllib.request.urlopen('http://127.0.0.1:8000/healthz/live', timeout=2)"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+    stop_grace_period: 60s
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: redis-server --appendonly yes --appendfsync everysec --maxmemory-policy noeviction
+    volumes:
+      - redis-solo:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+volumes:
+  redis-solo:
