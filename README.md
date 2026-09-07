@@ -29,16 +29,14 @@ make check       # 三项门禁：ruff + mypy + pytest（不需要 MySQL/Redis�
 make up          # 起全套（web + worker + redis）
 ```
 
-`make` 无参数列出所有命令。三种运行形态按需选：
+`make` 无参数列出所有命令。两种运行形态按需选：
 
 | 形态 | 命令 | 适用 |
 |---|---|---|
-| 单容器 | `make solo` | 单机试用、小流量生产。web+worker+scheduler 同进程，**免 .env** |
 | 三容器 | `make up` | 标准部署，worker 可独立扩副本 |
-| 本机单进程 | `make standalone` | 本地开发，一条命令起全套 |
+| 本机单进程 | `make standalone` | 本地开发、单机试用，一条命令起全套且**免 .env** |
 
-从 `solo` 换到 `up` 的标准：提交 QPS > 200、在途常态 > 500、或需要滚动重启 web
-而不中断在途任务。
+worker 需要扩副本或要滚动重启 web 而不中断在途任务时，从 `standalone` 换到 `up`。
 
 接真实环境时 `.env` 至少改三项：`ST_DATABASE_URL`（指向 new-api 那个库）、
 `ST_BILLING_SVC_URL`、`ST_UPSTREAM_ALLOWLIST`。

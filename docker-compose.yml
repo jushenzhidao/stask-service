@@ -5,7 +5,7 @@ services:
     build: .
     image: ghcr.io/aichatfire/stask-service:latest
     restart: unless-stopped
-    # .env 必须存在（make setup 会自动生成）；想免文件启动用 docker-compose.solo.yml
+    # .env 必须存在（make setup 会自动生成）
     env_file: .env
     environment:
       ST_REDIS_URL: ${ST_REDIS_URL:-redis://redis:6379/0}

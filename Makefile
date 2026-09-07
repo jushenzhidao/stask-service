@@ -46,9 +46,6 @@ up:  ## compose 起全套（web + worker + redis）
 	@echo "等待就绪..." && sleep 3
 	@curl -sf http://127.0.0.1:8000/healthz/ready | head -c 400 || echo "尚未就绪，看 make logs"
 
-solo:  ## compose 单容器模式（web+worker+scheduler 同进程）
-	docker compose -f docker-compose.solo.yml up -d --build
-
 down:  ## 停止并移除容器
 	docker compose down
 
