@@ -1,7 +1,7 @@
 """HTTP 客户端工厂：进程级共享 ``AsyncClient``（连接池 keep-alive 复用）。
 
 为什么必须共享：提交链路一次就有 inspect + balance 两个控制面调用，
-worker 侧还有 relay 调用。每次新建 AsyncClient 等于每个请求都付完整
+worker 侧还有上游调用。每次新建 AsyncClient 等于每个请求都付完整
 TCP + TLS 握手，握手开销会成为提交链路 P99 的主要来源。
 
 调用方**不得** ``aclose()`` 返回值；进程退出由 ``close_all()``

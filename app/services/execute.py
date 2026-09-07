@@ -2,7 +2,7 @@
 
     出队 → CAS SUBMITTED→IN_PROGRESS
     → 派发锁 SET NX（TTL=超时）；锁被占 → 不重发，转超时对账
-    → 取 sk → 调 new-api relay（原样 method/path/query/body + X-Task-Id）
+    → 取 sk → 调上游同步接口（原样 method/path/query/body + X-Task-Id）
     → 分流 → 终态落库（gzip）→ 释放槽 + 清会话 → 可选回调
 
 **派发锁是这个模块的心脏**。队列是 at-least-once，崩溃/重启会重投同一个
@@ -164,13 +164,13 @@ async def run(task_id: str) -> None:
         )
         return
 
-    # ---- 4. 调 new-api relay ----
+    # ---- 4. 调上游（同步接口，HTTP 一次调用）----
     await _dispatch(task_id, data, raw_token, token_hash, callback_url)
 
 
 async def _dispatch(task_id: str, data: dict, raw_token: str,
                     token_hash: str, callback_url: str) -> None:
-    base_url = str(data.get("upstream_base_url") or settings.newapi_base_url)
+    base_url = str(data.get("upstream_base_url") or settings.upstream_base_url)
     method = str(data.get("request_method") or "POST").upper()
     path = str(data.get("request_path") or "/")
     query = str(data.get("request_query") or "")
@@ -186,14 +186,14 @@ async def _dispatch(task_id: str, data: dict, raw_token: str,
         return
 
     headers["Authorization"] = f"Bearer {raw_token}"
-    # X-Task-Id：让 new-api 把本任务 id 记进消费日志，超时对账靠它精确反查
+    # X-Task-Id：让上游把本任务 id 记进消费日志，超时对账靠它精确反查
     headers["X-Task-Id"] = task_id
 
     url = f"{base_url}{path}"
     if query:
         url = f"{url}?{query}"
 
-    # 超时与重试次数走 dynconf：确认 relay 5xx 回滚语义后可在管理页直接
+    # 超时与重试次数走 dynconf：确认上游 5xx 回滚语义后可在管理页直接
     # 打开重试，不必重启 worker（ADR-002）
     timeout_seconds = await dynconf.get_int("worker_timeout")
     client = httpc.shared_client(timeout=httpx.Timeout(timeout_seconds))
@@ -227,7 +227,7 @@ async def _dispatch(task_id: str, data: dict, raw_token: str,
 
         status = resp.status_code
 
-        # 5xx：ADR-002 默认 retry_max=0（relay 的预扣回滚语义未确认）
+        # 5xx：ADR-002 默认 retry_max=0（上游的预扣回滚语义未确认）
         if status >= 500 and attempts_left > 0:
             attempts_left -= 1
             await asyncio.sleep(settings.retry_backoff_base * attempt)

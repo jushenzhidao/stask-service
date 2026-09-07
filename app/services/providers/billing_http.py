@@ -26,7 +26,7 @@ from app.services import httpc
 from app.services.providers import BillingError
 
 #: 扣费方向：freeze 只是预冻结，settle/charge 才是真实结算。
-#: 对账判「上游确实扣了钱」只认后两者——预冻结在 relay 失败时会被回滚。
+#: 对账判「上游确实扣了钱」只认后两者——预冻结在上游失败时会被回滚。
 _SETTLED_DIRECTIONS = frozenset({"settle", "charge"})
 
 
@@ -38,7 +38,7 @@ def _err_body(resp: Any) -> str:
         return str(resp.text)[:200]
 
 
-class NewapiBillingProvider:
+class HttpBillingProvider:
     def _client(self):
         return httpc.shared_client(
             base_url=settings.billing_svc_url, timeout=settings.http_timeout
@@ -84,7 +84,7 @@ class NewapiBillingProvider:
         """按 task_id 反查扣费记录（设计 §8 超时对账）。
 
         两级策略：
-        1. 精确匹配 ``attr_filter=task_id={task_id}``——要求 new-api relay
+        1. 精确匹配 ``attr_filter=task_id={task_id}``——要求上游
            把 ``X-Task-Id`` 头写进 billing attrs（OPEN-DECISIONS 待确认）；
         2. 精确匹配无结果时**不**自动降级到模糊匹配——模糊匹配
            （token + 时间窗）会把用户同期的其他调用误判成本任务的扣费，

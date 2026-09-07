@@ -628,7 +628,7 @@ def test_settings(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(settings, "async_allow_prefixes", ("/v1/images", "/v1/audio"))
     monkeypatch.setattr(settings, "async_deny_prefixes", ("/api/", "/console/"))
     monkeypatch.setattr(settings, "upstream_allowlist", ("newapi:3000", "127.0.0.1:3000"))
-    monkeypatch.setattr(settings, "newapi_base_url", "http://newapi:3000")
+    monkeypatch.setattr(settings, "upstream_base_url", "http://newapi:3000")
     monkeypatch.setattr(settings, "max_slots", 10)
     monkeypatch.setattr(settings, "ref_price_default", 1.0)
     monkeypatch.setattr(settings, "rate_limit", 1000)

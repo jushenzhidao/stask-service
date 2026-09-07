@@ -124,7 +124,7 @@ def _row_to_dict(row: Any) -> dict:
 
 async def create(task_id: str, user_id: int, action: str, data: dict) -> None:
     """落库 SUBMITTED。``channel_id`` 恒 0（执行后尽力回填），``quota`` 恒 0
-    （资金全在 new-api relay 内闭环，本服务零金额记账）。
+    （资金全在上游内部闭环，本服务零金额记账）。
 
     ``progress`` 写 ``STASK_RUNNING`` 而非 ``0%``：让 new-api 的
     ``sweepTimedOutTasks``（WHERE 含 ``progress != '100%'``）识别这是

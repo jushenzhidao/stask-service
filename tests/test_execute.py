@@ -116,7 +116,7 @@ async def test_5xx_no_retry_by_default(task_store, patch_redis, test_settings,
                                        respx_router):
     """AC-16 / ADR-002：ST_RETRY_MAX=0 时 5xx 直接判 FAILURE，只调一次上游。
 
-    这是保守决策——new-api relay 的 5xx 是否回滚预扣配额尚未确认，
+    这是保守决策——上游的 5xx 是否回滚预扣配额尚未确认，
     重试可能双扣。
     """
     await _seed(task_store, patch_redis)

@@ -4,7 +4,7 @@
 超限返回 429 + ``Retry-After``（保守取整窗，客户端不必猜）。
 
 Redis 不可用时**放行**：限流是防滥用的软措施，不该成为可用性单点。
-真正的资金闸门在 new-api relay 里，那里不放行。
+真正的资金闸门在上游，那里不放行。
 """
 
 from __future__ import annotations

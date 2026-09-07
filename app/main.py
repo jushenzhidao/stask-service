@@ -36,7 +36,7 @@ def create_app() -> FastAPI:
     app = FastAPI(
         title="stask-service",
         version=settings.app_version,
-        description="同步转异步任务网关：给 new-api 同步生成 API 加 /async 前缀即任务化",
+        description="独立异步队列服务：把同步生成接口变成长任务——毫秒返回 task_id，结果异步取回",
         lifespan=lifespan,
     )
 

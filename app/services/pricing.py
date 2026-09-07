@@ -81,7 +81,7 @@ def slots_for(balance: float | None, model: str, *,
     """并发槽位数（设计 §6）：``clamp(floor(balance / ref_price), 1, max_slots)``。
 
     语义 = 余额付得起几个在途任务。余额未知（billing 抖动）→ 回落 1，
-    既不硬拒也不放开。下限恒为 1：余额不足的判定归 new-api relay
+    既不硬拒也不放开。下限恒为 1：余额不足的判定归上游
     （它会返回 402，任务落 FAILURE），本服务不做资金判定。
 
     ``max_slots`` / ``default_price`` 由调用方从 dynconf 注入（可运行时热改）；

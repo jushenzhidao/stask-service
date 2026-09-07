@@ -4,7 +4,7 @@
 
 `app/config.py` 的纪律是「配置单例 + 禁止散读 env」，改配置要重启。但有些
 旋钮是运营性质的——某个模型涨价了要调 ref_price、某用户压测要临时放宽
-max_slots、确认 relay 回滚语义后要开重试。为这些事重启一次网关不合理。
+max_slots、确认上游回滚语义后要开重试。为这些事重启一次网关不合理。
 
 ## 分层规则（这是安全边界，不是便利性设计）
 
@@ -112,12 +112,12 @@ MUTABLE: dict[str, Spec] = {
              minimum=1, maximum=3600),
 
         # ---- worker ----
-        Spec("worker_timeout", "int", "relay 调用超时 (秒)", "执行",
+        Spec("worker_timeout", "int", "上游调用超时 (秒)", "执行",
              minimum=5, maximum=1800,
              note="改大要同步调 nginx proxy_read_timeout"),
         Spec("retry_max", "int", "5xx 重试次数", "执行",
              minimum=0, maximum=10,
-             note="ADR-002 默认 0：relay 5xx 回滚语义未确认，重试可能双扣"),
+             note="ADR-002 默认 0：上游 5xx 回滚语义未确认，重试可能双扣"),
         Spec("retry_max_connect", "int", "连接层错误重试次数", "执行",
              minimum=0, maximum=10,
              note="请求未到达上游，重试零资金风险"),

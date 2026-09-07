@@ -11,9 +11,11 @@
 
 ## 1. 产品定义
 
-- **一句话描述**：给 new-api 的同步生成 API（出图/TTS/视频）加 `/async` 前缀即任务化——毫秒返回本地 task_id，结果异步取回。
-- **目标用户**：接入 new-api 的应用开发者（客户端不愿为一次 60~180s 的出图请求挂住连接）。
-- **核心问题**：同步生成接口耗时长，HTTP 连接易被中间层掐断；而改造 new-api 引入任务模型成本高、风险大。本服务在**不改 new-api 一行代码**的前提下把同步接口变成任务接口，资金操作全部留在 new-api 原生 relay 内闭环。
+- **一句话描述**：把同步 HTTP 生成接口变成长任务——加 `/async` 前缀提交，毫秒返回本地 task_id，结果异步取回。
+- **目标用户**：接入同步生成 API 的应用开发者（客户端不愿为一次 60~180s 的出图请求挂住连接）。
+- **核心问题**：同步生成接口耗时长，HTTP 连接易被中间层掐断；而在上游里引入任务模型成本高、风险大。本服务在**不改上游一行代码**的前提下把同步接口变成任务接口，资金操作全部留在上游内部闭环。
+- **定位边界**：本服务是一个**独立异步队列服务**，职责只有「同步 → 异步的队列化」。上游（new-api 是默认实现）对本项目而言**只是一个 HTTP 服务**——渠道选择、配额扣费、限流、消费日志全在上游，本服务零资金动作。
+- **已知耦合**：任务行落在与上游同实例的 `tasks` 表上（ADR-001），这是当前唯一一处非 HTTP 依赖；反转它需要独立存储 + 迁移方案，不在本轮范围。
 
 ---
 
@@ -26,7 +28,7 @@
 | P0 | 路径准入（allow/deny 前缀） | deny 优先；未命中 allow → 403 | 高 |
 | P0 | upstream 寻址与三防线校验 | 头覆盖 + allowlist + scheme/userinfo 校验 | 高 |
 | P0 | 余额并发额度占槽 | slots 公式；超限 429 + Retry-After | 高 |
-| P0 | worker 派发锁 + relay 调用 + 四类分流 | 锁在不重发；2xx/4xx/5xx/超时各自归位 | 高 |
+| P0 | worker 派发锁 + 上游调用 + 四类分流 | 锁在不重发；2xx/4xx/5xx/超时各自归位 | 高 |
 | P0 | 查询 `GET /async/{path}/{task_id}` 与字节级回放 | 202/200/错误码重放三态 | 高 |
 | P0 | 长轮询 `?wait=N` | 终态即返，超时返 202 | 中 |
 | P0 | 取消 `DELETE /async/{path}/{task_id}` | 排队中 CANCELED；执行中 409 | 中 |
@@ -41,7 +43,7 @@
 
 | 不做 | 原因 | 何时考虑 |
 |---|---|---|
-| 自建计费/冻结/结算 | 资金全在 new-api relay 内闭环，本服务零资金动作 | 永不 |
+| 自建计费/冻结/结算 | 资金全在上游内部闭环，本服务零资金动作 | 永不 |
 | 建任何 MySQL 表 | 复用 new-api `tasks` 表，靠 `platform` 列划分自有行 | 永不 |
 | 跨服务直连 new-api/billing 的数据库 | 红线：余额/日志一律 HTTP | 永不 |
 | 执行中任务的真中止 | 上游是同步调用，无法中断；执行中取消返 409 | 上游支持 abort 后 |
@@ -215,7 +217,7 @@
 | taskiq `with_labels(delay=)` 不生效 | taskiq-redis/ListQueueBroker | ListQueueBroker 不支持 delay 标签 | 延迟任务一律走 `schedule_by_time` |
 | gunicorn preload + 全局连接池 | gunicorn/preload_app | fork 前建连接会在子进程间共享 socket | 引擎/Redis/HTTP 客户端全部惰性单例 |
 | loguru `diagnose=True` 泄露 sk | loguru | 异常回溯打印帧局部变量，含 raw_token | 固定 `backtrace=False, diagnose=False` |
-| 队列 at-least-once 造成双扣 | taskiq | 崩溃重投会再次调 relay | 派发锁 SET NX，锁在即不重发，转对账 |
+| 队列 at-least-once 造成双扣 | taskiq | 崩溃重投会再次调上游 | 派发锁 SET NX，锁在即不重发，转对账 |
 
 ---
 
@@ -228,7 +230,7 @@
 .venv/bin/python -m mypy app/
 .venv/bin/python -m pytest tests/ -q          # 断言全绿
 
-# 2. 起服务（需 MySQL/Redis/new-api 或用 compose）
+# 2. 起服务（需 MySQL/Redis/上游 或用 compose）
 docker compose up -d
 curl -sf http://127.0.0.1:8000/healthz/ready | jq .
 
@@ -277,3 +279,4 @@ curl -s -X DELETE "http://127.0.0.1:8000/async/v1/images/generations/$NEW" | jq 
 | 2026-08-23 | 运行时配置白名单（AC-34） | ADR-005：运营旋钮可热改，安全项永久只读 | 新增 `dynconf` |
 | 2026-08-23 | 管理面 + 单文件看板（AC-35/36） | 独立 `ST_ADMIN_KEY`，未配置则全部 404 | 新增 `/admin` |
 | 2026-08-23 | 单进程部署模式 | 简化部署：一条命令起 web+worker+scheduler | 新增 `app/standalone.py` |
+| 2026-09-07 | 定位与命名去 newapi 化 | 本服务是独立异步队列服务，上游只是一个 HTTP 服务；`newapi_base_url`→`upstream_base_url`（旧 env 名保留兼容），`billing_newapi`→`billing_http` | §1 措辞、`app/config.py`、`app/services/providers/`；**无契约变更** |

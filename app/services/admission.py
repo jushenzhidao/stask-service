@@ -89,11 +89,11 @@ def _host_matches(host: str) -> bool:
 def resolve_upstream(header_value: str | None) -> str:
     """确定并校验 upstream base url（防线 2 + 防线 3）。
 
-    优先级：``X-Upstream-Base-Url`` 头（nginx 注入）> ``ST_NEWAPI_BASE_URL``。
+    优先级：``X-Upstream-Base-Url`` 头（nginx 注入）> ``ST_UPSTREAM_BASE_URL``。
     返回值是**规整后**的 base（去尾斜杠），提交时随任务落库，worker 只认
     落库值——中途改配置不影响在途任务的目标地址。
     """
-    raw = (header_value or "").strip() or settings.newapi_base_url
+    raw = (header_value or "").strip() or settings.upstream_base_url
     parts = urlsplit(raw)
 
     if parts.scheme not in ("http", "https"):

@@ -101,7 +101,7 @@ async def test_freeze_direction_is_not_a_charge(task_store, patch_redis,
     """
     await _seed_pending(task_store, patch_redis)
     # FakeBilling 直接返回 charges 里的字典，这里改走真 provider 的过滤逻辑
-    from app.services.providers.billing_newapi import _SETTLED_DIRECTIONS
+    from app.services.providers.billing_http import _SETTLED_DIRECTIONS
 
     assert "freeze" not in _SETTLED_DIRECTIONS
     assert "cancel" not in _SETTLED_DIRECTIONS

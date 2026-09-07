@@ -7,7 +7,7 @@
 
 安全纪律（红线：用户 sk 不进日志）：
 ``backtrace=False, diagnose=False``——异常回溯绝不带帧局部变量值。
-worker 任务参数里就有 raw_token（从令牌会话取出后传给 relay 调用），
+worker 任务参数里就有 raw_token（从令牌会话取出后传给上游调用），
 开 diagnose 会把它直接打进日志。业务日志只打 task_id / user_id /
 token_hash / 状态码，绝不打 raw token 与响应体。
 """

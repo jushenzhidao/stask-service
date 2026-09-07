@@ -64,7 +64,7 @@ async def overview(
         "version": settings.app_version,
         "env": settings.app_env,
         "platform": settings.gateway_platform,
-        "upstream_default": settings.newapi_base_url,
+        "upstream_default": settings.upstream_base_url,
         "sweep_enabled": await dynconf.get_bool("sweep_enabled"),
         "override_count": (await dynconf.snapshot())["override_count"],
     }

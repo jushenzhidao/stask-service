@@ -20,7 +20,7 @@ import json
 from functools import lru_cache
 from typing import Annotated
 
-from pydantic import field_validator
+from pydantic import AliasChoices, Field, field_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 
@@ -70,8 +70,15 @@ class Settings(BaseSettings):
     redis_key_prefix: str = "st"
 
     # ---- 上游寻址（§7）----
-    #: 默认 upstream（nginx 未注入 X-Upstream-Base-Url 头时的回落值）
-    newapi_base_url: str = "http://127.0.0.1:3000"
+    #: 默认 upstream（nginx 未注入 X-Upstream-Base-Url 头时的回落值）。
+    #: 上游对本项目而言**只是一个 HTTP 服务**：new-api 是默认实现，换任何
+    #: 同步生成接口只要加进 allowlist 即可，本服务不感知它是谁。
+    #: 别名里保留旧名 ``ST_NEWAPI_BASE_URL``：存量 .env 不改名也能起来，
+    #: 否则改名会让已部署实例静默回落默认值、把请求打到错的上游。
+    upstream_base_url: str = Field(
+        default="http://127.0.0.1:3000",
+        validation_alias=AliasChoices("ST_UPSTREAM_BASE_URL", "ST_NEWAPI_BASE_URL"),
+    )
     #: 允许的 upstream host 白名单（含端口按 host:port 比对；不含端口只比 host）
     upstream_allowlist: Annotated[tuple[str, ...], NoDecode] = ("127.0.0.1:3000", "newapi:3000")
 
@@ -103,8 +110,8 @@ class Settings(BaseSettings):
     idem_replay_wait_seconds: float = 3.0  # 同键真并发的短轮询等待上限
 
     # ---- worker 执行（§5、§8）----
-    worker_timeout: int = 120            # relay 调用超时秒
-    #: 5xx 重试次数。**默认 0（ADR-002 保守决策）**：new-api relay 的 5xx
+    worker_timeout: int = 120            # 上游调用超时秒
+    #: 5xx 重试次数。**默认 0（ADR-002 保守决策）**：上游的 5xx
     #: 是否确定回滚预扣配额尚未确认，重试可能造成双扣。确认后改这个值即可开。
     retry_max: int = 0
     #: 连接层错误（请求未到达上游，重试零资金风险）的独立重试次数

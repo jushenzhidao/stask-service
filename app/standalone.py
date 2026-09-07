@@ -78,7 +78,7 @@ async def main() -> None:
     setup_logging()
     log.info(
         "stask standalone starting: env={} platform={} upstream={} admin={}",
-        settings.app_env, settings.gateway_platform, settings.newapi_base_url,
+        settings.app_env, settings.gateway_platform, settings.upstream_base_url,
         "on" if settings.admin_key else "off",
     )
 

@@ -4,8 +4,8 @@
 红线：这三件事一律走 HTTP，禁止跨服务直连 new-api 的库。
 
 为什么要 Protocol 而不是直接 import 实现：测试里换 FakeBilling 只需实现
-三个方法，不必起 respx 拦全部端点；将来 billing 换实现（比如直接问
-new-api 的 ``/api/user/self``）也只加一个 provider 文件。
+三个方法，不必起 respx 拦全部端点；将来 billing 换后端也只加一个 provider
+文件，调用方零改动。
 """
 
 from __future__ import annotations
@@ -52,10 +52,10 @@ class BillingProvider(Protocol):
 
 
 def _build_billing() -> BillingProvider:
-    from app.services.providers.billing_newapi import NewapiBillingProvider
+    from app.services.providers.billing_http import HttpBillingProvider
 
     if settings.billing_svc_url:
-        return NewapiBillingProvider()
+        return HttpBillingProvider()
     raise ProviderError("ST_BILLING_SVC_URL is required")
 
 

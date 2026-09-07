@@ -1,23 +1,28 @@
-# stask-service — 同步转异步任务网关
+# stask-service — 独立异步队列服务
 
-给 new-api 的同步生成 API（出图 / TTS / 视频）加 `/async` 前缀即任务化：
-毫秒返回本地 `task_id`，结果异步取回。
+把一个**同步 HTTP 接口**变成长任务：给目标路径加 `/async` 前缀提交，毫秒返回
+本地 `task_id`，结果异步取回。除此之外没有别的职责——不实现计费、不判扣费、
+不改上游一行代码。
 
-**计费零代码**——资金操作全部在 new-api 原生 relay 内闭环，本服务不做任何
-冻结/结算/退款动作。atask-service（异步任务网关）零改动，两者共享 `tasks`
-表但靠 `platform` 列划分自有行。
+**上游只是一个 HTTP 服务**（new-api 是默认实现，换任何同步生成接口只要进
+allowlist 即可）。鉴权、渠道选择、配额扣费、消费日志全部在上游内部闭环，
+本服务零资金动作。
 
 ```
 nginx（同一域名）
-├─ /async/ → stask-service          其余 → new-api
+├─ /async/ → stask-service          其余 → 上游 HTTP
 │
 stask web    提交：幂等占位 + 余额额度占槽 → 落库 SUBMITTED → 令牌会话 → 入队 → 202
-stask worker 执行：派发锁 → 用户 sk 调 new-api relay → 响应即终态落库 → 释放槽/清会话/回调
-new-api      渠道选择 / 配额扣费 / 限流 / 消费日志，零改动
+stask worker 执行：派发锁 → 用户 sk 调上游同步接口 → 响应即终态落库 → 释放槽/清会话/回调
+上游          渠道选择 / 配额扣费 / 限流 / 消费日志，零改动
 ```
 
 状态机：`SUBMITTED → IN_PROGRESS → SUCCESS / FAILURE / CANCELED`。
 无冻结、无孤儿判死、无 HELD。
+
+> **已知耦合（本轮未动）**：任务行落在与上游同实例的 `tasks` 表上，靠
+> `platform='stask'` 划分自有行。这是当前唯一一处非 HTTP 依赖——彻底做到
+> 「上游只是 HTTP」需要独立存储 + 迁移方案，见「关键决策 · 建表」。
 
 ---
 
@@ -38,8 +43,9 @@ make up          # 起全套（web + worker + redis）
 
 worker 需要扩副本或要滚动重启 web 而不中断在途任务时，从 `standalone` 换到 `up`。
 
-接真实环境时 `.env` 至少改三项：`ST_DATABASE_URL`（指向 new-api 那个库）、
-`ST_BILLING_SVC_URL`、`ST_UPSTREAM_ALLOWLIST`。
+接真实环境时 `.env` 至少改四项：`ST_UPSTREAM_BASE_URL`（上游地址）、
+`ST_DATABASE_URL`（指向 tasks 表所在库）、`ST_BILLING_SVC_URL`、
+`ST_UPSTREAM_ALLOWLIST`。
 
 ---
 
@@ -141,10 +147,10 @@ curl "https://api.example.com/async/v1/images/generations/dall_e_3_ab12...?wait=
 
 | 决策 | 取值 | 依据 |
 |---|---|---|
-| 5xx 重试 | **默认关**（`ST_RETRY_MAX=0`） | ADR-002：relay 5xx 是否回滚预扣未确认，重试可能双扣 |
+| 5xx 重试 | **默认关**（`ST_RETRY_MAX=0`） | ADR-002：上游 5xx 是否回滚预扣未确认，重试可能双扣 |
 | ref_price 来源 | 配置 + 兜底默认值 | ADR-003：提交链路不引入额外 RTT，精度只影响闸门松紧 |
 | Redis | 独立实例 + `st:` 键前缀 | ADR-004：故障域隔离，前缀是误配时的第二道防线 |
-| 建表 | 零 | 复用 new-api `tasks` 表 |
+| 建表 | 零 | ADR-001：复用上游同实例 `tasks` 表（**已知耦合**，反转需独立存储 + 迁移方案）|
 | 动态配置 | 白名单子集可热改 | ADR-005：安全项开放等于把防线挂到网上 |
 
 完整规格见 [`docs/SPEC.md`](docs/SPEC.md)（12 章节契约 + 34 条 EARS 验收标准），
@@ -193,7 +199,7 @@ app/
 
 ## 测试
 
-200 个用例，不依赖真实 MySQL / Redis / new-api / billing：
+200 个用例，不依赖真实 MySQL / Redis / 上游 / billing：
 Redis 用手写 FakeRedis（Lua 按 `app/redis.py` 常量做等价 Python 实现），
 tasks 表用 InMemoryTaskStore（保留 CAS 与 data 合并语义），
 出站 HTTP 用 respx 拦截（未声明的请求立即失败），
