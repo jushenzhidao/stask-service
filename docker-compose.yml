@@ -3,19 +3,38 @@ name: stask
 # 通用 HTTP 异步任务服务：web（提交/查询）+ worker（执行+定时）+ redis（队列/锁/会话）。
 # 没有 mysql 服务——tasks 表复用 new-api 的实例（零建表），
 # ST_DATABASE_URL 必须指向 new-api 那个库。
+#
+# 【寻址纪律】.env 是**宿主视角**（make run / make standalone 直接读它）。
+# 容器内 127.0.0.1 = 容器自己，所以凡涉及网络寻址的项，一律在下面
+# x-app-base.environment 里用 *_DOCKER 后缀变量整体覆盖，宿主值不会被带进容器。
 
 x-app-base: &app-base
   image: ghcr.io/aichatfire/stask-service:latest
   build: .
   restart: unless-stopped
-  # .env 必须存在（make setup 会自动生成）
-  env_file: .env
+  # required: true（默认）—— .env 缺失时直接报错，而不是静默起一个错配置的服务
+  env_file:
+    - path: .env
+      required: true
   environment:
-    ST_REDIS_URL: ${ST_REDIS_URL:-redis://redis:6379/0}
+    # ---- 容器网络寻址（覆盖 .env 的同名项）----
+    # 默认值即可跑通：redis 走 compose 网络，DB / 上游走宿主机。
+    # 若 new-api 与本项目同在一个 compose 网络，把 UPSTREAM 改成 http://newapi:3000
+    # （并确认该 host:port 在 ST_UPSTREAM_ALLOWLIST 里，否则提交一律 400）。
+    ST_REDIS_URL: ${ST_REDIS_URL_DOCKER:-redis://redis:6379/0}
+    ST_DATABASE_URL: ${ST_DATABASE_URL_DOCKER:-mysql+asyncmy://root:root@host.docker.internal:3306/newapi?charset=utf8mb4}
+    ST_UPSTREAM_BASE_URL: ${ST_UPSTREAM_BASE_URL_DOCKER:-http://host.docker.internal:3000}
+  # Linux 上 host.docker.internal 不是内置记录，必须显式指到宿主机网关；
+  # Docker Desktop（macOS / Windows）自带该记录，重复声明无害。
+  extra_hosts:
+    - "host.docker.internal:host-gateway"
   depends_on:
     redis:
       condition: service_healthy
-  stop_grace_period: 60s
+  # 必须 > gunicorn 的 graceful_timeout（默认 = ST_POLL_WAIT_MAX_SECONDS + 15 = 75s），
+  # 否则 Docker 先 SIGKILL，在飞的长轮询请求被硬截断。
+  # 把 ST_POLL_WAIT_MAX_SECONDS 调到 60 以上时，这里要同步加大。
+  stop_grace_period: 90s
   logging:
     driver: json-file
     options:
@@ -40,9 +59,28 @@ services:
     <<: *app-base
     # scheduler 合并进 worker 进程 —— 它必须单副本（多份会重复触发 cron）。
     # 扩 worker 副本时：把 scheduler 拆成独立 service，worker 只跑 `taskiq worker`。
-    command: >
-      sh -c "taskiq scheduler app.queue:scheduler &
-             exec taskiq worker app.queue:broker --max-async-tasks ${ST_QUEUE_CONCURRENCY:-64}"
+    #
+    # 用 bash 包一层是为了**信号转发与故障可见性**：原来的 `... & exec ...`
+    # 会让 scheduler 变成孤儿——停机时拿不到 SIGTERM，它自己崩了容器也不会重启。
+    # 这里任一子进程退出即整体退出，交给 restart: unless-stopped 拉起。
+    #
+    # 【转义纪律】compose 对**整份文件**做变量插值，`$name` 和 `${name}` 都吃。
+    # 脚本里的 shell 变量必须写成 `$$name`（compose 把 `$$` 还原成 `$`）；
+    # 只有 `${ST_QUEUE_CONCURRENCY:-64}` 这种是真要交给 compose 求值的。
+    command:
+      - bash
+      - -c
+      - |
+        term() { kill -TERM "$$sched" "$$wk" 2>/dev/null || true; }
+        trap term TERM INT
+        taskiq scheduler app.queue:scheduler &
+        sched=$$!
+        taskiq worker app.queue:broker --max-async-tasks "${ST_QUEUE_CONCURRENCY:-64}" &
+        wk=$$!
+        wait -n "$$sched" "$$wk"; rc=$$?
+        term
+        wait "$$sched" "$$wk" 2>/dev/null || true
+        exit "$$rc"
     healthcheck:
       # worker 无 HTTP 端口，探 Redis 连通性代替（进程死了容器也会退出重启）
       test: ["CMD", "python", "-c",
@@ -60,10 +98,12 @@ services:
     # 未 ack 的消息也靠 AOF 在重启后存活。
     command: >
       redis-server --appendonly yes --appendfsync everysec
-                   --maxmemory ${ST_REDIS_MAXMEMORY:-256mb}
+                   --maxmemory ${ST_REDIS_MAXMEMORY:-512mb}
                    --maxmemory-policy noeviction
     ports:
-      - "${ST_REDIS_PORT:-6381}:6379"    # 独立端口，与别家实例隔离（ADR-004）
+      # 只绑 127.0.0.1：compose 内服务走 redis:6379，宿主只有本机 standalone
+      # 模式需要它。绑 0.0.0.0 等于把一个无密码的 Redis 暴露到局域网。
+      - "127.0.0.1:${ST_REDIS_PORT:-6381}:6379"    # 独立端口，与别家实例隔离（ADR-004）
     volumes:
       - redis-data:/data
     healthcheck:
@@ -85,7 +125,8 @@ services:
     profiles: ["admin"]
     restart: unless-stopped
     ports:
-      - "${ST_TASKIQ_ADMIN_PORT:-3001}:3000"
+      # 面板无鉴权，同样只绑本机；要对外放请前面套一层反向代理做认证
+      - "127.0.0.1:${ST_TASKIQ_ADMIN_PORT:-3001}:3000"
     environment:
       # 默认值仅为让未启用 profile 时 compose 可整体插值；启用 admin 时务必改掉
       TASKIQ_ADMIN_API_TOKEN: ${ST_TASKIQ_ADMIN_API_TOKEN:-change-me}

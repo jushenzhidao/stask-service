@@ -14,6 +14,7 @@ from fastapi import APIRouter
 from fastapi.responses import JSONResponse
 from sqlalchemy import text
 
+from app.config import settings
 from app.db import get_session_factory
 from app.logging import log
 from app.redis import r
@@ -48,5 +49,12 @@ async def healthz_ready() -> JSONResponse:
     ok = all(v == "ok" for v in checks.values())
     return JSONResponse(
         status_code=200 if ok else 503,
-        content={"status": "ok" if ok else "unavailable", "checks": checks},
+        content={
+            "status": "ok" if ok else "unavailable",
+            "checks": checks,
+            # 只上报、不门禁：channel_id=0 在本地/测试是合法的，但放到生产
+            # 意味着上游会周期性误杀在途任务。暴露出来让监控能直接抓到，
+            # 而不是等人报"任务莫名其妙全 FAILURE"才发现。
+            "config": {"channel_id": settings.channel_id},
+        },
     )

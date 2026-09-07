@@ -18,7 +18,7 @@ setup:  ## 建虚拟环境并安装依赖（含开发依赖）
 check: lint type test  ## 三项门禁全跑（提交前必须绿）
 
 lint:  ## ruff 静态检查
-	$(PY) -m ruff check app tests scripts
+	$(PY) -m ruff check app tests scripts gunicorn.conf.py
 
 type:  ## mypy 类型检查
 	$(PY) -m mypy app/

@@ -21,22 +21,37 @@ from app.logging import log, setup_logging
 from app.services import httpc
 
 
+#: 这些环境里 channel_id 缺失不再容忍：静默带病启动比起不来危险得多
+_STRICT_ENVS = frozenset({"prod", "production"})
+
+
 def _warn_coexistence_risks() -> None:
-    """ADR-006 共存契约的启动期告警（只告警不阻断——单测/本地无 new-api 也要能起）。
+    """ADR-006 共存契约的启动期校验。
 
     new-api 轮询 ``updateVideoTasks`` 中 ``CacheGetChannel(channel_id)`` 在
     adaptor nil 检查**之前**执行：channel_id 指向不存在的渠道时，该渠道下
     本服务的全部在途任务会被无 CAS 批量强制 FAILURE。platform 自定义值
     挡不住这条路径——必须配一个真实存在的渠道 id。
+
+    分级策略：
+    - 非生产（dev / test / 本地）：只打 warning，保证单测和无 new-api 的
+      本地环境照样能起来；
+    - 生产（``ST_APP_ENV=prod|production``）：**直接抛错阻断启动**。
+      渠道 0 不是"少个功能"，是上游会周期性误杀在途任务——让它起不来，
+      比让它在监控盲区里慢慢吃任务要好。
     """
-    if settings.channel_id <= 0:
-        log.warning(
-            "ST_CHANNEL_ID 未配置（当前 {}）。若上游 new-api 的任务轮询开启，"
-            "渠道 0 不存在会导致本服务的在途任务被其批量误判 FAILURE"
-            "（CacheGetChannel 失败先于 adaptor nil 检查）。请在 new-api "
-            "创建一个占位渠道并把其 id 配到 ST_CHANNEL_ID。",
-            settings.channel_id,
-        )
+    if settings.channel_id > 0:
+        return
+
+    hint = (
+        "ST_CHANNEL_ID 未配置（当前 {}）。上游 new-api 的任务轮询中 "
+        "CacheGetChannel 先于 adaptor nil 检查执行，渠道不存在会导致本服务"
+        "在途任务被其无 CAS 批量强制 FAILURE。请在 new-api 建一个**禁用状态**的"
+        "占位渠道（渠道缓存含禁用渠道），把它的 id 填到这里。"
+    )
+    if settings.app_env.strip().lower() in _STRICT_ENVS:
+        raise RuntimeError(hint.format(settings.channel_id))
+    log.warning(hint, settings.channel_id)
 
 
 @asynccontextmanager

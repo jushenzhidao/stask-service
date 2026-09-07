@@ -15,6 +15,8 @@ from pathlib import Path
 import httpx
 import pytest
 
+from app import main
+from app.config import settings
 from app.services import codec, notify, taskstore
 from tests.conftest import AUTH
 
@@ -179,6 +181,49 @@ def test_healthz_live_has_no_dependencies(client):
     resp = client.get("/healthz/live")
     assert resp.status_code == 200
     assert resp.json() == {"status": "ok"}
+
+
+def test_healthz_ready_reports_channel_id_without_gating(client, monkeypatch):
+    """ADR-006：channel_id 缺失只**上报**、不门禁。
+
+    它是致命配置（上游会无 CAS 批量误杀在途任务），但在 dev/测试环境里
+    channel_id=0 是合法的——若拿它判 503，本地和 CI 就永远起不来。
+    所以放进 ``config`` 段让监控去抓，而不是混进 ``checks`` 里摘流量。
+    """
+    from app import healthz
+
+    class _Session:
+        async def execute(self, _q):
+            return None
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_a):
+            return False
+
+    monkeypatch.setattr(healthz, "get_session_factory", lambda: (lambda: _Session()))
+    monkeypatch.setattr(settings, "channel_id", 0)
+
+    resp = client.get("/healthz/ready")
+    assert resp.status_code == 200
+    assert resp.json()["checks"] == {"redis": "ok", "db": "ok"}
+    assert resp.json()["config"] == {"channel_id": 0}
+
+
+@pytest.mark.parametrize("app_env,should_raise", [
+    ("dev", False), ("test", False), ("prod", True), ("PRODUCTION", True),
+])
+def test_channel_id_missing_is_fatal_only_in_prod(monkeypatch, app_env, should_raise):
+    """生产环境 channel_id=0 必须 fail-fast：带病启动比起不来危险得多。"""
+    monkeypatch.setattr(settings, "app_env", app_env)
+    monkeypatch.setattr(settings, "channel_id", 0)
+
+    if should_raise:
+        with pytest.raises(RuntimeError, match="ST_CHANNEL_ID"):
+            main._warn_coexistence_risks()
+    else:
+        main._warn_coexistence_risks()      # 非生产只告警，不阻断
 
 
 async def test_ops_stats(client, task_store):
