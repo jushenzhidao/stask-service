@@ -56,7 +56,8 @@ services:
     image: redis:7-alpine
     restart: unless-stopped
     # AOF everysec 是硬要求：丢失窗口 ≤1s。关掉 AOF 后一次重启会丢掉
-    # 全部令牌会话与派发锁，在途任务集体判死。
+    # 全部令牌会话与派发锁，在途任务集体判死；队列走 Redis Stream，
+    # 未 ack 的消息也靠 AOF 在重启后存活。
     command: >
       redis-server --appendonly yes --appendfsync everysec
                    --maxmemory ${ST_REDIS_MAXMEMORY:-256mb}
@@ -76,5 +77,26 @@ services:
         max-size: "10m"
         max-file: "2"
 
+  # 任务看板（可选）：docker compose --profile admin up -d
+  # 启用后给 stask/worker 配 ST_TASKIQ_ADMIN_URL=http://taskiq-admin:3000
+  # 和 ST_TASKIQ_ADMIN_API_TOKEN=<与下面 TASKIQ_ADMIN_API_TOKEN 相同>。
+  taskiq-admin:
+    image: ghcr.io/taskiq-python/taskiq-admin:latest
+    profiles: ["admin"]
+    restart: unless-stopped
+    ports:
+      - "${ST_TASKIQ_ADMIN_PORT:-3001}:3000"
+    environment:
+      # 默认值仅为让未启用 profile 时 compose 可整体插值；启用 admin 时务必改掉
+      TASKIQ_ADMIN_API_TOKEN: ${ST_TASKIQ_ADMIN_API_TOKEN:-change-me}
+    volumes:
+      - taskiq-admin-data:/usr/database/
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "2"
+
 volumes:
   redis-data:
+  taskiq-admin-data:

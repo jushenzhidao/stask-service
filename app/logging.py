@@ -51,7 +51,12 @@ class InterceptHandler(logging.Handler):
 
 
 def setup_logging() -> None:
-    """装配 loguru（幂等）：stderr sink + stdlib 桥接。"""
+    """装配 loguru（幂等）：stderr sink + stdlib 桥接 + logfire 桥接（若已配）。
+
+    logfire sink 在这里挂而不在 ``app.observability``：本函数以
+    ``logger.remove()`` 开头，任何一次重装配（standalone 下 web 与 worker
+    先后各调一次）都会冲掉旧 sink——桥接必须跟着每次装配重挂。
+    """
     logger.remove()
     logger.add(
         sys.stderr,
@@ -60,6 +65,12 @@ def setup_logging() -> None:
         backtrace=False,
         diagnose=False,
     )
+    from app import observability
+
+    if observability.is_configured():
+        import logfire
+
+        logger.add(**logfire.loguru_handler())
     logging.basicConfig(handlers=[InterceptHandler()], level=0, force=True)
 
     logging.getLogger("httpcore").setLevel(logging.WARNING)

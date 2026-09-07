@@ -20,11 +20,15 @@ dependencies = [
     # RuntimeError: 'cryptography' package is required...
     # 实测遗漏它的症状是 /healthz/ready 报 db fail: RuntimeError
     "cryptography==44.0.0",
-    "redis==5.2.1",
+    "redis==8.1.0",       # taskiq-redis 1.2.x 要求 redis>=8；本项目只用基础命令+eval，API 兼容
     "httpx[http2]==0.28.1",
-    "taskiq==0.11.18",
-    "taskiq-redis==1.0.2",
+    # opentelemetry extra：内置 OpenTelemetryMiddleware 的依赖（otel-api/psutil）。
+    # 0.12 起还内置 TaskiqAdminMiddleware（依赖 aiohttp，核心依赖已含）。
+    "taskiq[opentelemetry]==0.12.6",
+    "taskiq-redis==1.2.3",
     "loguru==0.7.3",
+    # logfire：ST_LOGFIRE_ENABLED=1 时启用；fastapi/httpx extra 是对应插桩包
+    "logfire[fastapi,httpx]==5.0.0",
 ]
 
 [project.optional-dependencies]

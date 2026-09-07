@@ -17,8 +17,12 @@ import gzip
 
 
 def encode(raw: bytes) -> str:
-    """原始响应字节 → gzip → base64 字符串（可直接进 JSON 列）。"""
-    return base64.b64encode(gzip.compress(raw, compresslevel=6)).decode("ascii")
+    """原始响应字节 → gzip → base64 字符串（可直接进 JSON 列）。
+
+    ``mtime=0``：gzip header 默认嵌当前时间戳，同一输入跨秒两次 encode
+    会产出不同字节串——既让输出不可复现（测试 flaky），也没有任何用处。
+    """
+    return base64.b64encode(gzip.compress(raw, compresslevel=6, mtime=0)).decode("ascii")
 
 
 def decode(encoded: str) -> bytes:

@@ -49,8 +49,11 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
 
 
 def create_app() -> FastAPI:
-    """应用工厂：日志 → 异常处理器 → 路由（顺序不可换）。"""
+    """应用工厂：日志 → observability → 异常处理器 → 路由（顺序不可换）。"""
     setup_logging()
+    from app.observability import instrument_fastapi, setup as setup_observability
+
+    setup_observability("web")
     _warn_coexistence_risks()
     app = FastAPI(
         title="stask-service",
@@ -58,6 +61,7 @@ def create_app() -> FastAPI:
         description="独立异步队列服务：把同步生成接口变成长任务——毫秒返回 task_id，结果异步取回",
         lifespan=lifespan,
     )
+    instrument_fastapi(app)
 
     register_exception_handlers(app)
 

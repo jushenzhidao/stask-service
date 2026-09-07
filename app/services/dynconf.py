@@ -24,7 +24,7 @@ from __future__ import annotations
 import json
 import time
 from dataclasses import dataclass
-from typing import Any, Literal
+from typing import Any, Literal, cast
 
 from app.config import settings
 from app.logging import log
@@ -264,7 +264,9 @@ async def set_many(updates: dict[str, Any]) -> dict[str, Any]:
             raise ValueError(f"{key} cannot be changed at runtime ({reason})")
         payload[key] = json.dumps(spec.coerce(raw))
 
-    await r.hset(_KEY, mapping=payload)
+    # redis 8 的 hset 注解要求键类型是宽 union 且 Mapping 键 invariant，
+    # dict[str, str] 无法直接匹配——语义没变，cast(Any) 过桥
+    await r.hset(_KEY, mapping=cast(Any, payload))
     _invalidate()
     log.info("dynconf updated: keys={}", sorted(payload))
     return await snapshot()

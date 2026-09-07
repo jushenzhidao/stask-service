@@ -144,6 +144,24 @@ class Settings(BaseSettings):
     #: 回调 URL 的 host 白名单（空 = 不限制；生产强烈建议配置）
     callback_allowlist: Annotated[tuple[str, ...], NoDecode] = ()
 
+    # ---- 队列（Redis Stream，at-least-once）----
+    #: 流的近似最大长度（XADD MAXLEN ~）。已 ack 的条目 XACK 并不会删除，
+    #: 必须 trim 防无界增长。取值要 >> 峰值积压——trim 是从最旧端裁剪，
+    #: 积压超过它才可能裁到未处理消息。0 = 不裁剪（不建议，内存无界）。
+    queue_stream_maxlen: int = 100_000
+
+    # ---- 可观测性（logfire，可选）----
+    #: 1 = 启用 logfire（trace + metrics + loguru 桥接）。
+    #: 凭证走 logfire 自己的 LOGFIRE_TOKEN 环境变量（无 ST_ 前缀）；
+    #: 未配 token 时 send_to_logfire="if-token-present" 会静默降级为不发送。
+    logfire_enabled: bool = False
+    logfire_service_name: str = "stask"
+
+    # ---- taskiq-admin 任务看板（可选）----
+    #: taskiq-admin 实例地址（如 http://taskiq-admin:3000）。空 = 关闭。
+    taskiq_admin_url: str = ""
+    taskiq_admin_api_token: str = ""
+
     # ---- 定时任务开关 ----
     sweep_enabled: bool = True
 
