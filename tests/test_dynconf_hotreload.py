@@ -45,7 +45,7 @@ async def test_poll_wait_max_seconds_hotreload_422(
     task_store.rows[task_id] = {
         "task_id": task_id,
         "user_id": "user_test",
-        "status": "SUBMITTED",
+        "status": "NOT_START",
         "data": {"request_path": "/v1/images/generations"},
     }
 
@@ -75,7 +75,7 @@ async def test_slot_ttl_seconds_hotreload_redis_expiry(
     client, monkeypatch, patch_redis, test_settings
 ):
     """slot_ttl_seconds 热改后，Redis 槽键 TTL 用新值（而非 env 值）。"""
-    from app.services.identity import token_hash
+    from app.deps.auth import token_hash
 
     # env 是 300s，热改为 65s（spec minimum=60）
     monkeypatch.setattr(test_settings, "slot_ttl_seconds", 300)

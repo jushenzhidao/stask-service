@@ -76,7 +76,7 @@
   .t-SUCCESS  { background: var(--green-bg); color: var(--green); }
   .t-FAILURE  { background: var(--red-bg);   color: var(--red); }
   .t-CANCELED { background: var(--gray-bg);  color: var(--muted); }
-  .t-SUBMITTED, .t-IN_PROGRESS { background: var(--blue-bg); color: var(--blue); }
+  .t-NOT_START, .t-IN_PROGRESS { background: var(--blue-bg); color: var(--blue); }
   .t-warn { background: var(--amber-bg); color: var(--amber); }
 
   .tabs { display: flex; gap: 4px; margin-bottom: 16px; flex-wrap: wrap; }
@@ -141,7 +141,7 @@
 <div class="wrap" id="app" hidden>
   <header>
     <h1>stask-service</h1>
-    <span class="tag t-SUBMITTED mono" id="verTag">-</span>
+    <span class="tag t-NOT_START mono" id="verTag">-</span>
     <span style="flex:1"></span>
     <select id="window">
       <option value="3600">近 1 小时</option>
@@ -194,7 +194,7 @@
       <div class="row" style="margin-bottom:12px">
         <select id="fStatus">
           <option value="">全部状态</option>
-          <option>SUBMITTED</option><option>IN_PROGRESS</option>
+          <option>NOT_START</option><option>IN_PROGRESS</option>
           <option>SUCCESS</option><option>FAILURE</option><option>CANCELED</option>
         </select>
         <input id="fModel" placeholder="模型" style="width:150px">
@@ -203,9 +203,6 @@
           <option value="prefix">task_id 前缀</option>
         </select>
         <input id="fTaskId" placeholder="完整 task_id" style="width:190px">
-        <label class="row" style="gap:5px;font-size:13px">
-          <input type="checkbox" id="fRecon" style="min-width:auto"> 仅待对账
-        </label>
         <button class="primary" id="searchBtn">查询</button>
         <span style="flex:1"></span>
         <span class="faint" id="tkTotal"></span>
@@ -273,8 +270,8 @@
         正常由 scheduler 按 cron 自动执行，这里用于排障时立即跑一轮。
       </div>
       <div class="row">
-        <button data-job="reconcile">超时对账</button>
-        <button data-job="stale">卡死任务扫描</button>
+        <button data-job="stale">卡死任务收敛</button>
+        <button data-job="overdue">超龄任务判死</button>
         <button data-job="slots">并发槽校准</button>
         <button data-job="purge">清理超期结果</button>
       </div>
@@ -283,15 +280,15 @@
            overflow:auto;display:none"></pre>
     </div>
     <div class="card">
-      <h2>待对账任务</h2>
+      <h2>活跃任务</h2>
       <div class="faint" style="margin-bottom:10px">
-        超时或卡死的任务在此排队。对账会查消费日志定性：查到扣费补记成功、
-        确认无扣费判失败、查询失败保持挂起。
+        当前在途（NOT_START / IN_PROGRESS）的任务。卡死的由 sweeper 自动收敛：
+        锁过期且未派发过的重投，派发后失联或超龄（默认 6h）的判死。
       </div>
       <div style="overflow:auto;max-height:44vh">
         <table>
-          <thead><tr><th>task_id</th><th>状态</th><th>原因</th><th>创建</th><th></th></tr></thead>
-          <tbody id="reconBody"></tbody>
+          <thead><tr><th>task_id</th><th>状态</th><th>创建</th><th></th></tr></thead>
+          <tbody id="activeBody"></tbody>
         </table>
       </div>
     </div>
@@ -380,7 +377,7 @@ async function loadOverview() {
   $("envLine").textContent =
     `env=${s.env}  platform=${s.platform}  upstream=${s.upstream_default}` +
     `  sweep=${s.sweep_enabled ? "on" : "off"}  配置覆盖=${s.override_count}`;
-  if (!s.sweep_enabled) banner("定时任务总开关处于关闭状态：对账、卡死扫描、结果清理均不会运行。", "err");
+  if (!s.sweep_enabled) banner("定时任务总开关处于关闭状态：卡死收敛、超龄判死、槽位校准、结果清理均不会运行。", "err");
 
   const rate = d.success_rate === null || d.success_rate === undefined
     ? "-" : (d.success_rate * 100).toFixed(1) + "%";
@@ -393,13 +390,12 @@ async function loadOverview() {
   $("kpis").innerHTML =
     kpi("窗口内任务", ICONS.total, d.total, "创建于所选时间范围") +
     kpi("成功率", ICONS.ok, rate, "SUCCESS / (SUCCESS + FAILURE)") +
-    kpi("当前在途", ICONS.active, d.active_total, "SUBMITTED + IN_PROGRESS，全时段") +
-    kpi("待对账", ICONS.warn, d.pending_reconcile,
-        d.pending_reconcile ? "存在超时或卡死任务，需关注" : "无异常挂起");
+    kpi("当前在途", ICONS.active, d.active_total, "NOT_START + IN_PROGRESS，全时段") +
+    kpi("失败数", ICONS.warn, (d.status_counts || {}).FAILURE || 0, "窗口内 FAILURE 总数");
 
   const counts = d.status_counts || {};
   const max = Math.max(1, ...Object.values(counts));
-  const order = ["SUCCESS", "FAILURE", "IN_PROGRESS", "SUBMITTED", "CANCELED"];
+  const order = ["SUCCESS", "FAILURE", "IN_PROGRESS", "NOT_START", "CANCELED"];
   const keys = order.filter((k) => counts[k]).concat(
     Object.keys(counts).filter((k) => !order.includes(k)));
   $("statusDist").innerHTML = keys.length ? keys.map((k) => `
@@ -445,7 +441,6 @@ async function loadTasks() {
   // 后端契约：task_id 精确匹配、task_id_prefix 前缀匹配，二者互斥。
   // 旧版无论用户输入什么都发 task_id，片段输入必然空结果。
   if (tid) q.set($("fTaskIdMode").value === "prefix" ? "task_id_prefix" : "task_id", tid);
-  if ($("fRecon").checked) q.set("reconcile_only", "true");
   const w = $("window").value;
   if (w) q.set("since", w);
 
@@ -472,7 +467,7 @@ async function loadTasks() {
     <tr>
       <td><a href="#" class="mono" data-tid="${esc(t.task_id)}"
              style="text-decoration:none">${esc(t.task_id.slice(0, 22))}…</a>
-          ${t.reconcile_pending ? '<span class="tag t-warn">待对账</span>' : ""}</td>
+</td>
       <td><span class="tag t-${esc(t.status)}">${esc(t.status)}</span></td>
       <td>${esc(t.model || "-")}</td>
       <td class="mono faint">${esc(t.request_path || "-")}</td>
@@ -493,8 +488,7 @@ async function showTask(id) {
   const d = await api("/tasks/" + encodeURIComponent(id));
   $("dlgTitle").textContent = d.task_id;
   const rows = [
-    ["状态", `<span class="tag t-${esc(d.status)}">${esc(d.status)}</span>` +
-             (d.reconcile_pending ? ' <span class="tag t-warn">待对账</span>' : "")],
+    ["状态", `<span class="tag t-${esc(d.status)}">${esc(d.status)}</span>`],
     ["失败原因", d.fail_reason || "-"],
     ["模型", d.model || "-"],
     ["请求", `${esc(d.request_method)} ${esc(d.request_path)}${d.request_query ? "?" + esc(d.request_query) : ""}`],
@@ -502,7 +496,7 @@ async function showTask(id) {
     ["上游状态码", d.upstream_status || "-"],
     ["响应类型", d.upstream_content_type || "-"],
     ["响应大小", d.result_purged ? "已按 TTL 清理" : bytes(d.response_bytes)],
-    ["用户 / 渠道", `${d.user_id} / ${d.channel_id || "未回填"}`],
+    ["渠道", d.channel_id || "-"],
     ["创建", d.created_at ? new Date(d.created_at * 1000).toLocaleString() : "-"],
     ["开始 / 结束", `${d.start_time ? new Date(d.start_time * 1000).toLocaleTimeString() : "-"}
                     / ${d.finish_time ? new Date(d.finish_time * 1000).toLocaleTimeString() : "-"}`],
@@ -510,19 +504,17 @@ async function showTask(id) {
     ["幂等键", d.idempotency_key || "-"],
     ["回调", d.callback_url ? `${esc(d.callback_url)}（${d.callback_delivered === true ? "已送达" :
               d.callback_delivered === false ? "已放弃" : "待推送"}）` : "未配置"],
-    ["对账原因", d.reconcile_reason || "-"],
-    ["扣费记录", d.reconcile_charge_id || "-"],
     ["令牌会话", d.token_session?.exists
         ? `存在，剩余 ${d.token_session.ttl_seconds}s` : "不存在（已清理或已过期）"],
     ["该用户在途占槽", d.slots_in_use],
   ];
   let html = rows.map(([k, v]) => `<dt>${esc(k)}</dt><dd>${v}</dd>`).join("");
-  if (d.status === "SUBMITTED" || d.status === "IN_PROGRESS") {
+  if (d.status === "NOT_START" || d.status === "IN_PROGRESS") {
     html += `<dt>操作</dt><dd>
       <button id="rq">重投队列</button>
       <div class="faint" style="margin-top:6px">
-        仅重发队列消息，不清派发锁——锁在意味着可能已调用上游、可能已扣费，
-        worker 会转为待对账而不是再打一次。
+        仅重发队列消息，不清派发锁——锁在意味着一次调用可能在飞，
+        worker 会直接跳过而不是再打一次上游。
       </div></dd>`;
   }
   $("dlgBody").innerHTML = html;
@@ -572,21 +564,24 @@ async function loadConfig() {
          <td class="faint">${esc(i.reason)}</td></tr>`).join("");
 }
 
-async function loadReconcile() {
-  const d = await api("/tasks?reconcile_only=true&limit=100");
-  $("reconBody").innerHTML = d.items.length ? d.items.map((t) => `
+async function loadActive() {
+  const [a, b] = await Promise.all([
+    api("/tasks?status=NOT_START&limit=50"),
+    api("/tasks?status=IN_PROGRESS&limit=50"),
+  ]);
+  const items = [...a.items, ...b.items];
+  $("activeBody").innerHTML = items.length ? items.map((t) => `
     <tr>
       <td class="mono">${esc(t.task_id.slice(0, 24))}…</td>
       <td><span class="tag t-${esc(t.status)}">${esc(t.status)}</span></td>
-      <td class="faint">${esc(t.reconcile_reason || "-")}</td>
       <td class="faint">${ago(t.created_at)}</td>
       <td><button data-tid="${esc(t.task_id)}">详情</button></td>
-    </tr>`).join("") : '<tr><td colspan="5" class="faint">无待对账任务</td></tr>';
-  $("reconBody").querySelectorAll("button[data-tid]").forEach((b) =>
+    </tr>`).join("") : '<tr><td colspan="4" class="faint">无在途任务</td></tr>';
+  $("activeBody").querySelectorAll("button[data-tid]").forEach((b) =>
     b.onclick = () => showTask(b.dataset.tid));
 }
 
-const LOADERS = { ov: loadOverview, tk: loadTasks, cf: loadConfig, op: loadReconcile };
+const LOADERS = { ov: loadOverview, tk: loadTasks, cf: loadConfig, op: loadActive };
 let current = "ov";
 
 async function show(tab) {
@@ -634,7 +629,7 @@ document.querySelectorAll("[data-job]").forEach((b) => b.onclick = async () => {
     const out = await api("/jobs/" + b.dataset.job, { method: "POST" });
     $("jobOut").style.display = "block";
     $("jobOut").textContent = b.textContent.trim() + "  →  " + JSON.stringify(out, null, 2);
-    await loadReconcile();
+    await loadActive();
   } catch (e) { banner(e.message); } finally { b.disabled = false; }
 });
 

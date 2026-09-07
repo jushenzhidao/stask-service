@@ -1,8 +1,10 @@
 """共享契约：状态常量与内部数据模型。
 
-状态机（设计 §1）：``SUBMITTED → IN_PROGRESS → SUCCESS / FAILURE / CANCELED``。
-比 atask 少了 QUEUED 与 HELD——本服务的上游是**同步接口**，没有"已提交上游、
-等待推进"的中间态，也没有冻结因而没有挂起收口需求。
+状态机：``NOT_START → IN_PROGRESS → SUCCESS / FAILURE / CANCELED``。
+
+状态值与 new-api tasks.status 的枚举完全对齐（ADR-006）：初始态用
+``NOT_START`` 而不是自造值——共享表里的行对上游工具（看板、SQL 巡检）
+也应该是可读的。
 """
 
 from __future__ import annotations
@@ -13,23 +15,16 @@ from pydantic import BaseModel
 # 状态常量（与 new-api tasks.status 口径对齐；大写）
 # ---------------------------------------------------------------------------
 
-SUBMITTED = "SUBMITTED"
+NOT_START = "NOT_START"
 IN_PROGRESS = "IN_PROGRESS"
 SUCCESS = "SUCCESS"
 FAILURE = "FAILURE"
 CANCELED = "CANCELED"
 
 #: 活跃（非终态）——CAS 迁移的合法起点
-ACTIVE: tuple[str, ...] = (SUBMITTED, IN_PROGRESS)
+ACTIVE: tuple[str, ...] = (NOT_START, IN_PROGRESS)
 #: 终态——不可逆
 TERMINAL: tuple[str, ...] = (SUCCESS, FAILURE, CANCELED)
-
-
-class UserIdentity(BaseModel):
-    """billing ``/api/v1/auth/inspect`` 的解析结果（令牌即身份）。"""
-
-    user_id: int
-    token_id: int = 0
 
 
 class SubmitPlan(BaseModel):
@@ -40,7 +35,6 @@ class SubmitPlan(BaseModel):
     """
 
     task_id: str
-    user_id: int
     token_hash: str
     model: str
     method: str

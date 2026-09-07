@@ -9,8 +9,9 @@
 - worker 侧的日志装配点在 ``ObservabilityMiddleware.startup``（web 侧在
   ``create_app``）——两个进程各装配一次，格式统一。
 
-定时任务（cron）三只：对账、槽位校准、结果清理。全部带重入锁——
-worker 扩副本后 scheduler 若误起多份，锁保证同一轮只有一个在跑。
+定时任务（cron）四只：卡死收敛、超龄判死、槽位校准、结果清理。
+全部带重入锁——worker 扩副本后 scheduler 若误起多份，锁保证同一轮只有
+一个在跑。
 """
 
 from __future__ import annotations
@@ -82,14 +83,24 @@ async def notify_task(task_id: str, attempt: int = 1,
     await deliver(task_id, attempt)
 
 
-@broker.task(schedule=[{"cron": "*/1 * * * *"}])
-async def sweep_reconcile(_context: Context = TaskiqDepends()) -> None:
-    """每分钟：超时挂起任务对账（设计 §8）。"""
+@broker.task(schedule=[{"cron": "*/2 * * * *"}])
+async def sweep_stale(_context: Context = TaskiqDepends()) -> None:
+    """每 2 分钟：卡死任务收敛（消息丢失重投 / 派发后失联判死）。"""
     if not settings.sweep_enabled:
         return
-    from app.services.reconcile import run_reconcile
+    from app.services.sweeper import sweep_stale as run
 
-    await run_reconcile()
+    await run()
+
+
+@broker.task(schedule=[{"cron": "*/5 * * * *"}])
+async def sweep_overdue(_context: Context = TaskiqDepends()) -> None:
+    """每 5 分钟：超龄任务判死（必须先于 new-api 的 24h 清理线收敛）。"""
+    if not settings.sweep_enabled:
+        return
+    from app.services.sweeper import sweep_overdue as run
+
+    await run()
 
 
 @broker.task(schedule=[{"cron": "*/5 * * * *"}])
@@ -97,24 +108,9 @@ async def sweep_slots(_context: Context = TaskiqDepends()) -> None:
     """每 5 分钟：并发槽计数按 tasks 表事实校准。"""
     if not settings.sweep_enabled:
         return
-    from app.services.reconcile import recalibrate_slots
+    from app.services.sweeper import recalibrate_slots
 
     await recalibrate_slots()
-
-
-@broker.task(schedule=[{"cron": "*/2 * * * *"}])
-async def sweep_stale(_context: Context = TaskiqDepends()) -> None:
-    """每 2 分钟：卡死任务兜底扫描。
-
-    补的是「入队消息丢失」这条路径——任务落库了但队列消息没了，worker
-    永不执行，而对账只扫被标记 ``reconcile_pending`` 的行，扫不到它。
-    没有这只 sweeper，那行会永久停在 SUBMITTED 并吃掉一个并发额度。
-    """
-    if not settings.sweep_enabled:
-        return
-    from app.services.reconcile import sweep_stale as run
-
-    await run()
 
 
 @broker.task(schedule=[{"cron": "17 * * * *"}])
@@ -125,7 +121,7 @@ async def sweep_results(_context: Context = TaskiqDepends()) -> None:
     """
     if not settings.sweep_enabled:
         return
-    from app.services.reconcile import purge_results
+    from app.services.sweeper import purge_results
 
     await purge_results()
 

@@ -6,7 +6,7 @@
 产品定位能否成立的关键。
 
 三态映射（设计 §2 表格）：
-| SUBMITTED / IN_PROGRESS | 202 + {task_id,status,created_at}，支持 ?wait= |
+| NOT_START / IN_PROGRESS | 202 + {task_id,status,created_at}，支持 ?wait= |
 | SUCCESS                 | 200 + 原文回放                                  |
 | FAILURE / CANCELED      | 重放上游状态码 + 原文；本地失败用 {"error":{}} |
 """
@@ -27,7 +27,7 @@ from app.schemas import (
     CANCELED,
     FAILURE,
     IN_PROGRESS,
-    SUBMITTED,
+    NOT_START,
     SUCCESS,
 )
 from app.services import codec, dynconf, slots, taskstore, tokensession
@@ -43,13 +43,10 @@ def _view(task: dict) -> dict:
 
 
 def _replay(task: dict, config: RuntimeConfig) -> Response:
-    """终态回放。结果已被 TTL 清理 → 410（AC-22）。
+    """终态回放。结果已被 TTL 清理 → 410。
 
     410 而非 404 是有意的：404 意味着「没有这个任务」，客户端会以为
-    task_id 写错了；410 明确表达「任务存在过、结果已过期」，语义不同。
-
-    ``config`` 由调用方传入（一次请求一次快照），410 文案里的保留时长
-    必须反映**当前生效值**而不是进程启动时的 env 值。
+    task_id 写错了；410 明确表达「任务存在过、结果已过期」。
     """
     data: dict = task.get("data") or {}
     encoded = str(data.get("upstream_response") or "")
@@ -70,7 +67,7 @@ def _replay(task: dict, config: RuntimeConfig) -> Response:
                     "invalid_request_error", code="result_expired",
                 ),
             )
-        # 无上游原文的本地失败（会话丢失、体超限、对账补记等）
+        # 无上游原文的本地失败（会话丢失、体超限、超时判死等）
         status = upstream_status if upstream_status >= 400 else 502
         return JSONResponse(
             status_code=status,
@@ -97,11 +94,7 @@ def _replay(task: dict, config: RuntimeConfig) -> Response:
 
 async def view(task_id: str, wait_seconds: int = 0,
                config: RuntimeConfig | None = None) -> Response:
-    """查询端点主逻辑。``wait_seconds > 0`` 时长轮询（AC-23）。
-
-    ``config`` 允许路由层把已取的快照传下来（一次请求一次快照）；未传时
-    自行取一次，保证被直接调用（测试、内部复用）时行为一致。
-    """
+    """查询端点主逻辑。``wait_seconds > 0`` 时长轮询。"""
     if config is None:
         config = await dynconf.get_runtime_config()
 
@@ -125,9 +118,7 @@ async def _long_poll(task_id: str, wait_seconds: int,
     """轮询到终态或超时。
 
     只查 ``status`` 列（不拉整行）——结果体可能有 10MB，每 0.5s 拉一次
-    会把 DB 带宽打满。命中终态后才拉整行。
-
-    性能优化：使用指数退避降低查询频率，高并发时显著减少数据库压力。
+    会把 DB 带宽打满。命中终态后才拉整行。指数退避降低长等待的查询频率。
     """
     budget = min(wait_seconds, config.poll_wait_max_seconds)
     deadline = time.monotonic() + budget
@@ -141,18 +132,15 @@ async def _long_poll(task_id: str, wait_seconds: int,
             return None
         if status not in ACTIVE:
             return await taskstore.get(task_id)
-        # 指数退避：0.5s → 1s → 2s → 4s（上限 max_interval）
-        # 初期快速响应，长时间等待时降低查询频率
         interval = min(interval * 2, max_interval)
     return None
 
 
 async def cancel(task_id: str) -> JSONResponse:
-    """取消（设计 §2）：排队中 → CANCELED（零资金动作）；执行中 → 409。
+    """取消（设计 §2）：排队中 → CANCELED；执行中 → 409。
 
     「执行中不可取消」是上游是同步接口的必然结果——请求已经发出去了，
-    HTTP 没有中止语义，上游该扣的费照扣。硬取消只会让本地状态和上游
-    实际情况脱节。
+    HTTP 没有中止语义。硬取消只会让本地状态和上游实际情况脱节。
     """
     task = await taskstore.get_meta(task_id)
     if task is None:
@@ -165,8 +153,7 @@ async def cancel(task_id: str) -> JSONResponse:
         raise HTTPException(409, "task is in progress and cannot be canceled")
 
     won = await taskstore.cas(
-        task_id, (SUBMITTED,), CANCELED,
-        patch={"inflight_slot": False},
+        task_id, (NOT_START,), CANCELED,
         fail_reason="canceled by client",
     )
     if not won:

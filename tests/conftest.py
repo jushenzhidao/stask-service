@@ -1,7 +1,7 @@
 """统一测试基建：内存版 Redis / 内存 taskstore / respx 出站拦截 / 受控 settings。
 
-原则：单测不依赖真实 MySQL / Redis / new-api / billing。外部边界只有两处——
-- HTTP 出站（billing provider 与 relay 调用）：respx 拦截；
+原则：单测不依赖真实 MySQL / Redis / 上游。外部边界只有两处——
+- HTTP 出站（上游调用与回调推送）：respx 拦截；
 - Redis：手写 FakeRedis（``decode_responses=True`` 语义，覆盖用到的命令子集，
   Lua 脚本按 ``app.redis`` 里的常量做等价 Python 实现）。
 
@@ -198,9 +198,8 @@ _REDIS_CONSUMERS = (
     "app.services.idem",
     "app.services.slots",
     "app.services.tokensession",
-    "app.services.identity",
     "app.services.execute",
-    "app.services.reconcile",
+    "app.services.sweeper",
     "app.services.dynconf",
     "app.healthz",
 )
@@ -218,11 +217,7 @@ def patch_redis(monkeypatch: pytest.MonkeyPatch, fake_redis: FakeRedis) -> FakeR
 
 @pytest.fixture(autouse=True)
 def _reset_dynconf_cache():
-    """dynconf 有 5s 进程内缓存——不清会让上个用例写的覆盖值串到下个用例。
-
-    autouse：这类全局状态泄漏一旦发生，症状是「单跑通过、全量跑失败」，
-    极难定位。宁可每个用例都付一次清理成本。
-    """
+    """dynconf 有 5s 进程内缓存——不清会让上个用例写的覆盖值串到下个用例。"""
     from app.services import dynconf
 
     dynconf._cache = {}
@@ -249,20 +244,24 @@ class InMemoryTaskStore:
 
     # ---- 与 taskstore 同名的接口 ----
 
-    async def create(self, task_id: str, user_id: int, action: str, data: dict) -> None:
+    async def create(self, task_id: str, action: str, data: dict) -> None:
+        from app.config import settings
+
         ts = self._now()
         self.rows[task_id] = {
             "task_id": task_id, "platform": "stask", "action": action,
-            "status": "SUBMITTED", "fail_reason": "", "progress": "STASK_RUNNING",
+            "status": "NOT_START", "fail_reason": "", "progress": "0%",
             "submit_time": ts, "start_time": 0, "finish_time": 0,
             "created_at": ts, "updated_at": ts,
-            "data": json.loads(json.dumps(data)), "user_id": user_id,
-            "channel_id": 0, "quota": 0,
+            "data": json.loads(json.dumps(data)), "user_id": 0,
+            "channel_id": settings.channel_id, "quota": 0,
         }
 
+    async def exists(self, task_id: str) -> bool:
+        return task_id in self.rows
+
     async def cas(self, task_id: str, from_statuses: tuple[str, ...], to_status: str,
-                  patch: dict | None = None, fail_reason: str = "",
-                  channel_id: int | None = None) -> bool:
+                  patch: dict | None = None, fail_reason: str = "") -> bool:
         from app.schemas import TERMINAL
 
         row = self.rows.get(task_id)
@@ -277,8 +276,6 @@ class InMemoryTaskStore:
         if to_status in TERMINAL:
             row["finish_time"] = ts
             row["progress"] = "100%"
-        if channel_id:
-            row["channel_id"] = channel_id
         row["data"] = {**row["data"], **(patch or {})}
         return True
 
@@ -307,8 +304,6 @@ class InMemoryTaskStore:
             return None
 
         def as_json_text(value: Any) -> str | None:
-            if value is None and False:  # pragma: no cover - 占位不可达
-                return None
             if isinstance(value, bool):
                 return "true" if value else "false"
             if isinstance(value, str):
@@ -344,20 +339,6 @@ class InMemoryTaskStore:
                 out[th] = out.get(th, 0) + 1
         return out
 
-    async def reconcile_pending(self, limit: int = 50) -> list[dict]:
-        from app.schemas import ACTIVE
-
-        out = []
-        recheck_before = self._now() - 60
-        for row in self.rows.values():
-            data = row["data"]
-            if row["status"] in ACTIVE and data.get("reconcile_pending") \
-                    and int(data.get("reconcile_checked_at") or 0) < recheck_before:
-                out.append(json.loads(json.dumps(row)))
-            if len(out) >= limit:
-                break
-        return out
-
     async def stale_active(self, stale_seconds: int, limit: int = 200) -> list[str]:
         from app.schemas import ACTIVE
 
@@ -367,11 +348,20 @@ class InMemoryTaskStore:
             if row["status"] in ACTIVE and row["updated_at"] < cutoff
         ][:limit]
 
+    async def overdue_active(self, lifetime_seconds: int, limit: int = 200) -> list[str]:
+        from app.schemas import ACTIVE
+
+        cutoff = self._now() - lifetime_seconds
+        return [
+            tid for tid, row in self.rows.items()
+            if row["status"] in ACTIVE and row["created_at"] < cutoff
+        ][:limit]
+
     async def search(self, *, status: str = "", model: str = "", task_id: str = "",
-                     task_id_prefix: str = "", reconcile_only: bool = False,
+                     task_id_prefix: str = "",
                      since_seconds: int = 0, limit: int = 50, offset: int = 0) -> dict:
         # 校验必须与 taskstore._validate_search_params 完全一致：替身不校验，
-        # 就测不出「非法参数是否返回 400」——测试绿灯而线上是另一套行为。
+        # 就测不出「非法参数是否返回 400」。
         from app.services.taskstore import _validate_search_params
 
         _validate_search_params(
@@ -390,8 +380,6 @@ class InMemoryTaskStore:
             if task_id and row["task_id"] != task_id:
                 return False
             if task_id_prefix and not row["task_id"].startswith(task_id_prefix):
-                return False
-            if reconcile_only and not data.get("reconcile_pending"):
                 return False
             if cutoff and row["created_at"] <= cutoff:
                 return False
@@ -413,8 +401,6 @@ class InMemoryTaskStore:
                 "request_path": data.get("request_path", ""),
                 "upstream_status": data.get("upstream_status", 0),
                 "response_bytes": data.get("response_bytes", 0),
-                "reconcile_pending": bool(data.get("reconcile_pending")),
-                "reconcile_reason": data.get("reconcile_reason", ""),
                 "result_purged": bool(data.get("result_purged")),
             })
         return {"total": len(hits), "items": items, "limit": limit, "offset": offset}
@@ -454,8 +440,6 @@ class InMemoryTaskStore:
             "total": sum(counts.values()),
             "success_rate": round(counts.get("SUCCESS", 0) / done, 4) if done else None,
             "active_total": len(active),
-            "pending_reconcile": sum(
-                1 for r in active if r["data"].get("reconcile_pending")),
             "duration_seconds": {
                 "count": len(durations), "p50": pct(0.50), "p95": pct(0.95),
                 "p99": pct(0.99), "max": durations[-1] if durations else 0,
@@ -493,16 +477,16 @@ _TASKSTORE_CONSUMERS = (
     "app.services.submit",
     "app.services.execute",
     "app.services.flow",
-    "app.services.reconcile",
+    "app.services.sweeper",
     "app.services.notify",
     "app.routers.ops",
 )
 
 #: taskstore 上被业务调用的函数名（逐名替换，漏一个就会打真 DB）
 _TASKSTORE_FUNCS = (
-    "create", "cas", "patch_data", "get", "get_meta", "get_status",
-    "counts_by_status", "active_counts_by_token", "reconcile_pending",
-    "stale_active", "purge_expired_results", "now",
+    "create", "exists", "cas", "patch_data", "get", "get_meta", "get_status",
+    "counts_by_status", "active_counts_by_token",
+    "stale_active", "overdue_active", "purge_expired_results", "now",
     "search", "metrics",
 )
 
@@ -520,66 +504,6 @@ def task_store(monkeypatch: pytest.MonkeyPatch) -> InMemoryTaskStore:
         if hasattr(module, "taskstore"):
             monkeypatch.setattr(module, "taskstore", store)
     return store
-
-
-# ---------------------------------------------------------------------------
-# billing provider
-# ---------------------------------------------------------------------------
-
-
-class FakeBilling:
-    """可编程的 billing 替身。
-
-    ``charges`` 按 task_id 存放"上游确实扣了费"的记录；
-    ``fail_find`` 置 True 时 ``find_charge`` 抛 BillingError（模拟查询失败，
-    对账必须保持挂起而不是判死——这是第二态与第三态的区分点）。
-    """
-
-    def __init__(self) -> None:
-        self.valid = True
-        self.user_id = 42
-        self.balance_value: float | None = 10.0
-        self.balance_error = False
-        self.charges: dict[str, dict] = {}
-        self.fail_find = False
-        self.inspect_calls = 0
-        self.balance_calls = 0
-
-    async def inspect(self, raw_token: str):
-        from app.schemas import UserIdentity
-
-        self.inspect_calls += 1
-        if not self.valid:
-            return None
-        return UserIdentity(user_id=self.user_id, token_id=7)
-
-    async def balance(self, raw_token: str) -> float:
-        from app.services.providers import BillingError
-
-        self.balance_calls += 1
-        if self.balance_error:
-            raise BillingError(503, "billing down")
-        return float(self.balance_value or 0.0)
-
-    async def find_charge(self, raw_token: str, *, task_id: str,
-                          since: int, until: int) -> dict | None:
-        from app.services.providers import BillingError
-
-        if self.fail_find:
-            raise BillingError(500, "log query failed")
-        return self.charges.get(task_id)
-
-
-@pytest.fixture
-def fake_billing(monkeypatch: pytest.MonkeyPatch) -> FakeBilling:
-    import importlib
-
-    provider = FakeBilling()
-    for name in ("app.services.providers", "app.services.identity",
-                 "app.services.reconcile"):
-        module = importlib.import_module(name)
-        monkeypatch.setattr(module, "billing", provider, raising=False)
-    return provider
 
 
 # ---------------------------------------------------------------------------
@@ -630,7 +554,6 @@ def test_settings(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(settings, "upstream_allowlist", ("newapi:3000", "127.0.0.1:3000"))
     monkeypatch.setattr(settings, "upstream_base_url", "http://newapi:3000")
     monkeypatch.setattr(settings, "max_slots", 10)
-    monkeypatch.setattr(settings, "ref_price_default", 1.0)
     monkeypatch.setattr(settings, "rate_limit", 1000)
     monkeypatch.setattr(settings, "retry_max", 0)
     monkeypatch.setattr(settings, "retry_max_connect", 0)
@@ -639,6 +562,7 @@ def test_settings(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(settings, "idem_replay_wait_seconds", 0.2)
     monkeypatch.setattr(settings, "callback_secret", "test-secret")
     monkeypatch.setattr(settings, "callback_allowlist", ())
+    monkeypatch.setattr(settings, "channel_id", 990)
     return settings
 
 
@@ -650,7 +574,7 @@ def respx_router() -> Iterator[respx.MockRouter]:
 
 
 @pytest.fixture
-def client(patch_redis, task_store, fake_billing, queue_events, test_settings):
+def client(patch_redis, task_store, queue_events, test_settings):
     """带全套替身的 ASGI 测试客户端。"""
     from fastapi.testclient import TestClient
 

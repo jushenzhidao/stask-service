@@ -1,19 +1,32 @@
 name: stask
 
+# 通用 HTTP 异步任务服务：web（提交/查询）+ worker（执行+定时）+ redis（队列/锁/会话）。
+# 没有 mysql 服务——tasks 表复用 new-api 的实例（零建表），
+# ST_DATABASE_URL 必须指向 new-api 那个库。
+
+x-app-base: &app-base
+  image: ghcr.io/aichatfire/stask-service:latest
+  build: .
+  restart: unless-stopped
+  # .env 必须存在（make setup 会自动生成）
+  env_file: .env
+  environment:
+    ST_REDIS_URL: ${ST_REDIS_URL:-redis://redis:6379/0}
+  depends_on:
+    redis:
+      condition: service_healthy
+  stop_grace_period: 60s
+  logging:
+    driver: json-file
+    options:
+      max-size: "20m"
+      max-file: "3"
+
 services:
   stask:
-    build: .
-    image: ghcr.io/aichatfire/stask-service:latest
-    restart: unless-stopped
-    # .env 必须存在（make setup 会自动生成）
-    env_file: .env
-    environment:
-      ST_REDIS_URL: ${ST_REDIS_URL:-redis://redis:6379/0}
+    <<: *app-base
     ports:
-      - "8000:8000"
-    depends_on:
-      redis:
-        condition: service_healthy
+      - "${ST_PORT:-8000}:8000"
     healthcheck:
       # slim 镜像没有 curl，用 python 自带的 urllib
       test: ["CMD", "python", "-c",
@@ -22,33 +35,34 @@ services:
       timeout: 5s
       retries: 3
       start_period: 20s
-    stop_grace_period: 60s
 
   worker:
-    image: ghcr.io/aichatfire/stask-service:latest
-    build: .
-    restart: unless-stopped
-    env_file: .env
-    environment:
-      ST_REDIS_URL: ${ST_REDIS_URL:-redis://redis:6379/0}
-    depends_on:
-      redis:
-        condition: service_healthy
+    <<: *app-base
     # scheduler 合并进 worker 进程 —— 它必须单副本（多份会重复触发 cron）。
-    # 扩 worker 时把 scheduler 拆成独立 service，worker 只跑 `taskiq worker`。
+    # 扩 worker 副本时：把 scheduler 拆成独立 service，worker 只跑 `taskiq worker`。
     command: >
       sh -c "taskiq scheduler app.queue:scheduler &
-             exec taskiq worker app.queue:broker --max-async-tasks 64"
-    stop_grace_period: 60s
+             exec taskiq worker app.queue:broker --max-async-tasks ${ST_QUEUE_CONCURRENCY:-64}"
+    healthcheck:
+      # worker 无 HTTP 端口，探 Redis 连通性代替（进程死了容器也会退出重启）
+      test: ["CMD", "python", "-c",
+             "import socket,os;u=os.environ.get('ST_REDIS_URL','redis://redis:6379/0');h=u.split('//')[1].split('/')[0];p=h.split(':');socket.create_connection((p[0],int(p[1]) if len(p)>1 else 6379),timeout=2)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
 
   redis:
     image: redis:7-alpine
     restart: unless-stopped
-    # AOF everysec 是硬要求：丢失窗口 ≤1s，残差由定时校准从 tasks 表重建。
-    # 关掉 AOF 后一次重启就会丢掉全部令牌会话，在途任务集体转对账。
-    command: redis-server --appendonly yes --appendfsync everysec --maxmemory-policy noeviction
+    # AOF everysec 是硬要求：丢失窗口 ≤1s。关掉 AOF 后一次重启会丢掉
+    # 全部令牌会话与派发锁，在途任务集体判死。
+    command: >
+      redis-server --appendonly yes --appendfsync everysec
+                   --maxmemory ${ST_REDIS_MAXMEMORY:-256mb}
+                   --maxmemory-policy noeviction
     ports:
-      - "6381:6379"           # 独立端口，与 atask 的 6380 隔离（ADR-004）
+      - "${ST_REDIS_PORT:-6381}:6379"    # 独立端口，与别家实例隔离（ADR-004）
     volumes:
       - redis-data:/data
     healthcheck:
@@ -56,9 +70,11 @@ services:
       interval: 10s
       timeout: 3s
       retries: 5
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "2"
 
 volumes:
   redis-data:
-
-# 注意：没有 mysql 服务 —— tasks 表复用 new-api 的实例（零建表）。
-# ST_DATABASE_URL 必须指向 new-api 那个库，否则查不到任何任务行。

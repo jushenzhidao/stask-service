@@ -10,7 +10,6 @@ async def test_runtime_config_snapshot_contains_operational_fields(patch_redis, 
     config = await dynconf.get_runtime_config()
 
     assert config.max_slots == test_settings.max_slots
-    assert config.ref_price_default == test_settings.ref_price_default
     assert config.rate_limit == test_settings.rate_limit
     assert config.worker_timeout == test_settings.worker_timeout
     assert config.sweep_enabled == test_settings.sweep_enabled
@@ -57,4 +56,3 @@ async def test_runtime_config_redis_outage_falls_back_to_settings(
     config = await dynconf.get_runtime_config()
 
     assert config.max_slots == test_settings.max_slots
-    assert config.ref_price_default == test_settings.ref_price_default

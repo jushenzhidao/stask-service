@@ -1,8 +1,8 @@
 """运维观测端点。
 
-鉴权复用终端用户令牌（``require_caller``）——本服务没有独立的管理身份，
-这些端点只暴露聚合统计与单任务诊断，不含任何敏感内容：
-- 不返回用户 sk（令牌会话只给存在性 + TTL）；
+鉴权只要求携带 Bearer 令牌（本服务不校验有效性——这些端点只暴露聚合
+统计与单任务诊断，不含任何敏感内容）：
+- 不返回用户令牌（会话只给存在性 + TTL）；
 - 不返回结果原文（只给字节数与 Content-Type）；
 - 不返回请求体（只给路径与模型）。
 """
@@ -12,7 +12,7 @@ from __future__ import annotations
 from fastapi import APIRouter, Depends, HTTPException
 
 from app.deps.auth import Caller, require_caller
-from app.services import reconcile, slots, taskstore, tokensession
+from app.services import slots, sweeper, taskstore, tokensession
 
 router = APIRouter(prefix="/ops")
 
@@ -49,20 +49,18 @@ async def task_detail(task_id: str, _: Caller = Depends(require_caller)) -> dict
         "response_bytes": data.get("response_bytes", 0),
         "result_purged": bool(data.get("result_purged", False)),
         "dispatch_epoch": data.get("dispatch_epoch", 0),
-        "reconcile_pending": bool(data.get("reconcile_pending", False)),
-        "reconcile_reason": data.get("reconcile_reason", ""),
         "callback_delivered": data.get("callback_delivered"),
         "token_session": await tokensession.session_info(task_id),
     }
 
 
-@router.post("/reconcile/run")
-async def run_reconcile(_: Caller = Depends(require_caller)) -> dict:
-    """手工触发一轮对账（排障用；定时任务每分钟自动跑）。"""
-    return await reconcile.run_reconcile()
+@router.post("/sweep/stale")
+async def run_sweep_stale(_: Caller = Depends(require_caller)) -> dict:
+    """手工触发一轮卡死收敛（排障用；定时任务每 2 分钟自动跑）。"""
+    return await sweeper.sweep_stale()
 
 
 @router.post("/slots/recalibrate")
 async def recalibrate(_: Caller = Depends(require_caller)) -> dict:
     """手工触发槽位校准。"""
-    return await reconcile.recalibrate_slots()
+    return await sweeper.recalibrate_slots()

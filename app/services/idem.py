@@ -1,84 +1,93 @@
-"""幂等占位：客户端重试不产生重复任务。
+"""自动幂等：**task_id 即幂等键**。
 
-**原子占位**是这里的核心。朴素做法「先查重放、落库后回填」在两个请求
-真并发时都查不到 → 双建任务 → 上游被调两次 → 用户被扣两次钱。
+设计（v2）：task_id 由请求指纹决定——同一 token 对同一 method/path/query/body
+的字节级相同请求，天然映射到同一个 task_id：
 
-现在的流程把「先查后写」变成原子操作：
-``SET NX`` 写 ``pending`` 占位 → 只有占位者继续创建链路 → 其余请求短轮询
-等同一个键回填为真实 task_id → 回填后回放。
+    task_id = f"{model_slug}_{sha256(token_hash | method | path | query | body | salt)[:32]}"
 
-超时/占位消失一律返回 **409**，绝不放行重建：重建会双建双扣，409 让
-客户端拿原键重试，资金侧零风险。
+客户端重试**不需要**带任何头就自动幂等；想强制重跑同一请求时带
+``Idempotency-Key`` 头作为盐（参与指纹计算）换一个 task_id 即可。
 
-状态流转全部在同一 Redis 键上：``pending`` → ``task_id``。
+去重的事实源是 tasks 表（task_id 查得到 = 已创建过）；Redis 占位只护
+「创建链路在飞」这几百毫秒的窗口，防止同键真并发双建：
+
+    DB 有行 → 直接回放
+    DB 无行 → SET NX 占位 → 占位者创建；其余短轮询等 DB 出现行 → 回放
+    等超时 → 409（绝不放行重建——上游调用可能有副作用）
 """
 
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import time
 
 from app.config import settings
 from app.redis import K_IDEM, LUA_CAS_DELETE, r
 
-#: 占位标记。task_id 形态是 ``{slug}_{32hex}``，绝不与本标记碰撞
+#: 占位值——task_id 形态是 ``{slug}_{32hex}``，绝不与本标记碰撞
 PENDING = "pending"
 
 _WAIT_INTERVAL_SECONDS = 0.05
 
 
-def _key(token_hash: str, idem_key: str) -> str:
-    return K_IDEM.format(token_hash=token_hash, key=idem_key)
+def fingerprint_task_id(
+    model_slug: str,
+    token_hash: str,
+    method: str,
+    path: str,
+    query: str,
+    body: bytes,
+    salt: str = "",
+) -> str:
+    """确定性 task_id：同请求恒同 id（自动幂等的根基）。
 
-
-async def get_task_id(token_hash: str, idem_key: str) -> str | None:
-    """已回填的 task_id；占位中/键不存在 → None。"""
-    value = await r.get(_key(token_hash, idem_key))
-    if not value or value == PENDING:
-        return None
-    return str(value)
-
-
-async def acquire(token_hash: str, idem_key: str) -> tuple[bool, str | None]:
-    """原子占位。返回 ``(owned, replay_task_id)``：
-
-    - ``(True, None)``：抢到占位，调用方走创建链路，落库后 ``set_task_id``
-      回填（失败必须 ``release`` 归还）；
-    - ``(False, task_id)``：键已回填，直接回放；
-    - ``(False, None)``：他方占位中（同键真并发），调用方 ``wait_task_id``。
+    ``salt`` 来自可选的 ``Idempotency-Key`` 头——带不同盐即可对同一
+    请求体强制创建新任务。
     """
+    h = hashlib.sha256()
+    for part in (token_hash, method.upper(), path, query, salt):
+        h.update(part.encode("utf-8"))
+        h.update(b"\x00")
+    h.update(body)
+    return f"{model_slug}_{h.hexdigest()[:32]}"
+
+
+async def acquire(task_id: str) -> bool:
+    """创建窗口占位（SET NX）。True = 本请求负责走创建链路。"""
     ok = await r.set(
-        _key(token_hash, idem_key), PENDING,
+        K_IDEM.format(task_id=task_id), PENDING,
         ex=settings.idem_pending_ttl_seconds, nx=True,
     )
-    if ok:
-        return True, None
-    return False, await get_task_id(token_hash, idem_key)
+    return bool(ok)
 
 
-async def wait_task_id(token_hash: str, idem_key: str) -> str | None:
-    """短轮询等他方占位回填。超时/占位消失 → None（调用方按 409 处理）。"""
-    deadline = time.monotonic() + settings.idem_replay_wait_seconds
-    key = _key(token_hash, idem_key)
-    while time.monotonic() < deadline:
-        value = await r.get(key)
-        if value is None:                 # 占位已消失：创建方失败，不再等
-            return None
-        if value != PENDING:
-            return str(value)
-        await asyncio.sleep(_WAIT_INTERVAL_SECONDS)
-    return None
+async def release(task_id: str) -> None:
+    """创建失败时归还占位（CAS：仅当值仍是 ``pending`` 才删）。"""
+    await r.eval(LUA_CAS_DELETE, 1, K_IDEM.format(task_id=task_id), PENDING)
 
 
-async def set_task_id(token_hash: str, idem_key: str, task_id: str) -> None:
-    """占位回填（占位保证单写者，无需 NX；TTL 换成全量保留期）。"""
-    await r.set(_key(token_hash, idem_key), task_id, ex=settings.idem_ttl)
+async def settle(task_id: str) -> None:
+    """创建成功后清占位——DB 行已是事实源，占位使命完成。"""
+    try:
+        await r.delete(K_IDEM.format(task_id=task_id))
+    except Exception:
+        pass  # 占位有 TTL，删失败也会自行过期
 
 
-async def release(token_hash: str, idem_key: str) -> None:
-    """创建失败时归还占位（CAS：仅当值仍是 ``pending`` 才删）。
+async def wait_row(task_id: str, exists) -> bool:
+    """短轮询等占位者把行写进 DB。
 
-    CAS 而非直接 DEL：并发场景下本请求失败的同时可能已有别的路径回填了
-    真实 task_id，直接删会把有效幂等记录抹掉，导致后续重试重建任务。
+    ``exists``：``async (task_id) -> bool`` 回调（查 tasks 表）。
+    返回 True = 行已出现（调用方回放）；False = 等超时/占位者失败
+    （调用方按 409 处理，绝不放行重建）。
     """
-    await r.eval(LUA_CAS_DELETE, 1, _key(token_hash, idem_key), PENDING)
+    deadline = time.monotonic() + settings.idem_replay_wait_seconds
+    key = K_IDEM.format(task_id=task_id)
+    while time.monotonic() < deadline:
+        if await exists(task_id):
+            return True
+        if await r.get(key) is None:      # 占位消失且行未出现：创建方失败
+            return await exists(task_id)
+        await asyncio.sleep(_WAIT_INTERVAL_SECONDS)
+    return await exists(task_id)

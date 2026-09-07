@@ -8,10 +8,9 @@
 - 测试重载：``get_settings.cache_clear()``；单测更常用
   ``monkeypatch.setattr(settings, "xxx", ...)`` 直接改单例字段。
 
-与 atask-service 的区别：env 前缀 ``ST_``（atask 是 ``GW_``），
-Redis 独立实例 + 键前缀 ``st:``（ADR-004），tasks 表 platform 值独立
-（``ST_GATEWAY_PLATFORM``，默认 ``stask``）——两个网关共享 tasks 表，
-靠 platform 列划分自有行，绝不互相踩踏。
+定位：通用 HTTP 异步任务服务。本服务**不做计费、不做 key 管理**，
+Authorization 只透传给上游，有效性由上游判定。tasks 表复用 new-api 实例，
+靠 ``platform`` 列划分自有行（ADR-001 / ADR-006）。
 """
 
 from __future__ import annotations
@@ -46,7 +45,7 @@ class Settings(BaseSettings):
 
     # ---- 应用 ----
     app_env: str = "dev"
-    app_version: str = "0.1.0"
+    app_version: str = "0.2.0"
     log_level: str = "INFO"
 
     #: 管理面密钥（看板 + 动态配置写入）。**空 = 整个管理面 404**，
@@ -61,20 +60,28 @@ class Settings(BaseSettings):
     db_pool_recycle: int = 1800          # 必须 < MySQL wait_timeout
     db_pool_pre_ping: bool = True
 
-    #: tasks 表 platform 列取值——本网关自有行的唯一标识（写侧 WHERE 必带）
+    #: tasks 表 platform 列取值——本服务自有行的唯一标识（写侧 WHERE 必带）。
+    #: 必须避开 new-api 内置平台值（suno/mj/...），使 GetTaskAdaptorFunc
+    #: 返回 nil、原生任务轮询天然跳过本服务的行（ADR-006）。
     gateway_platform: str = "stask"
+
+    #: tasks 表 channel_id 列取值——外部任务专用的独立渠道号（ADR-006）。
+    #: **必须是 new-api 中真实存在的渠道 id**（禁用状态也行，缓存含禁用渠道）。
+    #: 原因：new-api 轮询 updateVideoTasks 里 CacheGetChannel 在 adaptor nil
+    #: 检查**之前**执行——渠道不存在时该渠道下全部任务会被无 CAS 批量强制
+    #: FAILURE（"Failed to get channel info"），adaptor 为 nil 救不了。
+    #: 0 = 未配置（启动时打告警；若上游轮询开启，在途任务会被误杀）。
+    channel_id: int = 0
 
     # ---- Redis（独立实例，ADR-004）----
     redis_url: str = "redis://127.0.0.1:6381/0"
-    #: 全部键的统一前缀（即便误连 atask 实例也不会撞键）
+    #: 全部键的统一前缀（即便误连别家实例也不会撞键）
     redis_key_prefix: str = "st"
 
     # ---- 上游寻址（§7）----
-    #: 默认 upstream（nginx 未注入 X-Upstream-Base-Url 头时的回落值）。
+    #: 默认 upstream（请求未带 X-Upstream-Base-Url 头时的回落值）。
     #: 上游对本项目而言**只是一个 HTTP 服务**：new-api 是默认实现，换任何
     #: 同步生成接口只要加进 allowlist 即可，本服务不感知它是谁。
-    #: 别名里保留旧名 ``ST_NEWAPI_BASE_URL``：存量 .env 不改名也能起来，
-    #: 否则改名会让已部署实例静默回落默认值、把请求打到错的上游。
     upstream_base_url: str = Field(
         default="http://127.0.0.1:3000",
         validation_alias=AliasChoices("ST_UPSTREAM_BASE_URL", "ST_NEWAPI_BASE_URL"),
@@ -89,37 +96,27 @@ class Settings(BaseSettings):
     #: 硬拒前缀（deny 优先于 allow）：管理面绝不允许被任务化转发
     async_deny_prefixes: Annotated[tuple[str, ...], NoDecode] = ("/api/", "/console/")
 
-    # ---- 计费服务（余额 / 身份内省 / 消费日志，全部 HTTP，红线：禁止跨服务读库）----
-    billing_svc_url: str = "http://127.0.0.1:8080"
-    http_timeout: float = 10.0
-    balance_cache_ttl: int = 30          # 余额缓存秒（§6）
-    inspect_cache_ttl: int = 30          # 身份内省缓存秒
-
-    # ---- 余额并发额度（§6）----
-    #: 参考单价兜底值（USD/次）——按模型覆盖用 ``ST_REF_PRICE_{MODEL}``，
-    #: 模型名中的 ``-``/``.``/``/`` 全部替换为 ``_`` 再大写（见 pricing.ref_price）
-    ref_price_default: float = 0.04
-    max_slots: int = 10                  # 单用户在途上限
+    # ---- 并发保护（本服务不做资金判定，纯固定闸门）----
+    max_slots: int = 10                  # 单 token 在途上限
     slot_ttl_seconds: int = 3600         # 槽键 TTL 兜底（进程崩溃不永久泄漏）
 
     # ---- 限流与幂等 ----
     rate_limit: int = 60                 # 每窗口提交次数
     rate_limit_window_seconds: int = 60
-    idem_ttl: int = 86400                # 幂等键回填后的保留秒
+    #: 自动幂等窗口：同一 token 的字节级相同请求在此窗口内只创建一个任务
+    idem_ttl: int = 86400
     idem_pending_ttl_seconds: int = 30   # 占位标记 TTL（创建链路在飞窗口）
     idem_replay_wait_seconds: float = 3.0  # 同键真并发的短轮询等待上限
 
     # ---- worker 执行（§5、§8）----
     worker_timeout: int = 120            # 上游调用超时秒
-    #: 5xx 重试次数。**默认 0（ADR-002 保守决策）**：上游的 5xx
-    #: 是否确定回滚预扣配额尚未确认，重试可能造成双扣。确认后改这个值即可开。
-    retry_max: int = 0
-    #: 连接层错误（请求未到达上游，重试零资金风险）的独立重试次数
+    retry_max: int = 0                   # 5xx 重试次数（上游可能有副作用，默认不重试）
+    #: 连接层错误（请求未到达上游，重试零副作用）的独立重试次数
     retry_max_connect: int = 2
     retry_backoff_base: float = 1.0
     dispatch_lock_margin_seconds: int = 30   # 派发锁 TTL = worker_timeout + margin
     queue_concurrency: int = 64          # worker 并发度（taskiq --max-async-tasks）
-    sk_session_ttl_seconds: int = 172800  # 令牌会话 TTL（48h，终态即清）
+    sk_session_ttl_seconds: int = 7200   # 令牌会话 TTL（2h，终态即清）
 
     # ---- 提交/响应体上限 ----
     body_max_bytes: int = 2 * 1024 * 1024        # 提交体落库上限（2MB）
@@ -129,11 +126,12 @@ class Settings(BaseSettings):
     poll_wait_max_seconds: int = 60      # ?wait= 的上限（须 < nginx proxy_read_timeout）
     poll_interval_seconds: float = 0.5
 
-    # ---- 超时对账（§8）----
-    reconcile_ttl: int = 86400           # 挂起转人工秒
-    reconcile_batch_limit: int = 50
-    reconcile_log_window_seconds: int = 3600   # 查消费日志的时间窗
-    reconcile_biz_type: str = ""         # 消费日志 biz_type 过滤（空 = 不过滤）
+    # ---- 卡死任务收敛（§8）----
+    #: 每轮兜底扫描条数
+    sweep_batch_limit: int = 200
+    #: 任务最大生命期（秒）：超过即判死 FAILURE。必须 < new-api 的 24h
+    #: 超时清理线（否则会被上游 sweepTimedOutTasks 抢先动我们的行）。
+    task_max_lifetime_seconds: int = 6 * 3600
 
     # ---- 结果存储（§9）----
     result_ttl_seconds: int = 86400      # 结果保留秒，到期清空 upstream_response

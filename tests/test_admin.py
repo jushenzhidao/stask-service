@@ -235,7 +235,7 @@ async def test_task_detail_never_leaks_secrets(admin_client, task_store, patch_r
     from app.services import tokensession
 
     task_id = "img_" + "1" * 32
-    await task_store.create(task_id, 42, "/x", {
+    await task_store.create(task_id, "/x", {
         "token_hash": "th", "model": "dall-e-3",
         "request_body": codec.encode(b'{"prompt":"top secret prompt"}'),
         "upstream_response": codec.encode(b'{"url":"https://cdn/secret.png"}'),
@@ -260,7 +260,7 @@ def test_task_detail_404(admin_client):
 
 async def test_requeue_only_for_active(admin_client, task_store, queue_events):
     task_id = "img_" + "2" * 32
-    await task_store.create(task_id, 42, "/x", {"token_hash": "th"})
+    await task_store.create(task_id, "/x", {"token_hash": "th"})
 
     resp = admin_client.post(f"/admin/api/tasks/{task_id}/requeue", headers=ADMIN)
     assert resp.status_code == 200
@@ -286,7 +286,7 @@ async def three_tasks(task_store):
     """img_aaa… / img_aab… / vid_aaa… ——前缀可区分、精确可区分。"""
     ids = ["img_" + "a" * 32, "img_" + "a" * 31 + "b", "vid_" + "a" * 32]
     for tid in ids:
-        await task_store.create(tid, 42, "/x", {"model": "dall-e-3"})
+        await task_store.create(tid, "/x", {"model": "dall-e-3"})
     return ids
 
 
@@ -361,7 +361,7 @@ def test_dashboard_offers_exact_and_prefix_modes(admin_client):
     assert 'id="tkErr"' in html
 
 
-def test_job_trigger(admin_client, fake_billing):
+def test_job_trigger(admin_client):
     resp = admin_client.post("/admin/api/jobs/stale", headers=ADMIN)
     assert resp.status_code == 200
     assert "scanned" in resp.json()

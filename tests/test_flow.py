@@ -18,10 +18,10 @@ TASK = "dall_e_3_" + "b" * 32
 TH = "tokenhash0000000000000000000000"
 
 
-async def _seed(task_store, status="SUBMITTED", **data_over) -> str:
-    await task_store.create(TASK, 42, "/v1/images/generations", {
+async def _seed(task_store, status="NOT_START", **data_over) -> str:
+    await task_store.create(TASK, "/v1/images/generations", {
         "source": "stask", "model": "dall-e-3", "token_hash": TH,
-        "inflight_slot": True, "upstream_response": "",
+        "upstream_response": "",
         "upstream_content_type": "", "upstream_status": 0,
         **data_over,
     })
@@ -43,7 +43,7 @@ async def test_pending_returns_202(client, task_store):
     assert resp.status_code == 202
     body = resp.json()
     assert body["task_id"] == TASK
-    assert body["status"] == "SUBMITTED"
+    assert body["status"] == "NOT_START"
     assert "created_at" in body
 
 
@@ -197,7 +197,6 @@ async def test_cancel_pending_task(client, task_store, patch_redis):
     row = task_store.rows[TASK]
     assert row["status"] == "CANCELED"
     assert row["progress"] == "100%"
-    assert row["data"]["inflight_slot"] is False
     assert await slots.current(TH) == 0
     assert await tokensession.get(TASK) is None
 

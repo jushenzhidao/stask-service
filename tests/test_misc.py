@@ -121,7 +121,7 @@ def test_callback_allowlist_enforced(monkeypatch, test_settings):
 async def test_callback_delivery_signs_request(task_store, patch_redis,
                                                test_settings, respx_router):
     task_id = "img_" + "d" * 32
-    await task_store.create(task_id, 42, "/x", {
+    await task_store.create(task_id, "/x", {
         "callback_url": "http://cb.example/hook", "upstream_status": 200,
     })
     task_store.rows[task_id]["status"] = "SUCCESS"
@@ -145,7 +145,7 @@ async def test_callback_delivery_signs_request(task_store, patch_redis,
 async def test_callback_retries_with_backoff(task_store, patch_redis, test_settings,
                                              respx_router, queue_events):
     task_id = "img_" + "e" * 32
-    await task_store.create(task_id, 42, "/x", {"callback_url": "http://cb.example/h"})
+    await task_store.create(task_id, "/x", {"callback_url": "http://cb.example/h"})
     task_store.rows[task_id]["status"] = "FAILURE"
     respx_router.post("http://cb.example/h").mock(return_value=httpx.Response(500))
 
@@ -159,7 +159,7 @@ async def test_callback_exhausts_and_records(task_store, patch_redis, monkeypatc
                                              queue_events):
     monkeypatch.setattr(test_settings, "callback_max_attempts", 2)
     task_id = "img_" + "f" * 32
-    await task_store.create(task_id, 42, "/x", {"callback_url": "http://cb.example/h"})
+    await task_store.create(task_id, "/x", {"callback_url": "http://cb.example/h"})
     task_store.rows[task_id]["status"] = "FAILURE"
     respx_router.post("http://cb.example/h").mock(return_value=httpx.Response(500))
 
@@ -182,10 +182,10 @@ def test_healthz_live_has_no_dependencies(client):
 
 
 async def test_ops_stats(client, task_store):
-    await task_store.create("a_" + "1" * 32, 42, "/x", {"token_hash": "th"})
+    await task_store.create("a_" + "1" * 32, "/x", {"token_hash": "th"})
     resp = client.get("/ops/stats", headers=AUTH)
     assert resp.status_code == 200
-    assert resp.json()["status_counts"]["SUBMITTED"] == 1
+    assert resp.json()["status_counts"]["NOT_START"] == 1
 
 
 async def test_ops_task_detail_never_leaks_sk_or_body(client, task_store,
@@ -194,7 +194,7 @@ async def test_ops_task_detail_never_leaks_sk_or_body(client, task_store,
     from app.services import tokensession
 
     task_id = "img_" + "9" * 32
-    await task_store.create(task_id, 42, "/x", {
+    await task_store.create(task_id, "/x", {
         "token_hash": "th", "model": "dall-e-3",
         "request_body": codec.encode(b'{"prompt":"secret prompt"}'),
         "upstream_response": codec.encode(b'{"url":"x"}'),

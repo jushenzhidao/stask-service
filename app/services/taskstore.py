@@ -1,13 +1,23 @@
-"""tasks 表读写（new-api 现有表，本服务零建表）。
+"""tasks 表读写（复用 new-api 现有表，本服务零建表）。
 
 三条铁律：
 
 1. **扩展字段全部在 ``data`` JSON 列**，用 ``JSON_MERGE_PATCH`` 合并，
    绝不 ALTER 表结构。
 2. **状态迁移一律 CAS**：``rowcount == 1`` 才算抢到推进权（恰好一次语义）。
-   worker 重投、对账补记、用户取消可能同时到达，只有一个能赢。
-3. **写侧 WHERE 必带 ``platform``**：tasks 是三方共享表（new-api 原生任务、
-   atask ``gateway``、本服务 ``stask``），绝不动别人的行。
+3. **读写侧 WHERE 必带 ``platform``**：tasks 是共享表（new-api 原生任务 +
+   本服务 ``stask``），绝不动别人的行。
+
+与 new-api 的共存契约（ADR-006）：
+- ``platform`` = 自定义值（非 suno/mj）→ ``GetTaskAdaptorFunc`` 返回 nil，
+  原生任务轮询天然跳过本服务的行；
+- ``channel_id`` = 独立渠道号（``ST_CHANNEL_ID``），不与上游任务混用；
+- ``quota`` 恒 0 —— 本服务不做计费，上游超时清理即便动到我们的行，
+  退款金额也是 0，零资金影响；
+- ``status``/``progress`` 用 new-api 原生枚举（``NOT_START``/``0%``/``100%``），
+  共享表里的行对上游工具（看板、SQL 巡检）保持可读；
+- 任务生命期（``ST_TASK_MAX_LIFETIME_SECONDS``，默认 6h）必须远小于
+  new-api 的 24h 超时清理线——我们先于上游收敛自己的行。
 
 时间口径：表里的时间列**应该**是 unix 秒，但 new-api 原生任务模块用过
 UnixMilli 写法，所以读侧统一 ``as_unix_seconds`` 归一、SQL 侧统一套
@@ -79,10 +89,9 @@ _TIME_COLUMNS = ("submit_time", "start_time", "finish_time", "created_at", "upda
 def _secs(column: str) -> str:
     """SQL 侧时间列归一表达式（毫秒 → 秒）。
 
-    读侧的 Python 归一救不了**在 SQL 里做的比较**（对账窗口、结果清理
+    读侧的 Python 归一救不了**在 SQL 里做的比较**（超期判定、结果清理
     全是 ``col < :cutoff``）：cutoff 恒为秒，列里混进毫秒值会让判定彻底
-    失真——毫秒行永远躲过筛选，秒行一旦被拿去与毫秒口径比较就会被瞬间
-    命中。所有时间比较统一套这个表达式，口径只有一种。
+    失真。所有时间比较统一套这个表达式，口径只有一种。
     """
     return f"IF({column} > {_UNIX_MS_THRESHOLD}, {column} DIV 1000, {column})"
 
@@ -101,7 +110,6 @@ def as_unix_seconds(value: Any) -> int:
 def _row_to_dict(row: Any) -> dict:
     result = dict(row)
     data = result.get("data")
-    # 性能优化：data 已经是 dict 时不重复解析（MySQL JSON 列在某些驱动下会自动解码）
     if isinstance(data, dict):
         result["data"] = data
     elif isinstance(data, str):
@@ -122,14 +130,14 @@ def _row_to_dict(row: Any) -> dict:
 # ---------------------------------------------------------------------------
 
 
-async def create(task_id: str, user_id: int, action: str, data: dict) -> None:
-    """落库 SUBMITTED。``channel_id`` 恒 0（执行后尽力回填），``quota`` 恒 0
-    （资金全在上游内部闭环，本服务零金额记账）。
+async def create(task_id: str, action: str, data: dict) -> None:
+    """落库 NOT_START（ADR-006 契约行）。
 
-    ``progress`` 写 ``STASK_RUNNING`` 而非 ``0%``：让 new-api 的
-    ``sweepTimedOutTasks``（WHERE 含 ``progress != '100%'``）识别这是
-    stask 的行、不应触碰。该扫描不过滤 platform，若误判我们的超时任务
-    为 FAILURE 终态，用户付了钱但任务被判死、对账 CAS 永远推不动。
+    - ``channel_id`` = 独立渠道号（``ST_CHANNEL_ID``）；
+    - ``quota`` 恒 0 —— 零资金记账，上游即便误动本行退款也是 0；
+    - ``user_id`` 恒 0 —— 本服务不做 key 管理，不知道也不需要知道用户；
+    - ``progress`` 用原生 ``0%`` —— 我们的生命期 sweeper（6h）先于
+      new-api 的 24h 清理收敛，不需要伪装 progress 躲扫描。
     """
     ts = now()
     async with get_session_factory()() as db:
@@ -141,8 +149,8 @@ async def create(task_id: str, user_id: int, action: str, data: dict) -> None:
                    user_id, channel_id, quota, submit_time, start_time,
                    created_at, updated_at)
                 VALUES
-                  (:task_id, :platform, :action, 'SUBMITTED', 'STASK_RUNNING', CAST(:data AS JSON),
-                   :user_id, 0, 0, :now, 0, :now, :now)
+                  (:task_id, :platform, :action, 'NOT_START', '0%', CAST(:data AS JSON),
+                   0, :channel_id, 0, :now, 0, :now, :now)
                 """
             ),
             {
@@ -150,7 +158,7 @@ async def create(task_id: str, user_id: int, action: str, data: dict) -> None:
                 "platform": settings.gateway_platform,
                 "action": action,
                 "data": json.dumps(data, ensure_ascii=False),
-                "user_id": user_id,
+                "channel_id": settings.channel_id,
                 "now": ts,
             },
         )
@@ -163,25 +171,23 @@ async def cas(
     to_status: str,
     patch: dict | None = None,
     fail_reason: str = "",
-    channel_id: int | None = None,
 ) -> bool:
     """CAS 状态迁移。返回 True = 本调用者抢到推进权（负责释放槽/清会话/回调）。
 
     - 终态一律把 ``progress`` 置 ``100%``（不只 SUCCESS）——失败/取消停在
       ``0%`` 会让看板与客户端以为任务还在跑；
     - 终态一律用**秒**刷 ``finish_time``；``IN_PROGRESS`` 顺带刷 ``start_time``；
-    - ``fail_reason`` 截断到 500 字符（表是 Text，但没必要塞整篇上游报错）。
+    - ``fail_reason`` 截断到 500 字符。
     """
     ts = now()
     terminal = 1 if to_status in TERMINAL else 0
     running = 1 if to_status == "IN_PROGRESS" else 0
-    set_channel = "channel_id = :channel_id, " if channel_id else ""
     stmt = text(
-        f"""
+        """
         UPDATE tasks
         SET status = :to,
             updated_at = :now,
-            {set_channel}start_time = IF(:running = 1, :now, start_time),
+            start_time = IF(:running = 1, :now, start_time),
             finish_time = IF(:terminal = 1, :now, finish_time),
             progress = IF(:terminal = 1, '100%', progress),
             fail_reason = :reason,
@@ -200,8 +206,6 @@ async def cas(
         "p": settings.gateway_platform,
         "froms": from_statuses,
     }
-    if channel_id:
-        params["channel_id"] = channel_id
     async with get_session_factory()() as db:
         res = cast("CursorResult[Any]", await db.execute(stmt, params))
         await db.commit()
@@ -209,7 +213,7 @@ async def cas(
 
 
 async def patch_data(task_id: str, patch: dict) -> None:
-    """非迁移性的数据合并（回填 channel_id 之外的观测字段、对账时间戳等）。"""
+    """非迁移性的数据合并（观测字段回填等）。"""
     async with get_session_factory()() as db:
         await db.execute(
             text(
@@ -235,20 +239,27 @@ async def patch_data(task_id: str, patch: dict) -> None:
 # ---------------------------------------------------------------------------
 
 
+async def exists(task_id: str) -> bool:
+    """自动幂等的事实源检查：行在 = 已创建过（idem.wait_row 的回调）。"""
+    async with get_session_factory()() as db:
+        row = (
+            await db.execute(
+                text("SELECT 1 FROM tasks WHERE task_id = :t AND platform = :p LIMIT 1"),
+                {"t": task_id, "p": settings.gateway_platform},
+            )
+        ).scalar()
+    return row is not None
+
+
 async def get(task_id: str) -> dict | None:
     """按 task_id 取**整行**（含 ``upstream_response`` 大字段）。
 
     只给**必须拿到原始结果体**的路径用：查询端点的字节级回放
     (`flow._replay`) 与 worker 执行前取请求体 (`execute.run`)。
-    其余只看元数据的路径（看板详情、ops 诊断、对账、回调推送）一律走
-    :func:`get_meta`——``data`` 里的结果体单行可达 10MB，拉回来纯属浪费。
+    其余只看元数据的路径一律走 :func:`get_meta`。
 
-    读侧必须加 platform 过滤：虽然我们的 task_id 生成算法
-    (``{model}_{uuid4hex}``) 碰撞概率极低，但 new-api 的 tasks 表在
-    task_id 上**只有普通索引，无唯一约束**（gorm tag 是 ``index`` 而非
-    ``uniqueIndex``）。new-api 自己的 ``GetUniqueByOnlyTaskId`` 函数注释
-    承认历史 task_id 不全局唯一，用 ``LIMIT 2`` 防重。不加 platform 过滤
-    可能返回别家的行——越权读取。
+    读侧必须加 platform 过滤：new-api 的 tasks 表在 task_id 上只有普通
+    索引、无唯一约束，不加过滤可能读到别家的行——越权读取。
     """
     async with get_session_factory()() as db:
         row = (
@@ -262,7 +273,7 @@ async def get(task_id: str) -> dict | None:
 
 #: 轻量投影的表列清单（显式列出，绝不 ``SELECT *``）
 _META_COLUMNS = (
-    "task_id", "status", "fail_reason", "progress", "user_id", "channel_id",
+    "task_id", "status", "fail_reason", "progress", "channel_id",
     "submit_time", "start_time", "finish_time", "created_at", "updated_at",
 )
 
@@ -272,11 +283,10 @@ _META_COLUMNS = (
 _META_STR_KEYS = (
     "model", "request_method", "request_path", "request_query",
     "upstream_base_url", "upstream_content_type",
-    "reconcile_reason", "reconcile_charge_id",
     "idempotency_key", "callback_url", "token_hash",
 )
 _META_INT_KEYS = ("upstream_status", "response_bytes", "dispatch_epoch")
-_META_BOOL_KEYS = ("result_purged", "body_truncated", "reconcile_pending")
+_META_BOOL_KEYS = ("result_purged", "body_truncated")
 #: 三态（None = 从未回调过 / True = 已送达 / False = 重试耗尽）
 _META_TRISTATE_KEYS = ("callback_delivered",)
 
@@ -313,7 +323,6 @@ def _meta_row_to_dict(row: Any) -> dict:
     result["status"] = str(result.get("status") or "")
     result["fail_reason"] = str(result.get("fail_reason") or "")
     result["progress"] = str(result.get("progress") or "")
-    result["user_id"] = _meta_int(result.get("user_id"))
     result["channel_id"] = _meta_int(result.get("channel_id"))
 
     data: dict[str, Any] = {}
@@ -333,16 +342,9 @@ def _meta_row_to_dict(row: Any) -> dict:
 async def get_meta(task_id: str) -> dict | None:
     """单行**元数据**投影：显式列 + 逐键 ``data ->> '$.x'``，不碰大字段。
 
-    ``upstream_response`` / ``request_body`` / ``request_headers`` 单行可达
-    10MB（出图、TTS、视频的原始响应体经 gzip+base64 存在 ``data`` 里）。
-    看板详情、ops 诊断、对账扫描、回调推送这些路径**一个字节都用不到**，
-    但 ``SELECT *`` 会把它们全量拉过 DB 连接——并发几个就能打满带宽。
-
-    返回结构与 :func:`get` 对齐（顶层列 + ``data`` 子字典），调用方无需改
-    取值方式；差别只有 ``data`` 里仅含 :data:`_META_DATA_KEYS` 这些键。
-    需要回放原始结果的路径必须继续用 :func:`get`。
-
-    读侧加 platform 过滤的理由见 :func:`get`。
+    ``upstream_response`` / ``request_body`` 单行可达 10MB。看板详情、
+    ops 诊断、回调推送这些路径一个字节都用不到，``SELECT *`` 会把它们
+    全量拉过 DB 连接——并发几个就能打满带宽。
     """
     async with get_session_factory()() as db:
         row = (
@@ -355,10 +357,7 @@ async def get_meta(task_id: str) -> dict | None:
 
 
 async def get_status(task_id: str) -> str | None:
-    """轻量状态查询（长轮询每 0.5s 一次，不必拉整行含 10MB 结果体）。
-
-    读侧加 platform 过滤的理由见 :func:`get`。
-    """
+    """轻量状态查询（长轮询每 0.5s 一次，不必拉整行含 10MB 结果体）。"""
     async with get_session_factory()() as db:
         row = (
             await db.execute(
@@ -406,39 +405,8 @@ async def active_counts_by_token() -> dict[str, int]:
     return {str(row[0]): int(row[1]) for row in rows}
 
 
-async def reconcile_pending(limit: int = 50) -> list[dict]:
-    """超时挂起待对账的任务（设计 §8：超时绝不判死，标 reconcile_pending）。
-
-    ``reconcile_checked_at`` 用于退避——每轮只捞距上次核对超过一个
-    ``poll_interval`` 的，避免同一批任务被反复查 billing 日志。
-    """
-    recheck_before = now() - 60
-    async with get_session_factory()() as db:
-        rows = (
-            await db.execute(
-                text(
-                    """
-                    SELECT task_id, status, created_at, data FROM tasks
-                    WHERE platform = :p AND status IN :acts
-                      AND COALESCE(data ->> '$.reconcile_pending', 'false') = 'true'
-                      AND CAST(COALESCE(data ->> '$.reconcile_checked_at', '0') AS UNSIGNED)
-                          < :recheck
-                    LIMIT :lim
-                    """
-                ).bindparams(bindparam("acts", expanding=True)),
-                {
-                    "p": settings.gateway_platform,
-                    "acts": ACTIVE,
-                    "recheck": recheck_before,
-                    "lim": limit,
-                },
-            )
-        ).mappings().all()
-    return [_row_to_dict(row) for row in rows]
-
-
 async def stale_active(stale_seconds: int, limit: int = 200) -> list[str]:
-    """长时间未更新的非终态任务（worker 崩溃/消息丢失的兜底扫描）。"""
+    """长时间未更新的非终态任务（消息丢失/worker 崩溃/超期的兜底扫描）。"""
     cutoff = now() - stale_seconds
     async with get_session_factory()() as db:
         rows = (
@@ -462,13 +430,37 @@ async def stale_active(stale_seconds: int, limit: int = 200) -> list[str]:
     return [str(x) for x in rows]
 
 
+async def overdue_active(lifetime_seconds: int, limit: int = 200) -> list[str]:
+    """超过最大生命期仍非终态的任务（按 created_at 判定，无条件判死对象）。"""
+    cutoff = now() - lifetime_seconds
+    async with get_session_factory()() as db:
+        rows = (
+            await db.execute(
+                text(
+                    f"""
+                    SELECT task_id FROM tasks
+                    WHERE platform = :p AND status IN :acts
+                      AND {_secs('created_at')} < :cutoff
+                    LIMIT :lim
+                    """
+                ).bindparams(bindparam("acts", expanding=True)),
+                {
+                    "p": settings.gateway_platform,
+                    "acts": ACTIVE,
+                    "cutoff": cutoff,
+                    "lim": limit,
+                },
+            )
+        ).scalars().all()
+    return [str(x) for x in rows]
+
+
 async def search(
     *,
     status: str = "",
     model: str = "",
     task_id: str = "",
     task_id_prefix: str = "",
-    reconcile_only: bool = False,
     since_seconds: int = 0,
     limit: int = 50,
     offset: int = 0,
@@ -477,9 +469,6 @@ async def search(
 
     ``task_id`` 只支持精确匹配；需要按前缀检索时使用 ``task_id_prefix``，
     生成可使用 task_id 索引的 ``LIKE 'prefix%'``，禁止任意片段模糊搜索。
-
-    性能优化：COUNT 查询添加 SQL_CALC_FOUND_ROWS 提示（MySQL 5.7+ 已废弃，
-    改用并发执行 COUNT 和 SELECT，总延迟降至较慢查询的时间）。
     """
     _validate_search_params(
         task_id=task_id, task_id_prefix=task_id_prefix,
@@ -498,18 +487,14 @@ async def search(
         where.append("task_id = :tid")
         params["tid"] = task_id
     elif task_id_prefix:
-        # 前缀值不允许通配符，LIKE 参数保持可使用 task_id 索引。
         where.append("task_id LIKE :tid_prefix")
         params["tid_prefix"] = f"{_escape_like_prefix(task_id_prefix)}%"
-    if reconcile_only:
-        where.append("COALESCE(data ->> '$.reconcile_pending', 'false') = 'true'")
     if since_seconds > 0:
         where.append(f"{_secs('created_at')} > :since")
         params["since"] = now() - since_seconds
 
     clause = " AND ".join(where)
 
-    # 并发执行 COUNT 和 SELECT：总延迟 = max(COUNT 时间, SELECT 时间)
     import asyncio
 
     async def _count() -> int:
@@ -532,8 +517,6 @@ async def search(
                                data ->> '$.request_path'     AS request_path,
                                data ->> '$.upstream_status'  AS upstream_status,
                                data ->> '$.response_bytes'   AS response_bytes,
-                               data ->> '$.reconcile_pending' AS reconcile_pending,
-                               data ->> '$.reconcile_reason' AS reconcile_reason,
                                data ->> '$.result_purged'    AS result_purged
                         FROM tasks WHERE {clause}
                         ORDER BY id DESC LIMIT :lim OFFSET :off
@@ -553,7 +536,6 @@ async def search(
             item[col] = as_unix_seconds(item.get(col))
         finish, start = item["finish_time"], item["start_time"]
         item["duration"] = (finish - start) if (finish and start and finish >= start) else 0
-        item["reconcile_pending"] = str(item.get("reconcile_pending")) == "true"
         item["result_purged"] = str(item.get("result_purged")) == "true"
         items.append(item)
 
@@ -562,10 +544,7 @@ async def search(
 
 
 async def metrics(window_seconds: int = 3600) -> dict:
-    """看板概览指标：窗口内状态分布、失败原因 TopN、模型分布、耗时分位。
-
-    性能优化：用 asyncio.gather 并发执行所有查询，减少总延迟。
-    """
+    """看板概览指标：窗口内状态分布、失败原因 TopN、模型分布、耗时分位。"""
     if not 60 <= window_seconds <= _ADMIN_MAX_WINDOW_SECONDS:
         raise ValueError("window must be between 60 and 604800 seconds")
     since = now() - window_seconds
@@ -643,44 +622,27 @@ async def metrics(window_seconds: int = 3600) -> dict:
             ).scalars().all()
             return list(rows)
 
-    async def _query_reconcile_pending() -> int:
-        async with get_session_factory()() as db:
-            return (
-                await db.execute(
-                    text(
-                        """
-                        SELECT COUNT(*) FROM tasks
-                        WHERE platform = :p AND status IN ('SUBMITTED', 'IN_PROGRESS')
-                          AND COALESCE(data ->> '$.reconcile_pending', 'false') = 'true'
-                        """
-                    ),
-                    {"p": p},
-                )
-            ).scalar() or 0
-
     async def _query_active_total() -> int:
         async with get_session_factory()() as db:
             return (
                 await db.execute(
                     text(
                         "SELECT COUNT(*) FROM tasks WHERE platform = :p "
-                        "AND status IN ('SUBMITTED', 'IN_PROGRESS')"
+                        "AND status IN ('NOT_START', 'IN_PROGRESS')"
                     ),
                     {"p": p},
                 )
             ).scalar() or 0
 
-    # 并发执行所有查询：5 次串行 → 1 次并发，延迟降至最慢查询的时间
     import asyncio
-    (status_rows, fail_rows, model_rows, duration_rows,
-     pending_reconcile, active_total) = await asyncio.gather(
-        _query_status(),
-        _query_failures(),
-        _query_models(),
-        _query_durations(),
-        _query_reconcile_pending(),
-        _query_active_total(),
-    )
+    status_rows, fail_rows, model_rows, duration_rows, active_total = \
+        await asyncio.gather(
+            _query_status(),
+            _query_failures(),
+            _query_models(),
+            _query_durations(),
+            _query_active_total(),
+        )
 
     counts = {str(row[0]): int(row[1]) for row in status_rows}
     done = counts.get("SUCCESS", 0) + counts.get("FAILURE", 0)
@@ -697,7 +659,6 @@ async def metrics(window_seconds: int = 3600) -> dict:
         "total": sum(counts.values()),
         "success_rate": round(counts.get("SUCCESS", 0) / done, 4) if done else None,
         "active_total": int(active_total),
-        "pending_reconcile": int(pending_reconcile),
         "duration_seconds": {
             "count": len(durations),
             "p50": pct(0.50), "p95": pct(0.95), "p99": pct(0.99),
@@ -713,8 +674,7 @@ async def purge_expired_results(ttl_seconds: int, limit: int = 200) -> int:
     """清空超期结果体（设计 §9）：只置空 ``upstream_response``，状态行保留。
 
     ``JSON_SET`` 而非 ``JSON_REMOVE``：留一个空串 + ``result_purged`` 标记，
-    查询端据此返回 410（"结果已过期"）而不是 404（"任务不存在"）——两者
-    对客户端的含义完全不同。
+    查询端据此返回 410（"结果已过期"）而不是 404（"任务不存在"）。
     """
     cutoff = now() - ttl_seconds
     async with get_session_factory()() as db:

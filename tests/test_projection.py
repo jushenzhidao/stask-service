@@ -16,11 +16,10 @@ TASK_ID = "test_projection_123456789012345678"
 async def test_get_meta_excludes_upstream_response(task_store):
     """核心：轻量投影不返回 `upstream_response` 大字段。"""
     large_body = b"X" * (10 * 1024 * 1024)  # 10MB
-    await task_store.create(TASK_ID, 42, "/v1/images/generations", {
+    await task_store.create(TASK_ID, "/v1/images/generations", {
         "model": "dall-e-3",
         "upstream_response": codec.encode(large_body),
         "upstream_status": 200,
-        "reconcile_pending": True,
     })
 
     # 轻量投影：不含 upstream_response
@@ -43,9 +42,8 @@ async def test_get_meta_boolean_fields_are_native_bool(task_store):
     如果不归一，调用方的 `if row["data"]["reconcile_pending"]:` 会因为
     `'false'` 是真值字符串而永远成立——这是非常隐蔽的 bug。
     """
-    await task_store.create(TASK_ID, 42, "/v1/audio/speech", {
+    await task_store.create(TASK_ID, "/v1/audio/speech", {
         "model": "tts-1",
-        "reconcile_pending": False,  # 存为 Python bool
         "result_purged": False,
         "body_truncated": True,
     })
@@ -55,35 +53,33 @@ async def test_get_meta_boolean_fields_are_native_bool(task_store):
     data = meta["data"]
 
     # 必须是原生 bool，不能是字符串
-    assert data["reconcile_pending"] is False
-    assert isinstance(data["reconcile_pending"], bool)
     assert data["result_purged"] is False
     assert isinstance(data["result_purged"], bool)
     assert data["body_truncated"] is True
     assert isinstance(data["body_truncated"], bool)
 
     # 验证反面：如果是字符串 'false'，这个判断会错误成立
-    assert not data["reconcile_pending"]  # 应该为假
-    if data["reconcile_pending"]:
+    assert not data["result_purged"]
+    if data["result_purged"]:
         raise AssertionError("'false' 字符串被当成真值了")
 
 
 async def test_get_meta_tristate_callback_delivered(task_store):
     """三态字段 `callback_delivered`：None / True / False。"""
-    await task_store.create(TASK_ID + "_none", 42, "/v1/images", {
+    await task_store.create(TASK_ID + "_none", "/v1/images", {
         "model": "dall-e-3",
     })
     meta_none = await taskstore.get_meta(TASK_ID + "_none")
     assert meta_none["data"]["callback_delivered"] is None
 
-    await task_store.create(TASK_ID + "_true", 42, "/v1/images", {
+    await task_store.create(TASK_ID + "_true", "/v1/images", {
         "model": "dall-e-3",
         "callback_delivered": True,
     })
     meta_true = await taskstore.get_meta(TASK_ID + "_true")
     assert meta_true["data"]["callback_delivered"] is True
 
-    await task_store.create(TASK_ID + "_false", 42, "/v1/images", {
+    await task_store.create(TASK_ID + "_false", "/v1/images", {
         "model": "dall-e-3",
         "callback_delivered": False,
     })
@@ -93,7 +89,7 @@ async def test_get_meta_tristate_callback_delivered(task_store):
 
 async def test_get_meta_int_fields_are_native_int(task_store):
     """整数字段必须归一为 Python `int`，不能是字符串。"""
-    await task_store.create(TASK_ID, 42, "/v1/images", {
+    await task_store.create(TASK_ID, "/v1/images", {
         "model": "dall-e-3",
         "upstream_status": 429,
         "response_bytes": 1048576,
@@ -114,7 +110,7 @@ async def test_get_meta_int_fields_are_native_int(task_store):
 
 async def test_get_meta_string_fields_default_empty(task_store):
     """字符串字段缺失时应该是空串，不是 None。"""
-    await task_store.create(TASK_ID, 42, "/v1/images", {
+    await task_store.create(TASK_ID, "/v1/images", {
         "model": "dall-e-3",
     })
 
@@ -122,8 +118,6 @@ async def test_get_meta_string_fields_default_empty(task_store):
     assert meta is not None
     data = meta["data"]
 
-    assert data["reconcile_reason"] == ""
-    assert data["reconcile_charge_id"] == ""
     assert data["idempotency_key"] == ""
     assert data["callback_url"] == ""
     assert data["token_hash"] == ""
@@ -131,7 +125,7 @@ async def test_get_meta_string_fields_default_empty(task_store):
 
 async def test_get_meta_covers_all_meta_keys(task_store):
     """确保轻量投影覆盖所有声明的元数据键。"""
-    await task_store.create(TASK_ID, 42, "/v1/audio/speech", {
+    await task_store.create(TASK_ID, "/v1/audio/speech", {
         "model": "tts-1",
         "request_method": "POST",
         "request_path": "/v1/audio/speech",
@@ -143,9 +137,6 @@ async def test_get_meta_covers_all_meta_keys(task_store):
         "dispatch_epoch": 1,
         "result_purged": False,
         "body_truncated": False,
-        "reconcile_pending": True,
-        "reconcile_reason": "timeout",
-        "reconcile_charge_id": "ch_123",
         "idempotency_key": "idem_abc",
         "callback_url": "https://example.com/hook",
         "callback_delivered": True,
@@ -163,8 +154,6 @@ async def test_get_meta_covers_all_meta_keys(task_store):
     assert data["request_query"] == "voice=alloy"
     assert data["upstream_base_url"] == "http://newapi:3000"
     assert data["upstream_content_type"] == "audio/mpeg"
-    assert data["reconcile_reason"] == "timeout"
-    assert data["reconcile_charge_id"] == "ch_123"
     assert data["idempotency_key"] == "idem_abc"
     assert data["callback_url"] == "https://example.com/hook"
     assert data["token_hash"] == "hash_xyz"
@@ -177,7 +166,6 @@ async def test_get_meta_covers_all_meta_keys(task_store):
     # 布尔键
     assert data["result_purged"] is False
     assert data["body_truncated"] is False
-    assert data["reconcile_pending"] is True
 
     # 三态键
     assert data["callback_delivered"] is True
@@ -186,7 +174,7 @@ async def test_get_meta_covers_all_meta_keys(task_store):
 async def test_result_replay_still_uses_get(task_store):
     """结果回放路径必须继续用 `get()`，确保能拿到完整的 `upstream_response`。"""
     payload = b'{"created":1234567890,"data":[{"url":"https://..."}]}'
-    await task_store.create(TASK_ID, 42, "/v1/images/generations", {
+    await task_store.create(TASK_ID, "/v1/images/generations", {
         "model": "dall-e-3",
         "upstream_response": codec.encode(payload),
         "upstream_status": 200,
