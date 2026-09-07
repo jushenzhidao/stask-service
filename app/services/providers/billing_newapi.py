@@ -1,4 +1,4 @@
-"""newapi-billing-service 适配（https://github.com/AIChatfire/newapi-billing-service）。
+"""billing 服务适配（地址由 ``ST_BILLING_SVC_URL`` 配置）。
 
 统一前缀 ``/api/v1``；鉴权恒为 ``Authorization: Bearer <终端用户 sk- 令牌>``，
 user_id 由令牌解析（本服务不指定 user_id，也不缓存跨用户数据）。
