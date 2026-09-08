@@ -12,7 +12,7 @@
 | 2026-08-21 | 设计 §12 ⑤ | 超大响应是否外置对象存储 | 10MB 上限 + gzip 已覆盖出图/TTS 的常见体量 | 本期不做；超限直接落 FAILURE + `response_too_large` 并打点 | 需要真实流量分布数据 | 出现 `response_too_large` 告警累计超阈值 | OPEN（`design-decision-to-evaluate`） |
 | 2026-08-21 | 设计 §12 ⑥ | 是否与 atask 共用 Redis 实例 | 故障域、内存配额、敏感数据同库 | 独立实例 + `st:` 键前缀双保险 | - | - | RESOLVED → ADR-004 |
 | 2026-08-21 | 实现 §8 | 消费日志按 X-Task-Id 反查（对账精确匹配） | — | — | — | — | RESOLVED（v0.2 去计费化：对账机制整体删除；X-Task-Id 头保留仅作上游日志反查排障用） |
-| 2026-08-21 | 实现 §4 | 入队失败时任务行**保留为 FAILURE** 而非删除 | 幂等语义 vs 上游被重复调用 | 入队是「响应可能丢失」的操作：broker 已收下但确认没回来时任务其实在跑，删行会让重试重建第二个任务、上游被调两次。让自动幂等把重试回放到 FAILURE 更安全 | - | - | RESOLVED（见 `submit.py` 回滚注释与 `test_enqueue_failure_rolls_back`） |
+| 2026-08-21 | 实现 §4 | 入队失败时任务行**保留为 FAILURE** 而非删除 | 幂等语义 vs 上游被重复调用 | 入队是「响应可能丢失」的操作：broker 已收下但确认没回来时任务其实在跑，删行会让重试重建第二个任务、上游被调两次。让幂等回放把重试导向 FAILURE 而非重建更安全（v0.3 起幂等为显式 `Idempotency-Key` 语义，ADR-007） | - | - | RESOLVED（见 `submit.py` 回滚注释与 `test_enqueue_failure_rolls_back`） |
 
 ## 三类固定 slug 说明
 

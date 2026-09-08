@@ -2,7 +2,7 @@
 
 把一个**同步 HTTP 接口**变成长任务：给目标路径加 `/async` 前缀提交，毫秒返回
 本地 `task_id`，结果异步取回。除此之外没有别的职责——**不做计费、不做 key
-管理**，只做队列化 worker。Authorization 原样透传给上游，有效性由上游判定。
+管理**，只做队列化 worker。Authorization 原样透传给上游。
 
 **上游只是一个 HTTP 服务**（new-api 是默认实现，换任何同步生成接口只要进
 allowlist 即可）。鉴权、渠道选择、配额扣费、限流全部在上游内部闭环。
@@ -11,13 +11,20 @@ allowlist 即可）。鉴权、渠道选择、配额扣费、限流全部在上�
 nginx（同一域名）
 ├─ /async/ → stask-service          其余 → 上游 HTTP
 │
-stask web    提交：请求指纹自动幂等 → 占槽 → 落库 NOT_START → 令牌会话 → 入队 → 202
+stask web    提交：鉴权（AUTH_MODE）→ 幂等占位 → 占槽 → 落库 QUEUED → 令牌会话 → 入队 → 202
 stask worker 执行：派发锁 → 用户令牌调上游同步接口 → 响应即终态落库 → 释放槽/清会话/回调
 上游          鉴权 / 渠道 / 扣费 / 限流，零改动
 ```
 
-状态机：`NOT_START → IN_PROGRESS → SUCCESS / FAILURE / CANCELED`
-（与 new-api tasks 表原生枚举对齐，ADR-006）。
+状态机：`QUEUED → IN_PROGRESS → SUCCESS / FAILURE / CANCELED`
+（new-api tasks 表原生枚举，两活跃态，ADR-006）。
+
+鉴权按 `AUTH_MODE` 分流（ADR-007）：
+
+| 模式 | 行为 |
+|---|---|
+| `generic`（默认） | 零动作——key 有效性由上游在任务执行时判定，提交链路零额外开销 |
+| `newapi` | 共享库单 SQL 直查 tokens ⋈ users：key 有效性 + 状态/额度预检 + user_id 回查；无效 key 提交即 401，额度耗尽 402，DB 挂 502 不放行。双层缓存（进程内 5s + Redis 300s），只缓存正向结果 |
 
 > **已知耦合（有意保留）**：任务行落在与 new-api 同实例的 `tasks` 表上，靠
 > `platform='stask'` + 独立 `channel_id` + `quota=0` 与上游任务零冲突共存
@@ -54,7 +61,7 @@ make up          # 起全套（web + worker + redis）
 
 | Method | Path | 说明 |
 |---|---|---|
-| POST/PUT | `/async/{path}` | 提交。202 + `{task_id,status,replayed}` + `Location` 头，**自动幂等** |
+| POST/PUT | `/async/{path}` | 提交。202 + `{task_id,status,replayed}` + `Location` 头，**默认不去重**；带 `Idempotency-Key` 头才幂等 |
 | GET | `/async/{path}/{task_id}` | 查询。202 进行中 / 200 原文回放 / 重放上游错误码；`?wait=60` 长轮询 |
 | DELETE | `/async/{path}/{task_id}` | 取消。排队中 → CANCELED；执行中 → 409 |
 | GET | `/healthz/live` `/healthz/ready` | 探针 |
@@ -185,7 +192,7 @@ app/
 
 ## 测试
 
-216 个用例，不依赖真实 MySQL / Redis / 上游：
+254 个用例，不依赖真实 MySQL / Redis / 上游：
 Redis 用手写 FakeRedis（Lua 按 `app/redis.py` 常量做等价 Python 实现），
 tasks 表用 InMemoryTaskStore（保留 CAS 与 data 合并语义），
 出站 HTTP 用 respx 拦截（未声明的请求立即失败），
