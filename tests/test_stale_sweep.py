@@ -13,7 +13,7 @@ from app.services import slots, sweeper
 TH = "tokenhash0000000000000000000000"
 
 
-async def _seed(task_store, task_id: str, *, status: str = "NOT_START",
+async def _seed(task_store, task_id: str, *, status: str = "QUEUED",
                 age: int = 0, epoch: int = 0, created_age: int | None = None) -> None:
     await task_store.create(task_id, "/v1/images/generations", {
         "source": "stask", "token_hash": TH, "dispatch_epoch": epoch,
@@ -32,7 +32,7 @@ async def _seed(task_store, task_id: str, *, status: str = "NOT_START",
 
 async def test_lost_enqueue_is_requeued(task_store, patch_redis, test_settings,
                                         queue_events):
-    """核心场景：NOT_START、从未派发（epoch=0）、锁不在 → 重投。"""
+    """核心场景：QUEUED、从未派发（epoch=0）、锁不在 → 重投。"""
     task_id = "img_" + "a" * 32
     await _seed(task_store, task_id, age=9999)
 
@@ -40,7 +40,7 @@ async def test_lost_enqueue_is_requeued(task_store, patch_redis, test_settings,
 
     assert result["requeued"] == 1 and result["killed"] == 0
     assert queue_events.execute == [task_id]
-    assert task_store.rows[task_id]["status"] == "NOT_START"  # 状态不变，等 worker
+    assert task_store.rows[task_id]["status"] == "QUEUED"  # 状态不变，等 worker
 
 
 async def test_dispatched_then_lost_is_killed(task_store, patch_redis, test_settings,

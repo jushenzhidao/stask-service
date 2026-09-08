@@ -13,11 +13,22 @@
 
 from __future__ import annotations
 
+import asyncio
+from collections.abc import Awaitable, Callable, Sequence
+from typing import TypeVar
+
 from app.config import settings
 from app.logging import log
 from app.redis import K_DISPATCH, K_SWEEP_LOCK, r
-from app.schemas import ACTIVE, FAILURE, IN_PROGRESS, NOT_START
+from app.schemas import ACTIVE, FAILURE
 from app.services import dynconf, slots, taskstore, tokensession
+
+T = TypeVar("T")
+
+#: 批内并发上限。批最大 200 条、每条 2~3 次 DB + 1 次 Redis 往返，
+#: 串行时一轮要几百个 RTT；开并发但必须有界——sweeper 与在线请求
+#: 共用同一个连接池，无界 gather 会把池吃干导致提交链路排队。
+_SWEEP_CONCURRENCY = 8
 
 
 def now() -> int:
@@ -34,14 +45,39 @@ async def _lock(job: str, ttl: int) -> bool:
         return False
 
 
-async def _kill(task_id: str, reason: str) -> bool:
-    """判死一个非终态任务：CAS → 释放槽 → 清会话 → 可选回调。"""
-    task = await taskstore.get_meta(task_id)
-    if task is None or task["status"] not in ACTIVE:
+async def _gather_bounded(
+    items: Sequence[T],
+    handler: Callable[[T], Awaitable[bool]],
+    *,
+    label: str,
+) -> int:
+    """有界并发跑一批，返回成功计数；单条异常只记日志不中断整批。"""
+    sem = asyncio.Semaphore(_SWEEP_CONCURRENCY)
+
+    async def run(item: T) -> bool:
+        async with sem:
+            try:
+                return await handler(item)
+            except Exception:
+                log.opt(exception=True).error("{} sweep item failed: {}", label, item)
+                return False
+
+    results = await asyncio.gather(*(run(item) for item in items))
+    return sum(1 for ok in results if ok)
+
+
+async def _kill(task: dict, reason: str) -> bool:
+    """判死一个非终态任务：CAS → 释放槽 → 清会话 → 可选回调。
+
+    入参是**已查好的元数据行**（不是 task_id）：调用方扫描时已经拿到了
+    整行，再回查一次纯属浪费——批量判死时那是每条一条多余查询。
+    """
+    task_id = str(task["task_id"])
+    if task["status"] not in ACTIVE:
         return False
     data: dict = task.get("data") or {}
     won = await taskstore.cas(
-        task_id, (NOT_START, IN_PROGRESS), FAILURE, fail_reason=reason,
+        task_id, ACTIVE, FAILURE, fail_reason=reason,
     )
     if not won:
         return False
@@ -63,7 +99,7 @@ async def _kill(task_id: str, reason: str) -> bool:
 async def sweep_stale() -> dict:
     """卡死任务收敛——补上「入队消息丢失」这条路径。
 
-    问题：提交链路落库 NOT_START 之后才入队。如果 broker 抖动/Redis 重启
+    问题：提交链路落库 QUEUED 之后才入队。如果 broker 抖动/Redis 重启
     把消息丢了，worker 永远不会执行这个任务，客户端查询永远 202。
 
     做法：超龄无进展的非终态任务，看派发锁——
@@ -79,42 +115,40 @@ async def sweep_stale() -> dict:
 
     threshold = (await dynconf.get_int("worker_timeout")
                  + await dynconf.get_int("dispatch_lock_margin_seconds") + 60)
-    task_ids = await taskstore.stale_active(
+    tasks = await taskstore.stale_active(
         threshold, await dynconf.get_int("sweep_batch_limit")
     )
-    requeued = 0
     killed = 0
-    for task_id in task_ids:
-        try:
-            task = await taskstore.get_meta(task_id)
-            if task is None or task["status"] not in ACTIVE:
-                continue
-            lock_alive = False
-            try:
-                lock_alive = await r.get(K_DISPATCH.format(task_id=task_id)) is not None
-            except Exception:
-                lock_alive = True          # Redis 不可用：保守视为在飞
-            if lock_alive:
-                continue
-            # 锁已过期：上一次调用（若有）早已结束。已派发过（epoch>0）的
-            # 任务结果已不可得，判死；从未派发过的（消息丢失）重投一次。
-            epoch = int((task.get("data") or {}).get("dispatch_epoch") or 0)
-            if epoch > 0:
-                if await _kill(task_id, "stale after dispatch (result unavailable)"):
-                    killed += 1
-                continue
-            from app.queue import publish_execute
 
-            await publish_execute(task_id)
-            await taskstore.patch_data(task_id, {"requeued_at": now()})
-            requeued += 1
-            log.warning("stale task requeued: task_id={}", task_id)
+    async def handle(task: dict) -> bool:
+        nonlocal killed
+        task_id = str(task["task_id"])
+        if task["status"] not in ACTIVE:
+            return False
+        try:
+            lock_alive = await r.get(K_DISPATCH.format(task_id=task_id)) is not None
         except Exception:
-            log.opt(exception=True).error("stale sweep item failed: {}", task_id)
+            lock_alive = True              # Redis 不可用：保守视为在飞
+        if lock_alive:
+            return False
+        # 锁已过期：上一次调用（若有）早已结束。已派发过（epoch>0）的
+        # 任务结果已不可得，判死；从未派发过的（消息丢失）重投一次。
+        if int((task.get("data") or {}).get("dispatch_epoch") or 0) > 0:
+            if await _kill(task, "stale after dispatch (result unavailable)"):
+                killed += 1
+            return False
+        from app.queue import publish_execute
+
+        await publish_execute(task_id)
+        await taskstore.patch_data(task_id, {"requeued_at": now()})
+        log.warning("stale task requeued: task_id={}", task_id)
+        return True
+
+    requeued = await _gather_bounded(tasks, handle, label="stale")
     if requeued or killed:
         log.info("stale sweep: scanned={} requeued={} killed={}",
-                 len(task_ids), requeued, killed)
-    return {"scanned": len(task_ids), "requeued": requeued, "killed": killed}
+                 len(tasks), requeued, killed)
+    return {"scanned": len(tasks), "requeued": requeued, "killed": killed}
 
 
 async def sweep_overdue() -> dict:
@@ -127,19 +161,16 @@ async def sweep_overdue() -> dict:
     if not await _lock("overdue", 110):
         return {"skipped": "locked"}
     lifetime = await dynconf.get_int("task_max_lifetime_seconds")
-    task_ids = await taskstore.overdue_active(
+    tasks = await taskstore.overdue_active(
         lifetime, await dynconf.get_int("sweep_batch_limit")
     )
-    killed = 0
-    for task_id in task_ids:
-        try:
-            if await _kill(task_id, f"task exceeded max lifetime ({lifetime}s)"):
-                killed += 1
-        except Exception:
-            log.opt(exception=True).error("overdue sweep item failed: {}", task_id)
+    reason = f"task exceeded max lifetime ({lifetime}s)"
+    killed = await _gather_bounded(
+        tasks, lambda task: _kill(task, reason), label="overdue"
+    )
     if killed:
-        log.info("overdue sweep: scanned={} killed={}", len(task_ids), killed)
-    return {"scanned": len(task_ids), "killed": killed}
+        log.info("overdue sweep: scanned={} killed={}", len(tasks), killed)
+    return {"scanned": len(tasks), "killed": killed}
 
 
 async def recalibrate_slots() -> dict:
@@ -151,14 +182,15 @@ async def recalibrate_slots() -> dict:
     if not await _lock("slots", 280):
         return {"skipped": "locked"}
     truth = await taskstore.active_counts_by_token()
-    fixed = 0
-    for token_hash, count in truth.items():
-        try:
-            if await slots.current(token_hash) != count:
-                await slots.reset(token_hash, count)
-                fixed += 1
-        except Exception:
-            log.opt(exception=True).debug("slot recalibrate failed: {}", token_hash)
+
+    async def fix(item: tuple[str, int]) -> bool:
+        token_hash, count = item
+        if await slots.current(token_hash) == count:
+            return False
+        await slots.reset(token_hash, count)
+        return True
+
+    fixed = await _gather_bounded(list(truth.items()), fix, label="slots")
     if fixed:
         log.info("slot recalibration: tokens={} fixed={}", len(truth), fixed)
     return {"tokens": len(truth), "fixed": fixed}

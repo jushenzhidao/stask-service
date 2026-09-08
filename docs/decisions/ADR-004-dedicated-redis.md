@@ -12,9 +12,9 @@ stask 的 Redis 承载：幂等占位、并发槽计数、限流窗口、身份/
 
 ## Decision
 
-**独立实例**（compose 映射 6381），同时**所有键仍加 `st:` 前缀**（`ST_REDIS_KEY_PREFIX`）。
+**独立实例**（compose 映射 6381），同时**所有键仍加 `st:` 前缀**（`REDIS_KEY_PREFIX`）。
 
-前缀是第二道防线：即便运维把 `ST_REDIS_URL` 误配成 atask 的实例，两边键空间也不会碰撞（`gw:*` vs `st:*`），最坏结果只是共享内存与故障域，不会数据串台。
+前缀是第二道防线：即便运维把 `REDIS_URL` 误配成 atask 的实例，两边键空间也不会碰撞（`gw:*` vs `st:*`），最坏结果只是共享内存与故障域，不会数据串台。
 
 ## Consequences
 

@@ -16,8 +16,9 @@ import httpx
 import pytest
 
 from app import main
-from app.config import settings
-from app.services import codec, notify, taskstore
+from app.config import normalize_database_url, settings
+from app.services import admission, codec, notify, taskstore
+from app.services.admission import AdmissionError
 from tests.conftest import AUTH
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -42,11 +43,24 @@ def test_as_unix_seconds(value, expected):
     assert taskstore.as_unix_seconds(value) == expected
 
 
-def test_secs_sql_expression_covers_both_units():
-    """SQL 侧归一：读侧 Python 归一救不了 `col < :cutoff` 这种比较。"""
-    expr = taskstore._secs("created_at")
-    assert "created_at > 100000000000" in expr
-    assert "created_at DIV 1000" in expr
+def test_sql_time_predicates_are_bare_columns():
+    """时间谓词必须裸列比较，否则 sweeper/看板的 range 条件吃不到索引。
+
+    前提是写侧恒写 unix 秒（见下一个用例）+ WHERE 恒带 platform，
+    所以 SQL 侧不再需要 ``IF(col > 1e11, col DIV 1000, col)`` 包裹。
+    这条是机械门禁：包裹一旦被写回来就失败。
+    """
+    source = (ROOT / "app" / "services" / "taskstore.py").read_text("utf-8")
+    body = source.split('"""', 2)[2]          # 去掉模块 docstring 里的说明文字
+    assert "DIV 1000" not in body
+    assert str(taskstore._UNIX_MS_THRESHOLD) not in body.replace(
+        "_UNIX_MS_THRESHOLD = 100_000_000_000", ""
+    )
+
+
+def test_write_side_timestamps_are_seconds():
+    """裸列比较的前提：本服务写入的时间列恒为秒，绝不写毫秒。"""
+    assert taskstore.now() < taskstore._UNIX_MS_THRESHOLD
 
 
 # ---------------------------------------------------------------------------
@@ -211,6 +225,91 @@ def test_healthz_ready_reports_channel_id_without_gating(client, monkeypatch):
     assert resp.json()["config"] == {"channel_id": 0}
 
 
+@pytest.mark.parametrize("raw,host,port,db,password", [
+    # new-api 的 SQL_DSN（Go DSN，官方示例）
+    ("root:123456@tcp(localhost:3306)/oneapi", "localhost", 3306, "oneapi", "123456"),
+    # 省略端口 → 补 3306
+    ("root:123456@tcp(127.0.0.1)/oneapi", "127.0.0.1", 3306, "oneapi", "123456"),
+    # 密码里带 @ 和 / ：必须以 @tcp( 为锚点切，不能按第一个 @ 切
+    ("root:p@ss/w0rd@tcp(db:3306)/oneapi", "db", 3306, "oneapi", "p@ss/w0rd"),
+    # 混种：SQLAlchemy 壳 + Go 的 tcp() + 重复问号（曾经让服务直接起不来）
+    ("mysql+asyncmy://root:pwd@tcp(h:3306)/db??charset=utf8mb4", "h", 3306, "db", "pwd"),
+    # 标准写法原样保留
+    ("mysql+asyncmy://root:pwd@h:3306/db?charset=utf8mb4", "h", 3306, "db", "pwd"),
+    # 同步 scheme 补成 asyncmy
+    ("mysql://root:pwd@h:3306/db", "h", 3306, "db", "pwd"),
+])
+def test_database_url_accepts_newapi_sql_dsn(raw, host, port, db, password):
+    """tasks 表与 new-api 共用，连接串要能直接吃上游那份（Go DSN）。"""
+    from sqlalchemy.engine import make_url
+
+    url = make_url(normalize_database_url(raw))
+    assert (url.host, url.port, url.database, url.password) == (host, port, db, password)
+    assert url.drivername == "mysql+asyncmy"
+
+
+def test_sql_dsn_env_alias_is_accepted(monkeypatch):
+    """``SQL_DSN`` 是 new-api 的变量名——两边共用同一份配置，不必再抄一遍。"""
+    from app.config import Settings
+
+    monkeypatch.setenv("SQL_DSN", "root:pwd@tcp(db:3306)/oneapi?parseTime=True")
+    # _env_file=None：别让本机 .env 干扰
+    built = Settings(_env_file=None)
+    assert built.database_url == "mysql+asyncmy://root:pwd@db:3306/oneapi?charset=utf8mb4"
+
+
+def test_settings_have_no_env_prefix():
+    """环境变量名 = 字段名大写，不带 ST_ 前缀。
+
+    这是**契约**而不是实现细节：.env 的键名、compose 的 environment、
+    gunicorn.conf.py 的直读全部依赖它。一旦有人把前缀加回来，存量 .env
+    会静默失效——所以钉住。
+    """
+    from app.config import Settings
+
+    assert Settings.model_config.get("env_prefix", "") == ""
+
+
+def test_empty_upstream_allowlist_means_unrestricted(monkeypatch):
+    """留空 = 不限制，与 CALLBACK_ALLOWLIST 同一套语义。
+
+    放行意味着 X-Upstream-Base-Url 头能决定令牌发往哪里，所以只有 scheme /
+    userinfo / query 这几道硬校验还在（它们防的是 SSRF 手法，与白名单无关）。
+    """
+    monkeypatch.setattr(settings, "upstream_allowlist", ())
+    assert admission.resolve_upstream("http://anything.example.com:9999") == (
+        "http://anything.example.com:9999"
+    )
+    for bad, code in [
+        ("ftp://x.com", "upstream_invalid_scheme"),
+        ("http://u:p@x.com", "upstream_userinfo"),
+        ("http://x.com/?a=1", "upstream_invalid"),
+    ]:
+        with pytest.raises(AdmissionError) as ei:
+            admission.resolve_upstream(bad)
+        assert ei.value.code == code
+
+
+def test_taskiq_admin_url_without_token_is_silent_failure(monkeypatch):
+    """看板改为必选后，URL 有、token 空 = 静默不上报——必须在启动期点出来。"""
+    monkeypatch.setattr(settings, "app_env", "dev")
+    monkeypatch.setattr(settings, "taskiq_admin_url", "http://taskiq-admin:3000")
+    monkeypatch.setattr(settings, "taskiq_admin_api_token", "")
+    main._check_taskiq_admin()                       # 非生产：只告警
+
+    monkeypatch.setattr(settings, "app_env", "prod")
+    with pytest.raises(RuntimeError, match="TASKIQ_ADMIN_API_TOKEN"):
+        main._check_taskiq_admin()
+
+
+def test_taskiq_admin_check_skipped_without_url(monkeypatch):
+    """没配 URL（本机 standalone）就不该拿 token 说事。"""
+    monkeypatch.setattr(settings, "app_env", "prod")
+    monkeypatch.setattr(settings, "taskiq_admin_url", "")
+    monkeypatch.setattr(settings, "taskiq_admin_api_token", "")
+    main._check_taskiq_admin()
+
+
 @pytest.mark.parametrize("app_env,should_raise", [
     ("dev", False), ("test", False), ("prod", True), ("PRODUCTION", True),
 ])
@@ -220,7 +319,7 @@ def test_channel_id_missing_is_fatal_only_in_prod(monkeypatch, app_env, should_r
     monkeypatch.setattr(settings, "channel_id", 0)
 
     if should_raise:
-        with pytest.raises(RuntimeError, match="ST_CHANNEL_ID"):
+        with pytest.raises(RuntimeError, match="CHANNEL_ID"):
             main._warn_coexistence_risks()
     else:
         main._warn_coexistence_risks()      # 非生产只告警，不阻断
@@ -230,7 +329,7 @@ async def test_ops_stats(client, task_store):
     await task_store.create("a_" + "1" * 32, "/x", {"token_hash": "th"})
     resp = client.get("/ops/stats", headers=AUTH)
     assert resp.status_code == 200
-    assert resp.json()["status_counts"]["NOT_START"] == 1
+    assert resp.json()["status_counts"]["QUEUED"] == 1
 
 
 async def test_ops_task_detail_never_leaks_sk_or_body(client, task_store,

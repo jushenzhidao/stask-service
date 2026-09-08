@@ -76,7 +76,7 @@
   .t-SUCCESS  { background: var(--green-bg); color: var(--green); }
   .t-FAILURE  { background: var(--red-bg);   color: var(--red); }
   .t-CANCELED { background: var(--gray-bg);  color: var(--muted); }
-  .t-NOT_START, .t-IN_PROGRESS { background: var(--blue-bg); color: var(--blue); }
+  .t-QUEUED, .t-IN_PROGRESS { background: var(--blue-bg); color: var(--blue); }
   .t-warn { background: var(--amber-bg); color: var(--amber); }
 
   .tabs { display: flex; gap: 4px; margin-bottom: 16px; flex-wrap: wrap; }
@@ -127,7 +127,7 @@
   <div class="card login">
     <h2>stask-service 控制台</h2>
     <p class="faint" style="margin-top:-6px">
-      需要管理密钥（<span class="mono">ST_ADMIN_KEY</span>）。密钥只存本页会话，不写入地址栏。
+      需要管理密钥（<span class="mono">ADMIN_KEY</span>）。密钥只存本页会话，不写入地址栏。
     </p>
     <div id="loginErr"></div>
     <div class="row">
@@ -141,7 +141,7 @@
 <div class="wrap" id="app" hidden>
   <header>
     <h1>stask-service</h1>
-    <span class="tag t-NOT_START mono" id="verTag">-</span>
+    <span class="tag t-QUEUED mono" id="verTag">-</span>
     <span style="flex:1"></span>
     <select id="window">
       <option value="3600">近 1 小时</option>
@@ -194,7 +194,7 @@
       <div class="row" style="margin-bottom:12px">
         <select id="fStatus">
           <option value="">全部状态</option>
-          <option>NOT_START</option><option>IN_PROGRESS</option>
+          <option>QUEUED</option><option>IN_PROGRESS</option>
           <option>SUCCESS</option><option>FAILURE</option><option>CANCELED</option>
         </select>
         <input id="fModel" placeholder="模型" style="width:150px">
@@ -282,7 +282,7 @@
     <div class="card">
       <h2>活跃任务</h2>
       <div class="faint" style="margin-bottom:10px">
-        当前在途（NOT_START / IN_PROGRESS）的任务。卡死的由 sweeper 自动收敛：
+        当前在途（QUEUED / IN_PROGRESS）的任务。卡死的由 sweeper 自动收敛：
         锁过期且未派发过的重投，派发后失联或超龄（默认 6h）的判死。
       </div>
       <div style="overflow:auto;max-height:44vh">
@@ -390,12 +390,12 @@ async function loadOverview() {
   $("kpis").innerHTML =
     kpi("窗口内任务", ICONS.total, d.total, "创建于所选时间范围") +
     kpi("成功率", ICONS.ok, rate, "SUCCESS / (SUCCESS + FAILURE)") +
-    kpi("当前在途", ICONS.active, d.active_total, "NOT_START + IN_PROGRESS，全时段") +
+    kpi("当前在途", ICONS.active, d.active_total, "QUEUED + IN_PROGRESS，全时段") +
     kpi("失败数", ICONS.warn, (d.status_counts || {}).FAILURE || 0, "窗口内 FAILURE 总数");
 
   const counts = d.status_counts || {};
   const max = Math.max(1, ...Object.values(counts));
-  const order = ["SUCCESS", "FAILURE", "IN_PROGRESS", "NOT_START", "CANCELED"];
+  const order = ["SUCCESS", "FAILURE", "IN_PROGRESS", "QUEUED", "CANCELED"];
   const keys = order.filter((k) => counts[k]).concat(
     Object.keys(counts).filter((k) => !order.includes(k)));
   $("statusDist").innerHTML = keys.length ? keys.map((k) => `
@@ -509,7 +509,7 @@ async function showTask(id) {
     ["该用户在途占槽", d.slots_in_use],
   ];
   let html = rows.map(([k, v]) => `<dt>${esc(k)}</dt><dd>${v}</dd>`).join("");
-  if (d.status === "NOT_START" || d.status === "IN_PROGRESS") {
+  if (d.status === "QUEUED" || d.status === "IN_PROGRESS") {
     html += `<dt>操作</dt><dd>
       <button id="rq">重投队列</button>
       <div class="faint" style="margin-top:6px">
@@ -566,7 +566,7 @@ async function loadConfig() {
 
 async function loadActive() {
   const [a, b] = await Promise.all([
-    api("/tasks?status=NOT_START&limit=50"),
+    api("/tasks?status=QUEUED&limit=50"),
     api("/tasks?status=IN_PROGRESS&limit=50"),
   ]);
   const items = [...a.items, ...b.items];

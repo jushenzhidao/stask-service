@@ -2,7 +2,8 @@
 
 这是**唯一**允许直读 os.environ 的地方——master 进程在 app 模块加载之前
 就要拿到 workers/bind，此时 pydantic-settings 单例还不存在。
-代价是：本机 ``make run`` 不会加载 .env，这里读到的 ST_* 全是默认值，
+业务配置无 env 前缀（如 POLL_WAIT_MAX_SECONDS），进程级参数仍带 GUNICORN_ 前缀。
+代价是：本机 ``make run`` 不会加载 .env，这里读到的业务配置全是默认值，
 只有容器里（compose 的 env_file）才是真实值——推导结果以容器为准。
 
 ``preload_app = True`` 配合 app 里的惰性单例：fork 前只加载代码不建连接，
@@ -37,18 +38,18 @@ proc_name = os.environ.get("GUNICORN_PROC_NAME", "stask-service")
 
 # ---- 约束 1：worker 数由 DB 连接预算反推 ----
 # 每个 worker 独占一个连接池（preload 只加载代码，连接池在 fork 后各自创建）。
-_DB_PER_WORKER = max(1, _env_int("ST_DB_POOL_SIZE", 10) + _env_int("ST_DB_MAX_OVERFLOW", 10))
+_DB_PER_WORKER = max(1, _env_int("DB_POOL_SIZE", 10) + _env_int("DB_MAX_OVERFLOW", 10))
 # MySQL 实例实际的 max_connections；共享实例上按低的那个填
-_DB_BUDGET = _env_int("ST_DB_MAX_CONNECTIONS", 151)
+_DB_BUDGET = _env_int("DB_MAX_CONNECTIONS", 151)
 # 分给 web 的份额，剩下的留给 worker 进程、new-api 自己和管理连接
-_DB_WEB_SHARE = float(os.environ.get("ST_DB_WEB_CONNECTION_SHARE", "0.5"))
+_DB_WEB_SHARE = float(os.environ.get("DB_WEB_CONNECTION_SHARE", "0.5"))
 _BY_BUDGET = max(1, int(_DB_BUDGET * _DB_WEB_SHARE) // _DB_PER_WORKER)
 _BY_CPU = min(16, multiprocessing.cpu_count() * 2 + 1)
 # 最少 2 个：单 worker 在 max_requests 回收或崩溃重启的窗口里就是单点
 workers = _env_int("GUNICORN_WORKERS", 0) or max(2, min(_BY_CPU, _BY_BUDGET))
 
 # ---- 约束 2 / 3：超时由长轮询窗口推导 ----
-_POLL_WAIT = _env_int("ST_POLL_WAIT_MAX_SECONDS", 60)
+_POLL_WAIT = _env_int("POLL_WAIT_MAX_SECONDS", 60)
 # +120 给上游/DB 抖动留余量：60s 轮询 → 180s；调到 120s 轮询 → 240s
 timeout = _env_int("GUNICORN_TIMEOUT", 0) or max(180, _POLL_WAIT + 120)
 # +15 让在飞的长轮询走完再退；再夹一层 timeout-5 防止两者倒挂
@@ -81,7 +82,7 @@ forwarded_allow_ips = os.environ.get("FORWARDED_ALLOW_IPS", "127.0.0.1")
 
 accesslog = "-" if os.environ.get("GUNICORN_ACCESS_LOG", "0") == "1" else None
 errorlog = "-"
-loglevel = os.environ.get("ST_LOG_LEVEL", "info").lower()
+loglevel = os.environ.get("LOG_LEVEL", "info").lower()
 
 
 def on_starting(server):

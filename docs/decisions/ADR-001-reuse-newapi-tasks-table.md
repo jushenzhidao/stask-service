@@ -20,7 +20,7 @@ stask-service 需要持久化任务状态。可选：(a) 自建 `stask_tasks` �
 2. **扩展字段全部塞 `data` JSON 列**，用 `JSON_MERGE_PATCH` 合并，不加任何列。
 3. **`data` 恒写 `freeze_amount: 0` 与 `settled: true`** —— 让 atask 的 sweeper 天然跳过 stask 的行（它按 `settled != 'true'` 找候选）。这是跨服务共存的关键防撞设计。
 
-时间列统一 unix **秒**，读侧 `as_unix_seconds()` 归一、SQL 侧 `_secs(col)` 表达式归一（new-api 原生模块用 UnixMilli 写法，列里会混入毫秒值）。
+时间列统一 unix **秒**：写侧恒写秒，读侧 `as_unix_seconds()` 兜底归一（new-api 原生模块用 UnixMilli 写法，列里会混入毫秒值）。SQL 时间谓词直接裸列比较——查询恒带 `platform='stask'`，命中的只有本服务写的秒值行，不必再包裹归一表达式（包裹会使索引失效，见 ADR-008）。
 
 ## Consequences
 

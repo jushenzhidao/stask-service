@@ -6,9 +6,9 @@
 产品定位能否成立的关键。
 
 三态映射（设计 §2 表格）：
-| NOT_START / IN_PROGRESS | 202 + {task_id,status,created_at}，支持 ?wait= |
-| SUCCESS                 | 200 + 原文回放                                  |
-| FAILURE / CANCELED      | 重放上游状态码 + 原文；本地失败用 {"error":{}} |
+| QUEUED / IN_PROGRESS   | 202 + {task_id,status,created_at}，支持 ?wait= |
+| SUCCESS                          | 200 + 原文回放                                  |
+| FAILURE / CANCELED               | 重放上游状态码 + 原文；本地失败用 {"error":{}} |
 """
 
 from __future__ import annotations
@@ -25,12 +25,11 @@ from app.logging import log
 from app.schemas import (
     ACTIVE,
     CANCELED,
-    FAILURE,
     IN_PROGRESS,
-    NOT_START,
-    SUCCESS,
+    PENDING,
+    TERMINAL,
 )
-from app.services import codec, dynconf, slots, taskstore, tokensession
+from app.services import codec, dynconf, slots, statuscache, taskstore, tokensession
 from app.services.dynconf import RuntimeConfig
 
 
@@ -94,31 +93,54 @@ def _replay(task: dict, config: RuntimeConfig) -> Response:
 
 async def view(task_id: str, wait_seconds: int = 0,
                config: RuntimeConfig | None = None) -> Response:
-    """查询端点主逻辑。``wait_seconds > 0`` 时长轮询。"""
+    """查询端点主逻辑。``wait_seconds > 0`` 时长轮询。
+
+    先探状态再决定拉不拉整行：活跃任务走 202 只需要 status/created_at，
+    ``get()`` 的 SELECT * 会把 data 里最大 2MB 的 request_body 整列拉
+    回来白白烧带宽——只有确认终态才值得拉整行做回放。
+    """
     if config is None:
         config = await dynconf.get_runtime_config()
 
-    task = await taskstore.get(task_id)
-    if task is None:
+    status = await _probe_status(task_id)
+    if status is None:
         raise HTTPException(404, "task not found")
 
-    if task["status"] in (SUCCESS, FAILURE, CANCELED):
+    if status in TERMINAL:
+        task = await taskstore.get(task_id)
+        if task is None:                        # 缓存幻影：以 DB 为准
+            raise HTTPException(404, "task not found")
         return _replay(task, config)
 
     if wait_seconds > 0:
-        task = await _long_poll(task_id, wait_seconds, config) or task
-        if task["status"] in (SUCCESS, FAILURE, CANCELED):
+        task = await _long_poll(task_id, wait_seconds, config)
+        if task is not None and task["status"] in TERMINAL:
             return _replay(task, config)
 
-    return JSONResponse(status_code=202, content=_view(task))
+    meta = await taskstore.get_meta(task_id)
+    if meta is None:
+        raise HTTPException(404, "task not found")
+    return JSONResponse(status_code=202, content=_view(meta))
+
+
+async def _probe_status(task_id: str) -> str | None:
+    """轻量状态探测：Redis 缓存优先，未命中回落 DB 并回填。"""
+    status = await statuscache.get(task_id)
+    if status is not None:
+        return status
+    status = await taskstore.get_status(task_id)
+    if status is not None:
+        await statuscache.set(task_id, status)  # 回填：后续探测不再打 DB
+    return status
 
 
 async def _long_poll(task_id: str, wait_seconds: int,
                      config: RuntimeConfig) -> dict | None:
     """轮询到终态或超时。
 
-    只查 ``status`` 列（不拉整行）——结果体可能有 10MB，每 0.5s 拉一次
-    会把 DB 带宽打满。命中终态后才拉整行。指数退避降低长等待的查询频率。
+    等待期查询走 ``_probe_status``（Redis 优先）：终态由 ``taskstore.cas``
+    write-through 秒级可见，N 个等待客户端的轮询几乎全部命中 Redis，
+    DB 只在缓存未命中的第一跳被打一次。命中终态后才拉整行做回放。
     """
     budget = min(wait_seconds, config.poll_wait_max_seconds)
     deadline = time.monotonic() + budget
@@ -127,7 +149,7 @@ async def _long_poll(task_id: str, wait_seconds: int,
 
     while time.monotonic() < deadline:
         await asyncio.sleep(interval)
-        status = await taskstore.get_status(task_id)
+        status = await _probe_status(task_id)
         if status is None:
             return None
         if status not in ACTIVE:
@@ -147,13 +169,13 @@ async def cancel(task_id: str) -> JSONResponse:
         raise HTTPException(404, "task not found")
 
     status = task["status"]
-    if status in (SUCCESS, FAILURE, CANCELED):
+    if status in TERMINAL:
         raise HTTPException(409, f"task already terminal: {status}")
     if status == IN_PROGRESS:
         raise HTTPException(409, "task is in progress and cannot be canceled")
 
     won = await taskstore.cas(
-        task_id, (NOT_START,), CANCELED,
+        task_id, PENDING, CANCELED,
         fail_reason="canceled by client",
     )
     if not won:

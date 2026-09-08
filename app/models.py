@@ -6,18 +6,20 @@
 与 new-api 的共存契约（ADR-006）：
 - ``platform`` = 自定义值 ``stask``（非 suno/mj）→ GetTaskAdaptorFunc 返回 nil，
   原生任务轮询天然跳过；
-- ``channel_id`` = 独立渠道号（``ST_CHANNEL_ID``），不与上游任务混用；
-- ``quota`` 恒 0 —— 零资金记账；
-- ``status``/``progress`` 用 new-api 原生枚举（NOT_START/IN_PROGRESS/
-  SUCCESS/FAILURE + 0%/100%）；
+- ``channel_id`` = 独立渠道号（``CHANNEL_ID``），不与上游任务混用；
+- ``quota`` 恒 0 —— 零资金记账（计费由上游 relay 自理）；
+- ``user_id`` = 上游鉴权回查值（tokens 表共库直查，查不到落 0）；
+- ``status``/``progress`` 用 new-api 原生枚举（QUEUED/
+  IN_PROGRESS/SUCCESS/FAILURE/CANCELED + 0%/100%）；
 - 任务生命期（默认 6h）< new-api 的 24h 超时清理线。
 
-时间字段是 int64 **unix 秒**——但表被 new-api 原生任务模块用 UnixMilli
-写过，所以读侧一律经 ``taskstore.as_unix_seconds`` 归一，SQL 侧一律套
-``taskstore._secs(col)``。
+时间字段是 int64 **unix 秒**。本服务写侧恒写秒（``taskstore.now()``），
+所以 SQL 的时间谓词直接裸比较列以吃到索引；毫秒只可能出现在 new-api
+原生任务自己的行里，而本服务的 WHERE 恒带 ``platform='stask'`` 把它们
+排除在外。读侧仍经 ``taskstore.as_unix_seconds`` 归一（防手工改库）。
 
-本服务对 MySQL 只有这一张表的读写依赖；``tokens`` / ``users`` 完全不碰
-（不做计费、不做 key 管理）。
+本服务对 MySQL 的依赖：``tasks`` 表读写 + ``AUTH_MODE=newapi`` 时
+``tokens``/``users`` 只读（``upstream._fetch_credential``）。不做计费。
 """
 
 from sqlalchemy import JSON, BigInteger, Column, String, Text
@@ -32,10 +34,10 @@ class Task(Base):
     __tablename__ = "tasks"
 
     id = Column(BigInteger, primary_key=True, autoincrement=True)
-    task_id = Column(String(64), index=True)   # {model_slug}_{fingerprint32} ≤53
+    task_id = Column(String(64), index=True)   # {model_slug}_{32hex} ≤53
     platform = Column(String(30), default="stask", index=True)
     action = Column(String(40), default="")
-    status = Column(String(20), default="NOT_START", index=True)
+    status = Column(String(20), default="QUEUED", index=True)
     fail_reason = Column(Text, default="")
     progress = Column(String(20), default="0%")
     submit_time = Column(BigInteger, default=0)

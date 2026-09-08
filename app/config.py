@@ -1,4 +1,12 @@
-"""配置单例（pydantic-settings，env 前缀 ``ST_``）。
+"""配置单例（pydantic-settings，**无 env 前缀**）。
+
+环境变量名 = 字段名的大写形式（``max_slots`` → ``MAX_SLOTS``）。没有前缀——
+本服务的键名本身已经够独特（``sk_session_ttl_seconds`` / ``queue_stream_maxlen``），
+前缀防不住任何真实碰撞，却让每一处文档、每一条启动命令都要多敲几个字符。
+``gunicorn.conf.py`` 直读 os.environ，用的也是这套无前缀名，改名要同步。
+
+**不保留任何历史别名**：旧名字一旦留下，新旧两套都要维护，而旧的那套永远
+测不到。改名就改到底——没有兼容层，也就没有"看起来兼容、实际静默回落"这回事。
 
 纪律：
 - 业务模块一律 ``from app.config import settings``，**禁止散读 os.environ**；
@@ -16,11 +24,79 @@ Authorization 只透传给上游，有效性由上游判定。tasks 表复用 ne
 from __future__ import annotations
 
 import json
+import re
 from functools import lru_cache
-from typing import Annotated
+from typing import Annotated, Literal
+from urllib.parse import quote, urlencode
 
 from pydantic import AliasChoices, Field, field_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
+
+#: 本服务只用 asyncmy，缺了它 SQLAlchemy 会用默认的同步驱动
+_ASYNC_SCHEME = "mysql+asyncmy://"
+#: new-api（上游）的 ``SQL_DSN`` 是 Go 风格：``user:pass@tcp(host:3306)/db?params``。
+#: 以 ``@tcp(`` 为锚点切，而不是「第一个 @」——密码里带 @ 是常态。
+_GO_MARKER = "@tcp("
+#: 混种写法里残留的 Go 风格 host 片段：``...pwd@tcp(host:3306)/db``
+_TCP_FRAGMENT = re.compile(r"@tcp\((?P<host>[^:)]+)(?::(?P<port>\d+))?\)")
+#: Go 驱动的参数 asyncmy 不认，放进去会在 connect 时抛未知 kwargs
+_KEEP_QUERY = ("charset", "collation", "unix_socket")
+
+
+def _keep_query(raw: str | None) -> str:
+    """只留 asyncmy 认得的查询参数，默认补 ``charset=utf8mb4``。"""
+    kept: dict[str, str] = {}
+    for part in (raw or "").lstrip("?").split("&"):
+        if "=" in part:
+            key, _, value = part.partition("=")
+            if key.lower() in _KEEP_QUERY:
+                kept[key.lower()] = value
+    kept.setdefault("charset", "utf8mb4")
+    return "?" + urlencode(kept)
+
+
+def normalize_database_url(value: str) -> str:
+    """把各种写法统一成 asyncmy 的 SQLAlchemy URL。
+
+    支持三种输入，都是真实踩过的坑：
+
+    1. **new-api 的 ``SQL_DSN``**（Go DSN）：``root:pwd@tcp(127.0.0.1:3306)/newapi``
+       ——无 scheme，逐段解析并对账号密码做百分号编码（密码里有 ``@`` ``/``
+       不会把 host 解析带歪）；Go 专有参数（``parseTime`` / ``loc`` / ...）丢弃。
+    2. **混种**：``mysql+asyncmy://root:pwd@tcp(host:3306)/db??charset=utf8mb4``
+       ——SQLAlchemy 的壳 + Go 的 host 写法 + 重复问号。SQLAlchemy 遇到它会直接抛
+       ``ValueError: invalid literal for int(): '3306)'``，服务起不来。
+    3. 标准写法照原样返回；``mysql://`` 补成 ``mysql+asyncmy://``。
+    """
+    raw = (value or "").strip()
+    if not raw:
+        return raw
+
+    if "://" not in raw and (marker := raw.find(_GO_MARKER)) >= 0:
+        userinfo, _, tail = raw[:marker], "", raw[marker + len(_GO_MARKER):]
+        hostport, close, remainder = tail.partition(")/")
+        if close and remainder:
+            host, _, port = hostport.partition(":")
+            db, _, query = remainder.partition("?")
+            user, _, password = userinfo.partition(":")
+            secret = ""
+            if user or password:
+                secret = f"{quote(user, safe='')}:{quote(password, safe='')}@"
+            return (
+                f"{_ASYNC_SCHEME}{secret}{host}:{port or '3306'}"
+                f"/{db.strip('/')}{_keep_query(query)}"
+            )
+        return f"{_ASYNC_SCHEME}{raw}"
+    if "://" not in raw:
+        return f"{_ASYNC_SCHEME}{raw}"
+
+    fixed = re.sub(r"\?\?+", "?", raw)
+    fixed = _TCP_FRAGMENT.sub(
+        lambda m: f"@{m.group('host')}:{m.group('port') or 3306}", fixed
+    )
+    if fixed.startswith("mysql://"):
+        fixed = _ASYNC_SCHEME + fixed[len("mysql://"):]
+    return fixed
 
 
 def _parse_str_tuple(value: object) -> object:
@@ -41,7 +117,7 @@ def _parse_str_tuple(value: object) -> object:
 
 
 class Settings(BaseSettings):
-    model_config = SettingsConfigDict(env_prefix="ST_", env_file=".env", extra="ignore")
+    model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
     # ---- 应用 ----
     app_env: str = "dev"
@@ -54,7 +130,13 @@ class Settings(BaseSettings):
     admin_key: str = ""
 
     # ---- 数据层（与 new-api 共享 MySQL 实例，零建表）----
-    database_url: str = "mysql+asyncmy://root:root@127.0.0.1:3306/newapi?charset=utf8mb4"
+    #: 也认 new-api 的 ``SQL_DSN``（Go 格式 ``root:pwd@tcp(host:3306)/db``）——
+    #: 两边共用同一个库，直接复用上游那一份，省掉一处要同步的配置。
+    #: 格式转换见 ``normalize_database_url``。
+    database_url: str = Field(
+        default="mysql+asyncmy://root:root@127.0.0.1:3306/newapi?charset=utf8mb4",
+        validation_alias=AliasChoices("DATABASE_URL", "SQL_DSN"),
+    )
     db_pool_size: int = 20
     db_max_overflow: int = 10
     db_pool_recycle: int = 1800          # 必须 < MySQL wait_timeout
@@ -82,12 +164,14 @@ class Settings(BaseSettings):
     #: 默认 upstream（请求未带 X-Upstream-Base-Url 头时的回落值）。
     #: 上游对本项目而言**只是一个 HTTP 服务**：new-api 是默认实现，换任何
     #: 同步生成接口只要加进 allowlist 即可，本服务不感知它是谁。
-    upstream_base_url: str = Field(
-        default="http://127.0.0.1:3000",
-        validation_alias=AliasChoices("ST_UPSTREAM_BASE_URL", "ST_NEWAPI_BASE_URL"),
-    )
-    #: 允许的 upstream host 白名单（含端口按 host:port 比对；不含端口只比 host）
-    upstream_allowlist: Annotated[tuple[str, ...], NoDecode] = ("127.0.0.1:3000", "newapi:3000")
+    upstream_base_url: str = "http://127.0.0.1:3000"
+    #: 允许的 upstream host 白名单（含端口按 host:port 比对；不含端口只比 host）。
+    #: **空 = 不限制**，与 ``callback_allowlist`` 同一套语义：不配即放行，配了
+    #: 才按条目卡。默认值必须是空而不是"几个常见地址"——后者是隐藏配置，
+    #: 没显式配过的人会以为自己在放行，实际被一份看不见的名单挡着。
+    #: 放行时 ``X-Upstream-Base-Url`` 头能决定令牌发往哪里，只在反向代理
+    #: 无条件覆盖该头（见 deploy/nginx.conf）时才安全；启动时会打 warning。
+    upstream_allowlist: Annotated[tuple[str, ...], NoDecode] = ()
 
     # ---- 路径准入（§2）----
     async_allow_prefixes: Annotated[tuple[str, ...], NoDecode] = (
@@ -100,13 +184,23 @@ class Settings(BaseSettings):
     max_slots: int = 10                  # 单 token 在途上限
     slot_ttl_seconds: int = 3600         # 槽键 TTL 兜底（进程崩溃不永久泄漏）
 
-    # ---- 限流与幂等 ----
+    # ---- 限流 ----
     rate_limit: int = 60                 # 每窗口提交次数
     rate_limit_window_seconds: int = 60
-    #: 自动幂等窗口：同一 token 的字节级相同请求在此窗口内只创建一个任务
-    idem_ttl: int = 86400
-    idem_pending_ttl_seconds: int = 30   # 占位标记 TTL（创建链路在飞窗口）
-    idem_replay_wait_seconds: float = 3.0  # 同键真并发的短轮询等待上限
+
+    # ---- 鉴权 ----
+    #: 鉴权模式：
+    #: - ``generic``（默认）：通用上游——不做提交前鉴权/余额预检，
+    #:   Authorization 原样透传，任务有效性由上游在执行时判定
+    #:   （无效 key = 上游 401 = 任务 FAILURE 回放），user_id 落 0；
+    #: - ``newapi``：上游是 new-api 且与本服务共库——提交前直查
+    #:   tokens ⋈ users 做鉴权+余额预检（401/402 不建任务），user_id 落表。
+    #: 用 Literal 而非 str：拼错（如 ``new-api``）会在启动时报错，
+    #: 而不是静默回落到 generic —— 那等于悄悄关掉了鉴权。
+    auth_mode: Literal["generic", "newapi"] = "generic"
+    #: 鉴权正向结果的 Redis 缓存 TTL（秒，仅 newapi 模式）。窗口内 key
+    #: 被禁用/余额耗尽仍可提交，但任务执行时会被上游 relay 拒绝。
+    auth_cache_ttl_seconds: int = 300
 
     # ---- worker 执行（§5、§8）----
     worker_timeout: int = 120            # 上游调用超时秒
@@ -152,13 +246,14 @@ class Settings(BaseSettings):
 
     # ---- 可观测性（logfire，可选）----
     #: 1 = 启用 logfire（trace + metrics + loguru 桥接）。
-    #: 凭证走 logfire 自己的 LOGFIRE_TOKEN 环境变量（无 ST_ 前缀）；
+    #: 凭证走 logfire 自己的 LOGFIRE_TOKEN 环境变量；
     #: 未配 token 时 send_to_logfire="if-token-present" 会静默降级为不发送。
+    #: service_name 固定 ``stask-web`` / ``stask-worker``，不做配置项。
     logfire_enabled: bool = False
-    logfire_service_name: str = "stask"
 
-    # ---- taskiq-admin 任务看板（可选）----
-    #: taskiq-admin 实例地址（如 http://taskiq-admin:3000）。空 = 关闭。
+    # ---- taskiq-admin 任务看板（必选）----
+    #: taskiq-admin 实例地址（compose 里写死 http://taskiq-admin:3000）。
+    #: 与 ``taskiq_admin_api_token`` **都非空**才挂 middleware；空 = 不上报。
     taskiq_admin_url: str = ""
     taskiq_admin_api_token: str = ""
 
@@ -173,6 +268,11 @@ class Settings(BaseSettings):
     @classmethod
     def _tuple_fields(cls, value: object) -> object:
         return _parse_str_tuple(value)
+
+    @field_validator("database_url", mode="before")
+    @classmethod
+    def _normalize_database_url(cls, value: object) -> object:
+        return normalize_database_url(value) if isinstance(value, str) else value
 
 
 @lru_cache

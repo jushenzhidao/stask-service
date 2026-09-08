@@ -15,7 +15,7 @@ TH = "tokenhash0000000000000000000000"
 URL = "http://newapi:3000/v1/images/generations"
 
 
-async def _seed(task_store, patch_redis, *, status="NOT_START", callback_url="",
+async def _seed(task_store, patch_redis, *, status="QUEUED", callback_url="",
                 body=b'{"model":"dall-e-3"}') -> str:
     await task_store.create(TASK, "/v1/images/generations", {
         "source": "stask", "model": "dall-e-3", "token_hash": TH,
@@ -109,7 +109,7 @@ async def test_4xx_becomes_failure_with_replayable_body(task_store, patch_redis,
 
 async def test_5xx_no_retry_by_default(task_store, patch_redis, test_settings,
                                        respx_router):
-    """ST_RETRY_MAX=0 时 5xx 直接判 FAILURE，只调一次上游（副作用保守）。"""
+    """RETRY_MAX=0 时 5xx 直接判 FAILURE，只调一次上游（副作用保守）。"""
     await _seed(task_store, patch_redis)
     route = respx_router.post(URL).mock(return_value=httpx.Response(502, text="bad gw"))
 
@@ -207,8 +207,8 @@ async def test_dispatch_lock_blocks_redelivery(task_store, patch_redis,
     await execute.run(TASK)                             # 第一次：正常执行
     assert route.call_count == 1
 
-    # 模拟崩溃重投：把状态改回 NOT_START，锁仍在（锁不主动释放）
-    task_store.rows[TASK]["status"] = "NOT_START"
+    # 模拟崩溃重投：把状态改回 QUEUED，锁仍在（锁不主动释放）
+    task_store.rows[TASK]["status"] = "QUEUED"
     await execute.run(TASK)
 
     assert route.call_count == 1                        # 上游没被第二次调用

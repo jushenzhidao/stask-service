@@ -1,10 +1,19 @@
 """共享契约：状态常量与内部数据模型。
 
-状态机：``NOT_START → IN_PROGRESS → SUCCESS / FAILURE / CANCELED``。
+状态机（全部取自 new-api 原生 ``TaskStatus`` 枚举，零自造值）：
 
-状态值与 new-api tasks.status 的枚举完全对齐（ADR-006）：初始态用
-``NOT_START`` 而不是自造值——共享表里的行对上游工具（看板、SQL 巡检）
-也应该是可读的。
+    QUEUED → IN_PROGRESS → SUCCESS / FAILURE / CANCELED
+
+与外部系统语义的对照：
+
+    外部系统: 已提交/排队中 → 处理中       → 完成/失败/取消
+    本服务:   QUEUED       → IN_PROGRESS  → SUCCESS/FAILURE/CANCELED
+
+- 落库即 ``QUEUED``（提交链路单次 INSERT，不做 SUBMITTED→QUEUED 二段
+  写——省一次 UPDATE）。「入队未确认」窗口由 dispatch_epoch=0 +
+  sweep_stale 兜底重投覆盖，不需要独立状态表达；
+- new-api 的 ``ToVideoStatus`` 把 QUEUED 归为 queued，共享表里的行对
+  上游工具（看板、SQL 巡检）保持可读（ADR-006）。
 """
 
 from __future__ import annotations
@@ -12,17 +21,19 @@ from __future__ import annotations
 from pydantic import BaseModel
 
 # ---------------------------------------------------------------------------
-# 状态常量（与 new-api tasks.status 口径对齐；大写）
+# 状态常量（new-api model.TaskStatus 原生枚举；大写）
 # ---------------------------------------------------------------------------
 
-NOT_START = "NOT_START"
+QUEUED = "QUEUED"
 IN_PROGRESS = "IN_PROGRESS"
 SUCCESS = "SUCCESS"
 FAILURE = "FAILURE"
 CANCELED = "CANCELED"
 
 #: 活跃（非终态）——CAS 迁移的合法起点
-ACTIVE: tuple[str, ...] = (NOT_START, IN_PROGRESS)
+ACTIVE: tuple[str, ...] = (QUEUED, IN_PROGRESS)
+#: worker 领取前的可取消状态
+PENDING: tuple[str, ...] = (QUEUED,)
 #: 终态——不可逆
 TERMINAL: tuple[str, ...] = (SUCCESS, FAILURE, CANCELED)
 
@@ -36,6 +47,7 @@ class SubmitPlan(BaseModel):
 
     task_id: str
     token_hash: str
+    user_id: int = 0
     model: str
     method: str
     path: str

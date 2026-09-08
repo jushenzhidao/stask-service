@@ -22,8 +22,10 @@ broker = **RedisStreamBroker**（Redis Stream + consumer group，at-least-once�
   （web 侧在 ``create_app``）——两个进程各装配一次，格式统一。
 
 可观测性（均可选，默认关）：
-- logfire：``OpenTelemetryMiddleware``（taskiq 0.12 内置）经 message labels
-  传播 traceparent，web 的 kiq span 与 worker 的 execute span 串成一条 trace；
+- logfire：由 ``app.observability.setup`` 统一装配——官方
+  ``TaskiqInstrumentor`` 把 OpenTelemetryMiddleware 插到本 broker 链头，
+  经 message labels 传播 traceparent，web 的 kiq span 与 worker 的
+  execute span 串成一条 trace。本模块**不再手动挂** otel middleware；
 - taskiq-admin：``TaskiqAdminMiddleware``（taskiq 0.12 内置）把 queued /
   started / executed 事件推给 admin 面板，fire-and-forget 不阻塞任务执行。
 
@@ -58,6 +60,9 @@ broker = RedisStreamBroker(
     consumer_id="0",
     idle_timeout=_IDLE_TIMEOUT_MS,
     unacknowledged_batch_size=100,
+    # XAUTOCLAIM 扫描锁的自动释放时间：不设的话 worker 在认领扫描中途
+    # 崩溃会让锁永不过期，pending 消息永久卡死（taskiq-redis 已知坑）
+    unacknowledged_lock_timeout=60.0,
     maxlen=settings.queue_stream_maxlen or None,
     approximate=True,
 ).with_result_backend(
@@ -87,15 +92,12 @@ class ObservabilityMiddleware(TaskiqMiddleware):
 
 
 def _build_middlewares() -> list[TaskiqMiddleware]:
-    """按配置装配 middleware 链。顺序：observability → otel → admin。"""
+    """按配置装配 middleware 链。顺序：observability → admin。
+
+    otel middleware 不在这里挂——``app.observability.setup`` 里的
+    ``TaskiqInstrumentor`` 会把它插到链头（幂等防重）。
+    """
     chain: list[TaskiqMiddleware] = [ObservabilityMiddleware()]
-
-    if settings.logfire_enabled:
-        # taskiq 0.12 内置；依赖 taskiq[opentelemetry] extra（otel-api + psutil）。
-        # tracer 不显式传——用全局 ProxyTracer，logfire.configure 后自动生效。
-        from taskiq.middlewares.opentelemetry_middleware import OpenTelemetryMiddleware
-
-        chain.append(OpenTelemetryMiddleware())
 
     if settings.taskiq_admin_url and settings.taskiq_admin_api_token:
         # taskiq 0.12 内置；上报是 fire-and-forget（asyncio.create_task），
@@ -134,7 +136,7 @@ async def execute_task(task_id: str, _context: Context = TaskiqDepends()) -> Non
 @broker.task
 async def notify_task(task_id: str, attempt: int = 1,
                       _context: Context = TaskiqDepends()) -> None:
-    """终态回调推送（失败按指数退避重投，上限 ``ST_CALLBACK_MAX_ATTEMPTS``）。"""
+    """终态回调推送（失败按指数退避重投，上限 ``CALLBACK_MAX_ATTEMPTS``）。"""
     from app.services.notify import deliver
 
     await deliver(task_id, attempt)

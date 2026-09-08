@@ -201,6 +201,7 @@ _REDIS_CONSUMERS = (
     "app.services.execute",
     "app.services.sweeper",
     "app.services.dynconf",
+    "app.services.upstream",
     "app.healthz",
 )
 
@@ -244,16 +245,17 @@ class InMemoryTaskStore:
 
     # ---- 与 taskstore 同名的接口 ----
 
-    async def create(self, task_id: str, action: str, data: dict) -> None:
+    async def create(self, task_id: str, action: str, data: dict,
+                     user_id: int = 0) -> None:
         from app.config import settings
 
         ts = self._now()
         self.rows[task_id] = {
             "task_id": task_id, "platform": "stask", "action": action,
-            "status": "NOT_START", "fail_reason": "", "progress": "0%",
+            "status": "QUEUED", "fail_reason": "", "progress": "0%",
             "submit_time": ts, "start_time": 0, "finish_time": 0,
             "created_at": ts, "updated_at": ts,
-            "data": json.loads(json.dumps(data)), "user_id": 0,
+            "data": json.loads(json.dumps(data)), "user_id": user_id,
             "channel_id": settings.channel_id, "quota": 0,
         }
 
@@ -290,18 +292,17 @@ class InMemoryTaskStore:
         row = self.rows.get(task_id)
         return json.loads(json.dumps(row)) if row else None
 
-    async def get_meta(self, task_id: str) -> dict | None:
+    def _meta(self, row: dict) -> dict:
         """元数据投影替身：复用真实的 ``_meta_row_to_dict`` 归一逻辑。
 
         关键是先把 ``data`` 的值**按 MySQL ``->>`` 的语义字符串化**再交给
         归一函数——直接把原生 bool/int 塞进去会掩盖真实链路上
         ``'false'`` 是真值字符串这类问题，替身就失去了防护意义。
+
+        ``get_meta`` 与 ``stale_active`` / ``overdue_active`` 共用此投影：
+        真实实现里三者的 SELECT 列表也是同一份 ``_META_SELECT``。
         """
         from app.services import taskstore as real
-
-        row = self.rows.get(task_id)
-        if row is None:
-            return None
 
         def as_json_text(value: Any) -> str | None:
             if isinstance(value, bool):
@@ -316,6 +317,10 @@ class InMemoryTaskStore:
                 as_json_text(row["data"][key]) if key in row["data"] else None
             )
         return real._meta_row_to_dict(raw)
+
+    async def get_meta(self, task_id: str) -> dict | None:
+        row = self.rows.get(task_id)
+        return self._meta(row) if row is not None else None
 
     async def get_status(self, task_id: str) -> str | None:
         row = self.rows.get(task_id)
@@ -339,21 +344,21 @@ class InMemoryTaskStore:
                 out[th] = out.get(th, 0) + 1
         return out
 
-    async def stale_active(self, stale_seconds: int, limit: int = 200) -> list[str]:
+    async def stale_active(self, stale_seconds: int, limit: int = 200) -> list[dict]:
         from app.schemas import ACTIVE
 
         cutoff = self._now() - stale_seconds
         return [
-            tid for tid, row in self.rows.items()
+            self._meta(row) for row in self.rows.values()
             if row["status"] in ACTIVE and row["updated_at"] < cutoff
         ][:limit]
 
-    async def overdue_active(self, lifetime_seconds: int, limit: int = 200) -> list[str]:
+    async def overdue_active(self, lifetime_seconds: int, limit: int = 200) -> list[dict]:
         from app.schemas import ACTIVE
 
         cutoff = self._now() - lifetime_seconds
         return [
-            tid for tid, row in self.rows.items()
+            self._meta(row) for row in self.rows.values()
             if row["status"] in ACTIVE and row["created_at"] < cutoff
         ][:limit]
 
@@ -559,10 +564,13 @@ def test_settings(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(settings, "retry_max_connect", 0)
     monkeypatch.setattr(settings, "worker_timeout", 5)
     monkeypatch.setattr(settings, "poll_interval_seconds", 0.01)
-    monkeypatch.setattr(settings, "idem_replay_wait_seconds", 0.2)
     monkeypatch.setattr(settings, "callback_secret", "test-secret")
     monkeypatch.setattr(settings, "callback_allowlist", ())
     monkeypatch.setattr(settings, "channel_id", 990)
+    # 下面两项必须钉死：它们会读到**开发者本机的 .env**，不钉住的话
+    # 「管理面未启用应 404」「非生产环境只告警」这类断言会随本地配置漂移。
+    monkeypatch.setattr(settings, "admin_key", "")     # 需要管理面的用例自己覆盖
+    monkeypatch.setattr(settings, "app_env", "test")   # 避免本机 APP_ENV=prod 触发 fail-fast
     return settings
 
 
@@ -574,7 +582,36 @@ def respx_router() -> Iterator[respx.MockRouter]:
 
 
 @pytest.fixture
-def client(patch_redis, task_store, queue_events, test_settings):
+def upstream_auth(monkeypatch: pytest.MonkeyPatch):
+    """鉴权替身：默认放行（user_id=42）。
+
+    用例可通过 ``upstream_auth.fail = UpstreamAuthError(...)`` 改为拒绝，
+    或断言 ``upstream_auth.calls`` 验证调用参数。
+    """
+    from app.services import upstream
+
+    upstream.clear_cache()
+
+    class _Stub:
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, str]] = []
+            self.fail: Exception | None = None
+            self.info = upstream.AuthInfo(user_id=42)
+
+        async def __call__(self, raw_token: str,
+                           token_hash: str) -> upstream.AuthInfo:
+            self.calls.append((raw_token, token_hash))
+            if self.fail is not None:
+                raise self.fail
+            return self.info
+
+    stub = _Stub()
+    monkeypatch.setattr(upstream, "authenticate", stub)
+    return stub
+
+
+@pytest.fixture
+def client(patch_redis, task_store, queue_events, test_settings, upstream_auth):
     """带全套替身的 ASGI 测试客户端。"""
     from fastapi.testclient import TestClient
 

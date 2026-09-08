@@ -1,4 +1,4 @@
-"""自动幂等（指纹 task_id + 创建窗口占位）+ 并发槽。
+"""显式幂等（Idempotency-Key → 确定性 task_id + 创建窗口占位）+ 并发槽。
 
 这两块是本服务并发正确性的核心：幂等失守 = 双建任务 = 上游被重复调用；
 槽位失守 = 并发保护形同虚设。
@@ -16,36 +16,32 @@ TID = "img_" + "0" * 32
 
 
 # ---------------------------------------------------------------------------
-# 请求指纹
+# task_id 生成
 # ---------------------------------------------------------------------------
 
 
-def test_fingerprint_is_deterministic():
-    """同输入恒同 task_id——自动幂等的根基。"""
-    a = idem.fingerprint_task_id("dall_e_3", TH, "POST", "/v1/images", "", b'{"p":1}')
-    b = idem.fingerprint_task_id("dall_e_3", TH, "POST", "/v1/images", "", b'{"p":1}')
+def test_task_id_with_key_is_deterministic():
+    """带 Idempotency-Key：同 token 同 key 恒同 task_id——显式幂等的根基。"""
+    a = idem.new_task_id("dall_e_3", TH, "order-1")
+    b = idem.new_task_id("dall_e_3", TH, "order-1")
     assert a == b
     assert a.startswith("dall_e_3_")
     assert len(a) <= 53                                 # varchar(64) 留余量
 
 
-def test_fingerprint_varies_by_every_component():
-    """token/method/path/query/body/salt 任一变化都必须换 id。"""
-    base = idem.fingerprint_task_id("m", TH, "POST", "/p", "q=1", b"body")
-    assert idem.fingerprint_task_id("m", "other", "POST", "/p", "q=1", b"body") != base
-    assert idem.fingerprint_task_id("m", TH, "PUT", "/p", "q=1", b"body") != base
-    assert idem.fingerprint_task_id("m", TH, "POST", "/p2", "q=1", b"body") != base
-    assert idem.fingerprint_task_id("m", TH, "POST", "/p", "q=2", b"body") != base
-    assert idem.fingerprint_task_id("m", TH, "POST", "/p", "q=1", b"body2") != base
-    assert idem.fingerprint_task_id("m", TH, "POST", "/p", "q=1", b"body",
-                                    salt="s") != base
+def test_task_id_varies_by_token_and_key():
+    """token 或 key 任一变化都必须换 id。"""
+    base = idem.new_task_id("m", TH, "k1")
+    assert idem.new_task_id("m", "other", "k1") != base
+    assert idem.new_task_id("m", TH, "k2") != base
 
 
-def test_fingerprint_no_field_concat_ambiguity():
-    """字段间有分隔符：("ab","c") 与 ("a","bc") 不得同指纹。"""
-    a = idem.fingerprint_task_id("m", TH, "POST", "/ab", "c", b"")
-    b = idem.fingerprint_task_id("m", TH, "POST", "/a", "bc", b"")
+def test_task_id_without_key_is_random():
+    """不带 Idempotency-Key：每次都是新任务（默认不幂等）。"""
+    a = idem.new_task_id("m", TH)
+    b = idem.new_task_id("m", TH)
     assert a != b
+    assert a.startswith("m_") and len(a) <= 53
 
 
 def test_model_slug_shape():

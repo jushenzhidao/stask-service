@@ -18,7 +18,7 @@ TASK = "dall_e_3_" + "b" * 32
 TH = "tokenhash0000000000000000000000"
 
 
-async def _seed(task_store, status="NOT_START", **data_over) -> str:
+async def _seed(task_store, status="QUEUED", **data_over) -> str:
     await task_store.create(TASK, "/v1/images/generations", {
         "source": "stask", "model": "dall-e-3", "token_hash": TH,
         "upstream_response": "",
@@ -43,7 +43,7 @@ async def test_pending_returns_202(client, task_store):
     assert resp.status_code == 202
     body = resp.json()
     assert body["task_id"] == TASK
-    assert body["status"] == "NOT_START"
+    assert body["status"] == "QUEUED"
     assert "created_at" in body
 
 
@@ -175,7 +175,7 @@ async def test_long_poll_timeout_returns_202(client, task_store, test_settings):
 
 
 def test_wait_exceeding_max_is_rejected(client, test_settings):
-    """?wait 上限受 ST_POLL_WAIT_MAX_SECONDS 约束（必须 < nginx read timeout）。"""
+    """?wait 上限受 POLL_WAIT_MAX_SECONDS 约束（必须 < nginx read timeout）。"""
     assert client.get(f"{BASE}/{TASK}?wait=99999").status_code == 422
 
 

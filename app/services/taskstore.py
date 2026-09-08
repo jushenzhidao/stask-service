@@ -11,17 +11,20 @@
 与 new-api 的共存契约（ADR-006）：
 - ``platform`` = 自定义值（非 suno/mj）→ ``GetTaskAdaptorFunc`` 返回 nil，
   原生任务轮询天然跳过本服务的行；
-- ``channel_id`` = 独立渠道号（``ST_CHANNEL_ID``），不与上游任务混用；
+- ``channel_id`` = 独立渠道号（``CHANNEL_ID``），不与上游任务混用；
 - ``quota`` 恒 0 —— 本服务不做计费，上游超时清理即便动到我们的行，
   退款金额也是 0，零资金影响；
-- ``status``/``progress`` 用 new-api 原生枚举（``NOT_START``/``0%``/``100%``），
+- ``status``/``progress`` 用 new-api 原生枚举（``QUEUED``/``0%``/``100%``），
   共享表里的行对上游工具（看板、SQL 巡检）保持可读；
-- 任务生命期（``ST_TASK_MAX_LIFETIME_SECONDS``，默认 6h）必须远小于
+- 任务生命期（``TASK_MAX_LIFETIME_SECONDS``，默认 6h）必须远小于
   new-api 的 24h 超时清理线——我们先于上游收敛自己的行。
 
-时间口径：表里的时间列**应该**是 unix 秒，但 new-api 原生任务模块用过
-UnixMilli 写法，所以读侧统一 ``as_unix_seconds`` 归一、SQL 侧统一套
-``_secs(col)``。两侧都不能省——读侧归一救不了在 SQL 里做的比较。
+时间口径（v0.3.2 收紧）：**本服务写入的时间列恒为 unix 秒**，且所有
+SQL 的 WHERE 恒带 ``platform = :p``（只扫自家行），因此 SQL 侧时间谓词
+一律**裸列比较**——原先的 ``IF(col > 1e11, col DIV 1000, col)`` 包裹会
+让 sweeper / 看板的 range 条件吃不到索引，退化为按 platform 过滤后的
+全量扫描。毫秒值只可能出现在 new-api 自己写的行里，那些行我们碰不到。
+读侧仍保留 ``as_unix_seconds`` 归一，用于兜底展示上游写入的历史行。
 """
 
 from __future__ import annotations
@@ -86,16 +89,6 @@ def _validate_search_params(
 _TIME_COLUMNS = ("submit_time", "start_time", "finish_time", "created_at", "updated_at")
 
 
-def _secs(column: str) -> str:
-    """SQL 侧时间列归一表达式（毫秒 → 秒）。
-
-    读侧的 Python 归一救不了**在 SQL 里做的比较**（超期判定、结果清理
-    全是 ``col < :cutoff``）：cutoff 恒为秒，列里混进毫秒值会让判定彻底
-    失真。所有时间比较统一套这个表达式，口径只有一种。
-    """
-    return f"IF({column} > {_UNIX_MS_THRESHOLD}, {column} DIV 1000, {column})"
-
-
 def as_unix_seconds(value: Any) -> int:
     """时间值归一为 unix 秒：毫秒时间戳折算，缺失/非法 → 0。"""
     try:
@@ -130,14 +123,17 @@ def _row_to_dict(row: Any) -> dict:
 # ---------------------------------------------------------------------------
 
 
-async def create(task_id: str, action: str, data: dict) -> None:
-    """落库 NOT_START（ADR-006 契约行）。
+async def create(task_id: str, action: str, data: dict, user_id: int = 0) -> None:
+    """落库 QUEUED（ADR-006 契约行）。
 
-    - ``channel_id`` = 独立渠道号（``ST_CHANNEL_ID``）；
-    - ``quota`` 恒 0 —— 零资金记账，上游即便误动本行退款也是 0；
-    - ``user_id`` 恒 0 —— 本服务不做 key 管理，不知道也不需要知道用户；
-    - ``progress`` 用原生 ``0%`` —— 我们的生命期 sweeper（6h）先于
-      new-api 的 24h 清理收敛，不需要伪装 progress 躲扫描。
+    - 直接落 ``QUEUED`` 而不是先 SUBMITTED 再 CAS：省掉每次提交的第二次
+      DB UPDATE。「入队未确认」窗口的两种失败都有兜底——入队调用失败时
+      提交链路当场 CAS 判死；进程在入队前崩溃时行停在 QUEUED 且
+      dispatch_epoch=0，sweep_stale 按「锁不在 + 从未派发」重投；
+    - ``channel_id`` = 独立渠道号（``CHANNEL_ID``）；
+    - ``quota`` 恒 0 —— 零资金记账，计费由上游 relay 自理，上游即便
+      误动本行退款也是 0；
+    - ``user_id`` = 鉴权直查值（查不到落 0，仅归属信息）。
     """
     ts = now()
     async with get_session_factory()() as db:
@@ -149,8 +145,8 @@ async def create(task_id: str, action: str, data: dict) -> None:
                    user_id, channel_id, quota, submit_time, start_time,
                    created_at, updated_at)
                 VALUES
-                  (:task_id, :platform, :action, 'NOT_START', '0%', CAST(:data AS JSON),
-                   0, :channel_id, 0, :now, 0, :now, :now)
+                  (:task_id, :platform, :action, 'QUEUED', '0%', CAST(:data AS JSON),
+                   :user_id, :channel_id, 0, :now, 0, :now, :now)
                 """
             ),
             {
@@ -158,11 +154,16 @@ async def create(task_id: str, action: str, data: dict) -> None:
                 "platform": settings.gateway_platform,
                 "action": action,
                 "data": json.dumps(data, ensure_ascii=False),
+                "user_id": user_id,
                 "channel_id": settings.channel_id,
                 "now": ts,
             },
         )
         await db.commit()
+    # write-through：长轮询读侧优先命中缓存（失败静默，见 statuscache）
+    from app.services import statuscache
+
+    await statuscache.set(task_id, "QUEUED")
 
 
 async def cas(
@@ -209,7 +210,13 @@ async def cas(
     async with get_session_factory()() as db:
         res = cast("CursorResult[Any]", await db.execute(stmt, params))
         await db.commit()
-        return res.rowcount == 1
+        won = res.rowcount == 1
+    if won:
+        # write-through：先 DB 后缓存，长轮询秒级看见终态
+        from app.services import statuscache
+
+        await statuscache.set(task_id, to_status)
+    return won
 
 
 async def patch_data(task_id: str, patch: dict) -> None:
@@ -273,7 +280,7 @@ async def get(task_id: str) -> dict | None:
 
 #: 轻量投影的表列清单（显式列出，绝不 ``SELECT *``）
 _META_COLUMNS = (
-    "task_id", "status", "fail_reason", "progress", "channel_id",
+    "task_id", "status", "fail_reason", "progress", "channel_id", "user_id",
     "submit_time", "start_time", "finish_time", "created_at", "updated_at",
 )
 
@@ -324,6 +331,7 @@ def _meta_row_to_dict(row: Any) -> dict:
     result["fail_reason"] = str(result.get("fail_reason") or "")
     result["progress"] = str(result.get("progress") or "")
     result["channel_id"] = _meta_int(result.get("channel_id"))
+    result["user_id"] = _meta_int(result.get("user_id"))
 
     data: dict[str, Any] = {}
     for key in _META_STR_KEYS:
@@ -405,17 +413,23 @@ async def active_counts_by_token() -> dict[str, int]:
     return {str(row[0]): int(row[1]) for row in rows}
 
 
-async def stale_active(stale_seconds: int, limit: int = 200) -> list[str]:
-    """长时间未更新的非终态任务（消息丢失/worker 崩溃/超期的兜底扫描）。"""
+async def stale_active(stale_seconds: int, limit: int = 200) -> list[dict]:
+    """长时间未更新的非终态任务（消息丢失/worker 崩溃/超期的兜底扫描）。
+
+    直接回**元数据行**而不是 task_id 列表：sweeper 判死/重投都要读
+    ``status`` 与 ``data.dispatch_epoch``，回 id 会让它每条再补一次
+    ``get_meta``（200 条批 = 200 条额外查询）。投影口径与 get_meta 一致，
+    不碰 ``upstream_response`` / ``request_body`` 这些大字段。
+    """
     cutoff = now() - stale_seconds
     async with get_session_factory()() as db:
         rows = (
             await db.execute(
                 text(
                     f"""
-                    SELECT task_id FROM tasks
+                    SELECT {_META_SELECT} FROM tasks
                     WHERE platform = :p AND status IN :acts
-                      AND {_secs('updated_at')} < :cutoff
+                      AND updated_at < :cutoff
                     LIMIT :lim
                     """
                 ).bindparams(bindparam("acts", expanding=True)),
@@ -426,21 +440,24 @@ async def stale_active(stale_seconds: int, limit: int = 200) -> list[str]:
                     "lim": limit,
                 },
             )
-        ).scalars().all()
-    return [str(x) for x in rows]
+        ).mappings().all()
+    return [_meta_row_to_dict(row) for row in rows]
 
 
-async def overdue_active(lifetime_seconds: int, limit: int = 200) -> list[str]:
-    """超过最大生命期仍非终态的任务（按 created_at 判定，无条件判死对象）。"""
+async def overdue_active(lifetime_seconds: int, limit: int = 200) -> list[dict]:
+    """超过最大生命期仍非终态的任务（按 created_at 判定，无条件判死对象）。
+
+    同 ``stale_active``：回元数据行，省掉 sweeper 侧的逐条回查。
+    """
     cutoff = now() - lifetime_seconds
     async with get_session_factory()() as db:
         rows = (
             await db.execute(
                 text(
                     f"""
-                    SELECT task_id FROM tasks
+                    SELECT {_META_SELECT} FROM tasks
                     WHERE platform = :p AND status IN :acts
-                      AND {_secs('created_at')} < :cutoff
+                      AND created_at < :cutoff
                     LIMIT :lim
                     """
                 ).bindparams(bindparam("acts", expanding=True)),
@@ -451,8 +468,8 @@ async def overdue_active(lifetime_seconds: int, limit: int = 200) -> list[str]:
                     "lim": limit,
                 },
             )
-        ).scalars().all()
-    return [str(x) for x in rows]
+        ).mappings().all()
+    return [_meta_row_to_dict(row) for row in rows]
 
 
 async def search(
@@ -490,7 +507,7 @@ async def search(
         where.append("task_id LIKE :tid_prefix")
         params["tid_prefix"] = f"{_escape_like_prefix(task_id_prefix)}%"
     if since_seconds > 0:
-        where.append(f"{_secs('created_at')} > :since")
+        where.append("created_at > :since")
         params["since"] = now() - since_seconds
 
     clause = " AND ".join(where)
@@ -511,7 +528,7 @@ async def search(
                 await db.execute(
                     text(
                         f"""
-                        SELECT task_id, status, fail_reason, channel_id,
+                        SELECT task_id, status, fail_reason, channel_id, user_id,
                                created_at, start_time, finish_time,
                                data ->> '$.model'            AS model,
                                data ->> '$.request_path'     AS request_path,
@@ -555,9 +572,9 @@ async def metrics(window_seconds: int = 3600) -> dict:
             rows = (
                 await db.execute(
                     text(
-                        f"""
+                        """
                         SELECT status, COUNT(*) AS n FROM tasks
-                        WHERE platform = :p AND {_secs('created_at')} > :since
+                        WHERE platform = :p AND created_at > :since
                         GROUP BY status
                         """
                     ),
@@ -571,12 +588,12 @@ async def metrics(window_seconds: int = 3600) -> dict:
             rows = (
                 await db.execute(
                     text(
-                        f"""
+                        """
                         SELECT COALESCE(NULLIF(fail_reason, ''), 'unknown') AS reason,
                                COUNT(*) AS n
                         FROM tasks
                         WHERE platform = :p AND status = 'FAILURE'
-                          AND {_secs('created_at')} > :since
+                          AND created_at > :since
                         GROUP BY reason ORDER BY n DESC LIMIT 10
                         """
                     ),
@@ -590,11 +607,11 @@ async def metrics(window_seconds: int = 3600) -> dict:
             rows = (
                 await db.execute(
                     text(
-                        f"""
+                        """
                         SELECT COALESCE(NULLIF(data ->> '$.model', ''), 'unknown') AS model,
                                COUNT(*) AS n
                         FROM tasks
-                        WHERE platform = :p AND {_secs('created_at')} > :since
+                        WHERE platform = :p AND created_at > :since
                         GROUP BY model ORDER BY n DESC LIMIT 10
                         """
                     ),
@@ -603,24 +620,51 @@ async def metrics(window_seconds: int = 3600) -> dict:
             ).all()
             return list(rows)
 
-    async def _query_durations() -> list:
+    async def _query_durations() -> dict[str, int]:
+        """分位数在 SQL 侧算完，只回 4 个标量。
+
+        原实现把窗口内**全部** SUCCESS 行的 duration 拉回 Python 排序，
+        任务量大时内存和网络往返都随行数线性涨。改用 MySQL 8 窗口函数
+        单趟扫描定位分位行，语义与原 Python 取法完全一致（0 基下标
+        ``min(n-1, floor(n*q))`` ⇔ 1 基 ``LEAST(n, FLOOR(n*q)+1)``）。
+        """
         async with get_session_factory()() as db:
-            rows = (
+            row = (
                 await db.execute(
                     text(
-                        f"""
-                        SELECT {_secs('finish_time')} - {_secs('start_time')} AS d
-                        FROM tasks
-                        WHERE platform = :p AND status = 'SUCCESS'
-                          AND {_secs('created_at')} > :since
-                          AND {_secs('start_time')} > 0
-                          AND {_secs('finish_time')} >= {_secs('start_time')}
+                        """
+                        WITH d AS (
+                            SELECT finish_time - start_time AS v,
+                                   ROW_NUMBER() OVER (
+                                       ORDER BY finish_time - start_time
+                                   ) AS rn,
+                                   COUNT(*) OVER () AS n
+                            FROM tasks
+                            WHERE platform = :p AND status = 'SUCCESS'
+                              AND created_at > :since
+                              AND start_time > 0
+                              AND finish_time >= start_time
+                        )
+                        SELECT n,
+                               MAX(IF(rn = LEAST(n, FLOOR(n * 0.50) + 1), v, NULL)) AS p50,
+                               MAX(IF(rn = LEAST(n, FLOOR(n * 0.95) + 1), v, NULL)) AS p95,
+                               MAX(IF(rn = LEAST(n, FLOOR(n * 0.99) + 1), v, NULL)) AS p99,
+                               MAX(v) AS mx
+                        FROM d GROUP BY n
                         """
                     ),
                     {"p": p, "since": since},
                 )
-            ).scalars().all()
-            return list(rows)
+            ).mappings().first()
+        if row is None:
+            return {"count": 0, "p50": 0, "p95": 0, "p99": 0, "max": 0}
+        return {
+            "count": int(row["n"] or 0),
+            "p50": int(row["p50"] or 0),
+            "p95": int(row["p95"] or 0),
+            "p99": int(row["p99"] or 0),
+            "max": int(row["mx"] or 0),
+        }
 
     async def _query_active_total() -> int:
         async with get_session_factory()() as db:
@@ -628,14 +672,14 @@ async def metrics(window_seconds: int = 3600) -> dict:
                 await db.execute(
                     text(
                         "SELECT COUNT(*) FROM tasks WHERE platform = :p "
-                        "AND status IN ('NOT_START', 'IN_PROGRESS')"
-                    ),
-                    {"p": p},
+                        "AND status IN :acts"
+                    ).bindparams(bindparam("acts", expanding=True)),
+                    {"p": p, "acts": ACTIVE},
                 )
             ).scalar() or 0
 
     import asyncio
-    status_rows, fail_rows, model_rows, duration_rows, active_total = \
+    status_rows, fail_rows, model_rows, durations, active_total = \
         await asyncio.gather(
             _query_status(),
             _query_failures(),
@@ -646,12 +690,6 @@ async def metrics(window_seconds: int = 3600) -> dict:
 
     counts = {str(row[0]): int(row[1]) for row in status_rows}
     done = counts.get("SUCCESS", 0) + counts.get("FAILURE", 0)
-    durations = sorted(int(d) for d in duration_rows if d is not None)
-
-    def pct(q: float) -> int:
-        if not durations:
-            return 0
-        return durations[min(len(durations) - 1, int(len(durations) * q))]
 
     return {
         "window_seconds": window_seconds,
@@ -659,11 +697,7 @@ async def metrics(window_seconds: int = 3600) -> dict:
         "total": sum(counts.values()),
         "success_rate": round(counts.get("SUCCESS", 0) / done, 4) if done else None,
         "active_total": int(active_total),
-        "duration_seconds": {
-            "count": len(durations),
-            "p50": pct(0.50), "p95": pct(0.95), "p99": pct(0.99),
-            "max": durations[-1] if durations else 0,
-        },
+        "duration_seconds": durations,
         "top_failures": [{"reason": str(r[0])[:160], "count": int(r[1])}
                          for r in fail_rows],
         "top_models": [{"model": str(r[0]), "count": int(r[1])} for r in model_rows],
@@ -682,14 +716,14 @@ async def purge_expired_results(ttl_seconds: int, limit: int = 200) -> int:
             "CursorResult[Any]",
             await db.execute(
                 text(
-                    f"""
+                    """
                     UPDATE tasks
                     SET data = JSON_SET(data, '$.upstream_response', '',
                                               '$.result_purged', true)
                     WHERE platform = :p
                       AND COALESCE(data ->> '$.result_purged', 'false') <> 'true'
                       AND COALESCE(data ->> '$.upstream_response', '') <> ''
-                      AND {_secs('finish_time')} BETWEEN 1 AND :cutoff
+                      AND finish_time BETWEEN 1 AND :cutoff
                     LIMIT :lim
                     """
                 ),

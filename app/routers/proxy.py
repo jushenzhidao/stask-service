@@ -1,7 +1,7 @@
 """``/async/{path:path}`` 通配路由——本服务的全部业务入口。
 
 三个方法映射到三件事：
-- ``POST`` / ``PUT`` → 提交任务（202，自动幂等）
+- ``POST`` / ``PUT`` → 提交任务（202；带 ``Idempotency-Key`` 头才幂等）
 - ``GET``            → 查询/回放（202 / 200 / 重放上游错误码）
 - ``DELETE``         → 取消（200 / 409）
 
@@ -18,16 +18,17 @@ from app.deps import ratelimit
 from app.deps.auth import Caller, require_caller
 from app.errors import error_body
 from app.logging import log
-from app.schemas import NOT_START, SubmitPlan
+from app.schemas import QUEUED, SubmitPlan
 from app.services import (
     admission,
     codec,
     dynconf,
     flow,
-    idem,
     submit,
+    upstream,
 )
 from app.services.admission import AdmissionError
+from app.services.idem import new_task_id
 from app.services.submit import model_slug
 
 router = APIRouter(prefix="/async")
@@ -70,7 +71,7 @@ def _extract_model(body: bytes, content_type: str) -> str:
 
 @router.api_route("/{path:path}", methods=["POST", "PUT"], status_code=202)
 async def submit_task(path: str, request: Request) -> Response:
-    """提交（自动幂等：同 token 的字节级相同请求映射到同一 task_id）。"""
+    """提交。带 ``Idempotency-Key`` 头时同 token 同 key 幂等回放。"""
     try:
         upstream_path = _normalize_path(path)
         admission.check_path(upstream_path)
@@ -82,6 +83,13 @@ async def submit_task(path: str, request: Request) -> Response:
 
     caller: Caller = require_caller(request)
     await ratelimit.check(caller.token_hash)
+
+    # 鉴权 + 余额预检：共享库单 SQL 直查（401 无效 key / 402 余额耗尽 /
+    # 502 库不可用），双层缓存。计费仍由上游 relay 在任务执行时自理。
+    try:
+        auth = await upstream.authenticate(caller.raw_token, caller.token_hash)
+    except upstream.UpstreamAuthError as exc:
+        raise HTTPException(exc.status, exc.message) from exc
 
     # 一次请求只取一次快照，后续判定全部复用（body 上限可在管理页热改）
     config = await dynconf.get_runtime_config()
@@ -97,20 +105,17 @@ async def submit_task(path: str, request: Request) -> Response:
 
     headers = admission.clean_headers(dict(request.headers))
     query = request.url.query or ""
-    # Idempotency-Key 是可选的**盐**：默认不带即自动幂等；带不同值可对
-    # 同一请求体强制创建新任务（比如故意重跑同一 prompt）。
+    # Idempotency-Key（可选）：带 = 显式幂等（同 token 同 key 恒同 task_id），
+    # 不带 = 每次提交都是新任务。
     idem_key = (request.headers.get("idempotency-key") or "").strip()[:128]
     callback_url = (request.headers.get("x-callback-url") or "").strip()[:1024]
 
-    # 请求指纹 → 确定性 task_id（自动幂等的根基）
-    task_id = idem.fingerprint_task_id(
-        model_slug(model), caller.token_hash,
-        request.method, upstream_path, query, body, salt=idem_key,
-    )
+    task_id = new_task_id(model_slug(model), caller.token_hash, idem_key)
 
     plan = SubmitPlan(
         task_id=task_id,
         token_hash=caller.token_hash,
+        user_id=auth.user_id,
         model=model,
         method=request.method,
         path=upstream_path,
@@ -143,7 +148,7 @@ async def submit_task(path: str, request: Request) -> Response:
     location = f"/async{upstream_path}/{task_id}"
     return JSONResponse(
         status_code=202,
-        content={"task_id": task_id, "status": NOT_START, "replayed": replayed},
+        content={"task_id": task_id, "status": QUEUED, "replayed": replayed},
         headers={"Location": location},
     )
 

@@ -243,10 +243,10 @@ wrk -t 10 -c 200 -d 30s --script submit.lua http://127.0.0.1:8000/async/v1/image
    
    **建议**：在 `docs/decisions/` 中增加 ADR 说明两者差异的原因（前者是软措施，后者是防双扣的硬保证）。
 
-2. **时间归一逻辑散落**
-   `_secs()` 在每个 SQL 中手工拼接，容易遗漏。
-   
-   **建议**：考虑在 DB 层统一处理（VIEW 或触发器），或改用 ORM 抽象。
+2. ~~**时间归一逻辑散落**：`_secs()` 在每个 SQL 中手工拼接，容易遗漏。~~
+   **已解决（ADR-008）**：`_secs()` 整体删除。写侧恒写 unix 秒 + 查询恒带
+   `platform='stask'`，SQL 时间谓词改裸列比较，既消除了拼接遗漏，也让
+   sweeper 的 range 条件恢复走索引。读侧保留 `as_unix_seconds` 兜底。
 
 3. **类型标注可加强**
    `taskstore.get()` 返回 `dict | None`，字段结构依赖文档。

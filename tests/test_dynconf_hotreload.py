@@ -45,7 +45,7 @@ async def test_poll_wait_max_seconds_hotreload_422(
     task_store.rows[task_id] = {
         "task_id": task_id,
         "user_id": "user_test",
-        "status": "NOT_START",
+        "status": "QUEUED",
         "data": {"request_path": "/v1/images/generations"},
     }
 

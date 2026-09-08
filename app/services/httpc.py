@@ -14,16 +14,21 @@ import httpx
 
 from app.logging import log
 
-#: key = 构造参数组合（同参数返回同一实例）
-_shared: dict[tuple, httpx.AsyncClient] = {}
+#: key = 用途名（每个用途恒一个实例，构造参数只在首次生效）
+_shared: dict[str, httpx.AsyncClient] = {}
 
 
-def shared_client(**kwargs) -> httpx.AsyncClient:
-    key = tuple(sorted((name, repr(value)) for name, value in kwargs.items()))
-    client = _shared.get(key)
+def shared_client(name: str, **kwargs) -> httpx.AsyncClient:
+    """按用途名取共享客户端；不存在或已关闭时按 ``kwargs`` 新建。
+
+    key **只用 name**：可变的 timeout 之类参数绝不能进 key，否则运行时改
+    一次配置就多出一个实例，旧实例连接一直占着直到进程退出。会随配置变的
+    超时请走请求级 ``client.request(..., timeout=...)``。
+    """
+    client = _shared.get(name)
     if client is None or client.is_closed:
         client = httpx.AsyncClient(**kwargs)
-        _shared[key] = client
+        _shared[name] = client
     return client
 
 

@@ -3,7 +3,7 @@
 - 业务模块一律 ``from app.logging import log``；
 - ``setup_logging()`` 在 web（``app.main.create_app``）与 worker
   （``app.queue.ObservabilityMiddleware.startup``）入口各调用一次；
-- 级别由 ``ST_LOG_LEVEL`` 控制。
+- 级别由 ``LOG_LEVEL`` 控制。
 
 安全纪律（红线：用户 sk 不进日志）：
 ``backtrace=False, diagnose=False``——异常回溯绝不带帧局部变量值。

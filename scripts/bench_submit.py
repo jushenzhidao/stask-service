@@ -10,7 +10,7 @@
 
 注意事项：
 - 每个请求带唯一 Idempotency-Key，否则会全部命中幂等回放，测出来是假数据；
-- `ST_MAX_SLOTS` 会限制在途任务数，压测前把它调大（或让 worker 跑起来消费），
+- `MAX_SLOTS` 会限制在途任务数，压测前把它调大（或让 worker 跑起来消费），
   否则大量请求会撞 429——那测的是限流器不是提交链路；
 - 建议同时观察 `/ops/stats` 的状态分布确认任务确实在落库。
 """
@@ -95,7 +95,7 @@ async def main() -> None:
     print(f"max        : {latencies[-1]:.1f} ms" if n else "")
     print(f"status     : {dict(sorted(codes.items()))}")
     if codes.get(429):
-        print("\n注意：出现 429——并发槽被打满。压测前调大 ST_MAX_SLOTS，"
+        print("\n注意：出现 429——并发槽被打满。压测前调大 MAX_SLOTS，"
               "或让 worker 跑起来消费在途任务，否则测的是限流器不是提交链路。")
 
 

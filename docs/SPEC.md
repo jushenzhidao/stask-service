@@ -61,7 +61,7 @@
 |---|---|---|---|
 | Web 框架 | FastAPI | 0.115.14 | 与 atask-service 对齐，团队零学习成本 |
 | ASGI | uvicorn / gunicorn | 0.34.0 / 23.0.0 | UvicornWorker + preload，post-fork 惰性单例 |
-| 数据校验 | pydantic / pydantic-settings | 2.11.7 / 2.9.1 | `ST_` 前缀配置单例 |
+| 数据校验 | pydantic / pydantic-settings | 2.11.7 / 2.9.1 | 无前缀配置单例 |
 | ORM/驱动 | SQLAlchemy[asyncio] / asyncmy | 2.0.41 / 0.2.10 | 只用 `text()` 原生 SQL，ORM 仅作映射说明 |
 | Redis | redis (asyncio) | 5.2.1 | `decode_responses=True`，Lua 原子操作 |
 | HTTP | httpx[http2] | 0.28.1 | 共享 AsyncClient 连接池 |
@@ -89,7 +89,7 @@
 | GET | `/ops/tasks/{task_id}` | 单任务诊断视图（不含 sk、不含结果体） | Bearer sk | - | `200`/`404` |
 | POST | `/ops/reconcile/run` | 手工触发一轮对账 | Bearer sk | - | `200 {scanned,stats}` |
 
-管理面（`X-Admin-Key`；`ST_ADMIN_KEY` 未配置时**全部 404**）：
+管理面（`X-Admin-Key`；`ADMIN_KEY` 未配置时**全部 404**）：
 
 | Method | Path | 功能 | 请求 | 响应 |
 |---|---|---|---|---|
@@ -110,7 +110,7 @@
 ## 6. 数据模型（锁定 — 复用 new-api `tasks` 表，零建表）
 
 `task_id` 形态：`{model_slug}_{uuid4hex}`（`model_slug` = 模型名小写、非 `[a-z0-9]` 替 `_`、截断 16 字符；总长 ≤ 53）。
-`platform` = `stask`（`ST_GATEWAY_PLATFORM`），**所有写操作 WHERE 必带**。
+`platform` = `stask`（`GATEWAY_PLATFORM`），**所有写操作 WHERE 必带**。
 `channel_id`：执行前 0，执行后从响应头尽力回填（开放问题④保守取头）。
 
 `data` JSON 列字段契约：
@@ -124,7 +124,7 @@
 | `callback_url` | str | 可空 |
 | `request_method` / `request_path` / `request_query` | str | 剥前缀后的原文 |
 | `request_headers` | obj | 已剔除 Authorization / Cookie / Host / Content-Length 等 |
-| `request_body` | str(b64) 或 obj | 超 `ST_BODY_MAX_BYTES` 则只存摘要 + `body_truncated:true` |
+| `request_body` | str(b64) 或 obj | 超 `BODY_MAX_BYTES` 则只存摘要 + `body_truncated:true` |
 | `upstream_base_url` | str | 提交时校验通过的值，worker 只认它 |
 | `freeze_amount` | int | 恒 `0` — 让 atask sweeper 天然跳过 |
 | `settled` | bool | 恒 `true` — 同上 |
@@ -157,21 +157,21 @@
 | 编号 | 功能 | EARS 验收标准 | 优先级 |
 |---|---|---|---|
 | AC-01 | 提交 | When 客户端 POST 合法 `/async/v1/images/generations`，系统**必须**在落库后返回 `202` + `task_id` + `Location` 头 | P0 |
-| AC-02 | 路径准入 | If 请求路径命中 `ST_ASYNC_DENY_PREFIXES`，系统**必须**返回 `403`，且 deny 判定优先于 allow | P0 |
-| AC-03 | 路径准入 | If 请求路径未命中 `ST_ASYNC_ALLOW_PREFIXES`，系统**必须**返回 `403` | P0 |
+| AC-02 | 路径准入 | If 请求路径命中 `ASYNC_DENY_PREFIXES`，系统**必须**返回 `403`，且 deny 判定优先于 allow | P0 |
+| AC-03 | 路径准入 | If 请求路径未命中 `ASYNC_ALLOW_PREFIXES`，系统**必须**返回 `403` | P0 |
 | AC-04 | 方法准入 | If 请求方法不是 POST/PUT，系统**必须**返回 `405` | P0 |
 | AC-05 | 幂等 | While 同一 `Idempotency-Key` 已回填 task_id，系统**必须**返回同一 task_id 而不重建任务 | P0 |
 | AC-06 | 幂等 | If 同一 `Idempotency-Key` 真并发且占位未回填，系统**必须**返回 `409`，绝不重建 | P0 |
-| AC-07 | 额度 | Where 余额为 `B`、参考单价为 `P`，系统**必须**按 `clamp(floor(B/P), 1, ST_MAX_SLOTS)` 计算槽位数 | P0 |
+| AC-07 | 额度 | Where 余额为 `B`、参考单价为 `P`，系统**必须**按 `clamp(floor(B/P), 1, MAX_SLOTS)` 计算槽位数 | P0 |
 | AC-08 | 额度 | If 在途任务数已达槽位上限，系统**必须**返回 `429` 并携带 `Retry-After` 头 | P0 |
 | AC-09 | 回滚 | If 落库失败，系统**必须**归还幂等占位（CAS）并归还并发槽 | P0 |
-| AC-10 | upstream | If `X-Upstream-Base-Url` 的 host 不在 `ST_UPSTREAM_ALLOWLIST`，系统**必须**返回 `400` | P0 |
+| AC-10 | upstream | `UPSTREAM_ALLOWLIST` 非空时，若 `X-Upstream-Base-Url` 的 host 不在其中，系统**必须**返回 `400`；留空则**不限制**（与 `CALLBACK_ALLOWLIST` 同语义），但 scheme / userinfo / query 校验（AC-11）始终生效 | P0 |
 | AC-11 | upstream | If upstream URL 含 userinfo 或 scheme 非 http(s)，系统**必须**返回 `400` | P0 |
 | AC-12 | 执行 | When worker 出队，系统**必须**先 CAS `SUBMITTED→IN_PROGRESS`，失败即放弃（不重复执行） | P0 |
 | AC-13 | 派发锁 | If 派发锁已被占用，系统**必须不**再次调用上游，并将任务标记为 `reconcile_pending` | P0 |
 | AC-14 | 分流 | When 上游返回 2xx，系统**必须**落 `SUCCESS` 并存储 gzip 响应原文与 Content-Type | P0 |
 | AC-15 | 分流 | When 上游返回 4xx，系统**必须**落 `FAILURE` 并保存原文与状态码用于重放 | P0 |
-| AC-16 | 分流 | When 上游返回 5xx 且 `ST_RETRY_MAX=0`，系统**必须**直接落 `FAILURE`，不重试 | P0 |
+| AC-16 | 分流 | When 上游返回 5xx 且 `RETRY_MAX=0`，系统**必须**直接落 `FAILURE`，不重试 | P0 |
 | AC-17 | 分流 | When 调用超时，系统**必须不**判死，而是保持非终态并标记 `reconcile_pending` | P0 |
 | AC-18 | 释放 | When 任务进入终态，系统**必须**释放并发槽、清除令牌会话、置 `inflight_slot=false` | P0 |
 | AC-19 | 查询 | While 任务为 SUBMITTED/IN_PROGRESS，系统**必须**返回 `202` + `{task_id,status,created_at}` | P0 |
@@ -184,14 +184,14 @@
 | AC-25 | 取消 | While 任务为 IN_PROGRESS，系统**必须**返回 `409` | P0 |
 | AC-26 | 对账 | While 任务 `reconcile_pending` 且消费日志按 `X-Task-Id` 查到成功扣费，系统**必须**补记 `SUCCESS` 并告警 result 缺失 | P1 |
 | AC-27 | 对账 | While 任务 `reconcile_pending` 且窗口内确认无任何扣费记录，系统**必须**落 `FAILURE` | P1 |
-| AC-28 | 对账 | If 对账查询本身失败，系统**必须**保持挂起，超 `ST_RECONCILE_TTL` 转人工告警 | P1 |
+| AC-28 | 对账 | If 对账查询本身失败，系统**必须**保持挂起，超 `RECONCILE_TTL` 转人工告警 | P1 |
 | AC-29 | 回调 | When 任务转终态且提供 `X-Callback-Url`，系统**必须**推送含 `X-Stask-Signature` 的 HMAC-SHA256 签名 | P1 |
 | AC-30 | 安全 | 系统**必须不**将用户 sk 写入 tasks 表、日志或任何 HTTP 响应 | P0 |
-| AC-31 | 时间 | 系统读写 tasks 表时间列**必须**经 `as_unix_seconds` / `_secs()` 归一 | P0 |
+| AC-31 | 时间 | 读 tasks 表时间列**必须**经 `as_unix_seconds` 归一；写侧恒写 unix 秒，SQL 时间谓词用裸列比较以保留索引 | P0 |
 | AC-32 | 清理 | When 结果超过 `result_ttl_seconds`，系统**必须**清空 `upstream_response` 但保留状态行 | P1 |
 | AC-33 | 卡死兜底 | If 任务落库后入队消息丢失（长时间无进展且未被标记待对账），系统**必须**将其标记 `reconcile_pending` 交由对账收敛，且**不得**直接判死 | P0 |
 | AC-34 | 动态配置 | If 请求修改白名单外的配置项（连接串 / 密钥 / upstream 白名单 / 路径准入等），系统**必须**拒绝并返回 400；区间校验失败**必须**整批回退 | P0 |
-| AC-35 | 管理鉴权 | If `ST_ADMIN_KEY` 未配置，所有管理端点**必须**返回 404；已配置时缺失或错误密钥**必须**返回 401，且终端用户 sk **不得**通过 | P0 |
+| AC-35 | 管理鉴权 | If `ADMIN_KEY` 未配置，所有管理端点**必须**返回 404；已配置时缺失或错误密钥**必须**返回 401，且终端用户 sk **不得**通过 | P0 |
 | AC-36 | 管理脱敏 | 管理端点**必须不**返回用户 sk、请求体原文或响应体原文 | P0 |
 
 ---
@@ -211,7 +211,7 @@
 
 | 坑 | 技术栈指纹 | 根因 | 修法 |
 |---|---|---|---|
-| tasks 表时间列混入毫秒 | mysql/new-api-tasks | new-api 原生任务模块用 UnixMilli 写法 | 读侧 `as_unix_seconds`，SQL 侧 `_secs(col)` 表达式；两侧都不能省 |
+| tasks 表时间列混入毫秒 | mysql/new-api-tasks | new-api 原生任务模块用 UnixMilli 写法 | 读侧 `as_unix_seconds` 兜底归一；SQL 谓词恒带 `platform='stask'`，只命中本服务写的秒值行，故可裸比较走索引 |
 | 共享表误改他人行 | mysql/new-api-tasks | tasks 表被 new-api + atask + stask 三方写 | 所有 UPDATE/SELECT 的 WHERE 必带 `platform = :p` |
 | atask sweeper 误扫 stask 行 | atask-service | sweeper 按 `settled != true` 找未结算任务 | data 恒写 `freeze_amount:0, settled:true`，天然跳过 |
 | taskiq `with_labels(delay=)` 不生效 | taskiq-redis/ListQueueBroker | ListQueueBroker 不支持 delay 标签 | 延迟任务一律走 `schedule_by_time` |
@@ -272,11 +272,11 @@ curl -s -X DELETE "http://127.0.0.1:8000/async/v1/images/generations/$NEW" | jq 
 | 日期 | 变更 | 原因 | 影响范围 |
 |---|---|---|---|
 | 2026-08-21 | Spec v1.0 建立 | 基于设计 v1.1 + 三项开放问题裁决 | 全量 |
-| 2026-08-21 | `ST_RETRY_MAX` 默认 0 | ADR-002：5xx 回滚语义未确认，保守不重试 | §5 worker |
+| 2026-08-21 | `RETRY_MAX` 默认 0 | ADR-002：5xx 回滚语义未确认，保守不重试 | §5 worker |
 | 2026-08-21 | ref_price 走配置 + 兜底 | ADR-003：提交链路不引入额外 RTT | §6 额度 |
 | 2026-08-21 | Redis 独立实例 | ADR-004：故障域隔离 | 部署 |
 | 2026-08-23 | 补齐卡死任务兜底扫描（AC-33） | `stale_active` 已实现但零调用方：入队消息丢失的任务永久停在 SUBMITTED 且永久占槽 | §5 worker、新增 sweeper |
 | 2026-08-23 | 运行时配置白名单（AC-34） | ADR-005：运营旋钮可热改，安全项永久只读 | 新增 `dynconf` |
-| 2026-08-23 | 管理面 + 单文件看板（AC-35/36） | 独立 `ST_ADMIN_KEY`，未配置则全部 404 | 新增 `/admin` |
+| 2026-08-23 | 管理面 + 单文件看板（AC-35/36） | 独立 `ADMIN_KEY`，未配置则全部 404 | 新增 `/admin` |
 | 2026-08-23 | 单进程部署模式 | 简化部署：一条命令起 web+worker+scheduler | 新增 `app/standalone.py` |
-| 2026-09-07 | 定位与命名去 newapi 化 | 本服务是独立异步队列服务，上游只是一个 HTTP 服务；`newapi_base_url`→`upstream_base_url`（旧 env 名保留兼容），`billing_newapi`→`billing_http` | §1 措辞、`app/config.py`、`app/services/providers/`；**无契约变更** |
+| 2026-09-07 | 定位与命名去 newapi 化 | 本服务是独立异步队列服务，上游只是一个 HTTP 服务；`newapi_base_url`→`upstream_base_url`（不保留旧 env 名），`billing_newapi`→`billing_http` | §1 措辞、`app/config.py`、`app/services/providers/`；**无契约变更** |

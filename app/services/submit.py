@@ -1,14 +1,14 @@
 """提交链路（web 侧，毫秒级）：
 
     token 限流
-    → 请求指纹 task_id（自动幂等）
-    → DB 有行 → 直接回放（不占资源）
-    → 幂等占位（Redis SET NX，护住创建在飞窗口）
+    → 鉴权 + 余额预检（共享库单 SQL + 双层缓存；401/402 在此拦截）
+    → 显式幂等（带 Idempotency-Key 才去重；DB 有行 → 直接回放）
+    → 幂等占位（Redis SET NX，护住创建在飞窗口，仅幂等提交需要）
     → 并发槽（固定上限，纯并发保护）
-    → 落库 NOT_START → 令牌会话 → 入队 → 202
+    → 落库 QUEUED → 令牌会话 → 入队 → 202
 
-本服务**不做计费、不做 key 管理**：Authorization 原样透传给上游，
-有效性由上游判定（无效令牌 = 上游 401 = 任务 FAILURE）。
+本服务**零计费代码**：预扣/退款/流水全部由上游 relay 在任务执行时自理。
+提交前的余额预检只是准入闸门（余额 ≤ 0 → 402 不建任务）。
 
 **失败即回滚**：任何一步失败都必须归还已获取的资源（占位 CAS 归还 +
 并发槽归还），否则一次失败的提交会永久扣掉一个槽。
@@ -26,7 +26,7 @@ import re
 from collections.abc import Awaitable, Callable
 
 from app.logging import log
-from app.schemas import SubmitPlan
+from app.schemas import QUEUED, SubmitPlan
 from app.services import dynconf, idem, slots, taskstore, tokensession
 from app.services.dynconf import RuntimeConfig
 
@@ -34,7 +34,7 @@ _NON_ALNUM = re.compile(r"[^a-z0-9]+")
 
 
 class SubmitConflict(Exception):
-    """同请求真并发且创建未完成 → 409（客户端稍后重试即可回放）。"""
+    """同幂等键真并发且创建未完成 → 409（客户端稍后重试即可回放）。"""
 
 
 class SlotExhausted(Exception):
@@ -86,8 +86,8 @@ async def submit(
 ) -> tuple[str, bool]:
     """执行完整提交链路。返回 ``(task_id, replayed)``。
 
-    ``replayed=True`` 表示命中自动幂等，未创建新任务（也未占新槽）。
-    ``plan.task_id`` 已由路由层按请求指纹算好（确定性）。
+    ``replayed=True`` 表示命中显式幂等（``Idempotency-Key``），未创建
+    新任务（也未占新槽）。``plan.task_id`` 已由路由层算好。
 
     ``enqueue`` 用回调而非直接 import：让路由层决定入队实现，
     测试里换成记录器即可，不必 monkeypatch taskiq broker。
@@ -97,17 +97,19 @@ async def submit(
 
     task_id = plan.task_id
     th = plan.token_hash
+    idempotent = bool(plan.idempotency_key)
 
-    # ---- 1. 自动幂等：DB 是事实源 ----
-    if await taskstore.exists(task_id):
-        log.info("idempotent replay: task_id={}", task_id)
-        return task_id, True
-
-    # ---- 2. 创建窗口占位（护住真并发的几百毫秒）----
-    if not await idem.acquire(task_id):
-        if await idem.wait_row(task_id, taskstore.exists):
+    # ---- 1. 显式幂等：DB 是事实源（仅带 Idempotency-Key 的提交）----
+    if idempotent:
+        if await taskstore.exists(task_id):
+            log.info("idempotent replay: task_id={}", task_id)
             return task_id, True
-        raise SubmitConflict("concurrent identical request in flight")
+
+        # ---- 2. 创建窗口占位（护住同 key 真并发的几百毫秒）----
+        if not await idem.acquire(task_id):
+            if await idem.wait_row(task_id, taskstore.exists):
+                return task_id, True
+            raise SubmitConflict("concurrent request with same idempotency key")
 
     slot_taken = False
     created = False
@@ -118,11 +120,12 @@ async def submit(
             raise SlotExhausted(config.max_slots)
         slot_taken = True
 
-        # ---- 4. 落库 NOT_START ----
+        # ---- 4. 落库 QUEUED ----
         await taskstore.create(
             task_id=task_id,
             action=plan.path[:32],
             data=build_task_data(plan),
+            user_id=plan.user_id,
         )
         created = True
 
@@ -137,13 +140,13 @@ async def submit(
         if slot_taken:
             await slots.release(th)
         if created:
-            # 行已存在但永远不会被执行：CAS 判死，别留僵尸 NOT_START。
-            # 行保留 = 自动幂等会把重试回放到这个 FAILURE（重试换
-            # Idempotency-Key 盐即可重跑）——比归还占位让重试重建更安全：
-            # 入队失败时 broker 可能已收下消息，重建会导致上游被调两次。
+            # 行已存在但永远不会被执行：CAS 判死，别留僵尸 QUEUED。
+            # 行保留 = 幂等重试会回放到这个 FAILURE（换 Idempotency-Key
+            # 即可重跑）——比归还占位让重试重建更安全：入队失败时 broker
+            # 可能已收下消息，重建会导致上游被调两次。
             try:
                 await taskstore.cas(
-                    task_id, ("NOT_START",), "FAILURE",
+                    task_id, (QUEUED,), "FAILURE",
                     fail_reason="submit pipeline aborted",
                 )
                 await tokensession.clear(task_id)
@@ -151,11 +154,11 @@ async def submit(
                 log.opt(exception=True).error(
                     "submit rollback failed to mark task: task_id={}", task_id
                 )
-        else:
+        elif idempotent:
             await idem.release(task_id)
         raise
     finally:
-        if created:
+        if created and idempotent:
             await idem.settle(task_id)
 
     log.info("task submitted: task_id={} model={} path={}",

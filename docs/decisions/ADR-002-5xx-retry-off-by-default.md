@@ -1,4 +1,4 @@
-# ADR-002: 上游 5xx 默认不重试（`ST_RETRY_MAX=0`）
+# ADR-002: 上游 5xx 默认不重试（`RETRY_MAX=0`）
 
 ## Status
 
@@ -16,11 +16,11 @@ Accepted (2026-08-21) —— 对应设计文档开放问题①
 
 **代码保留完整的退避重试能力，但默认关闭**：
 
-- `ST_RETRY_MAX = 0` —— HTTP 5xx 直接落 `FAILURE`，不重试。
-- `ST_RETRY_MAX_CONNECT = 2` —— **连接层错误单独放行**：`httpx.ConnectError` / `ConnectTimeout` / DNS 失败等，表示请求根本没到达上游，relay 未执行、零扣费风险，重试安全。
+- `RETRY_MAX = 0` —— HTTP 5xx 直接落 `FAILURE`，不重试。
+- `RETRY_MAX_CONNECT = 2` —— **连接层错误单独放行**：`httpx.ConnectError` / `ConnectTimeout` / DNS 失败等，表示请求根本没到达上游，relay 未执行、零扣费风险，重试安全。
 - 读超时（`ReadTimeout`）不算连接层错误 —— 请求已进 relay，可能已扣费，走 §8 超时对账路径（绝不判死）。
 
-确认 new-api 5xx 回滚语义后，把 `ST_RETRY_MAX` 改成 3 即可开启，无需改代码。
+确认 new-api 5xx 回滚语义后，把 `RETRY_MAX` 改成 3 即可开启，无需改代码。
 
 ## Consequences
 

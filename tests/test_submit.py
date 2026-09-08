@@ -20,12 +20,12 @@ def test_submit_returns_202_with_location(client, task_store, queue_events):
 
     payload = resp.json()
     task_id = payload["task_id"]
-    assert payload["status"] == "NOT_START"
+    assert payload["status"] == "QUEUED"
     assert task_id.startswith("dall_e_3_")
     assert resp.headers["location"] == f"{PATH}/{task_id}"
 
     row = task_store.rows[task_id]
-    assert row["status"] == "NOT_START"
+    assert row["status"] == "QUEUED"
     assert row["progress"] == "0%"
     assert queue_events.execute == [task_id]
 
@@ -38,7 +38,7 @@ def test_newapi_coexistence_contract(client, task_store):
     assert row["platform"] == "stask"          # 非 suno/mj → adaptor 为 nil
     assert row["channel_id"] == 990            # 独立渠道（test_settings）
     assert row["quota"] == 0                   # 零资金记账
-    assert row["status"] == "NOT_START"        # 原生枚举
+    assert row["status"] == "QUEUED"           # 原生枚举
     assert row["progress"] == "0%"
 
 
@@ -108,15 +108,27 @@ def test_upstream_userinfo_400(client):
 
 
 # ---------------------------------------------------------------------------
-# 自动幂等
+# 显式幂等（Idempotency-Key）
 # ---------------------------------------------------------------------------
 
 
-def test_auto_idempotent_replay(client, task_store, queue_events):
-    """核心新特性：**不带任何头**，同请求体第二次提交返回同一 task_id，
-    不重建、不重复入队。"""
+def test_no_key_creates_new_task_each_time(client, task_store, queue_events):
+    """默认（不带头）不去重：同请求体两次提交是两个任务。"""
     first = client.post(PATH, json=BODY, headers=AUTH).json()
     second = client.post(PATH, json=BODY, headers=AUTH).json()
+
+    assert first["task_id"] != second["task_id"]
+    assert first["replayed"] is False and second["replayed"] is False
+    assert len(task_store.rows) == 2
+    assert len(queue_events.execute) == 2
+
+
+def test_idempotency_key_replays(client, task_store, queue_events):
+    """带同一 Idempotency-Key 的第二次提交返回同一 task_id，
+    不重建、不重复入队。"""
+    headers = {**AUTH, "Idempotency-Key": "order-1"}
+    first = client.post(PATH, json=BODY, headers=headers).json()
+    second = client.post(PATH, json=BODY, headers=headers).json()
 
     assert first["task_id"] == second["task_id"]
     assert first["replayed"] is False
@@ -126,7 +138,7 @@ def test_auto_idempotent_replay(client, task_store, queue_events):
 
 
 def test_different_body_creates_new_task(client, task_store):
-    """不同请求体 → 不同指纹 → 不同任务。"""
+    """不带 key：不同请求体自然是不同任务。"""
     a = client.post(PATH, json=BODY, headers=AUTH).json()["task_id"]
     b = client.post(PATH, json={**BODY, "prompt": "a blue cube"},
                     headers=AUTH).json()["task_id"]
@@ -134,37 +146,41 @@ def test_different_body_creates_new_task(client, task_store):
     assert len(task_store.rows) == 2
 
 
-def test_idempotency_key_as_salt(client, task_store):
-    """带不同 Idempotency-Key = 换盐 = 对同一请求体强制创建新任务。"""
-    a = client.post(PATH, json=BODY, headers=AUTH).json()["task_id"]
+def test_different_key_creates_new_task(client, task_store):
+    """换 Idempotency-Key = 对同一请求体强制创建新任务。"""
+    a = client.post(PATH, json=BODY,
+                    headers={**AUTH, "Idempotency-Key": "run-1"}).json()["task_id"]
     b = client.post(PATH, json=BODY,
-                    headers={**AUTH, "Idempotency-Key": "rerun-1"}).json()["task_id"]
+                    headers={**AUTH, "Idempotency-Key": "run-2"}).json()["task_id"]
     c = client.post(PATH, json=BODY,
-                    headers={**AUTH, "Idempotency-Key": "rerun-1"}).json()
+                    headers={**AUTH, "Idempotency-Key": "run-2"}).json()
     assert a != b
     assert c["task_id"] == b and c["replayed"] is True
     assert len(task_store.rows) == 2
 
 
 def test_different_token_different_task(client, task_store):
-    """指纹含 token_hash：不同用户的相同请求体互不干扰。"""
-    a = client.post(PATH, json=BODY, headers=AUTH).json()["task_id"]
+    """幂等键含 token_hash：不同用户的相同 key 互不干扰。"""
+    a = client.post(PATH, json=BODY,
+                    headers={**AUTH, "Idempotency-Key": "k"}).json()["task_id"]
     b = client.post(PATH, json=BODY,
-                    headers={"Authorization": "Bearer sk-other"}).json()["task_id"]
+                    headers={"Authorization": "Bearer sk-other",
+                             "Idempotency-Key": "k"}).json()["task_id"]
     assert a != b
 
 
-def test_concurrent_identical_request_409(client, patch_redis, task_store):
-    """占位存在但行未落库（真并发在飞）→ 409，绝不重建。"""
+def test_concurrent_same_key_409(client, patch_redis, task_store):
+    """占位存在但行未落库（同 key 真并发在飞）→ 409，绝不重建。"""
     from app.services import idem
 
-    resp1 = client.post(PATH, json=BODY, headers=AUTH)
+    headers = {**AUTH, "Idempotency-Key": "conc-1"}
+    resp1 = client.post(PATH, json=BODY, headers=headers)
     tid = resp1.json()["task_id"]
     # 删掉行、保留占位，模拟另一个请求正在创建链路中
     del task_store.rows[tid]
     patch_redis._data[f"st:idem:{tid}"] = idem.PENDING
 
-    resp = client.post(PATH, json=BODY, headers=AUTH)
+    resp = client.post(PATH, json=BODY, headers=headers)
     assert resp.status_code == 409
     assert task_store.rows == {}
 
@@ -211,7 +227,7 @@ def test_enqueue_failure_rolls_back(client, monkeypatch, patch_redis, task_store
 
     行**有意保留**（FAILURE）：入队是「响应可能丢失」的操作——broker
     收下了但确认没回来时任务其实在跑，此时删行会让重试重建第二个任务、
-    上游被调两次。让自动幂等把重试回放到 FAILURE 更安全。
+    上游被调两次。带 Idempotency-Key 的重试会回放到 FAILURE 更安全。
     """
     import app.queue as queue_mod
 
@@ -220,7 +236,8 @@ def test_enqueue_failure_rolls_back(client, monkeypatch, patch_redis, task_store
 
     monkeypatch.setattr(queue_mod, "publish_execute", boom)
 
-    resp = client.post(PATH, json=BODY, headers=AUTH)
+    headers = {**AUTH, "Idempotency-Key": "rb-1"}
+    resp = client.post(PATH, json=BODY, headers=headers)
     assert resp.status_code == 500
 
     from app.deps.auth import token_hash
@@ -232,8 +249,8 @@ def test_enqueue_failure_rolls_back(client, monkeypatch, patch_redis, task_store
     assert row["status"] == "FAILURE"
     assert "aborted" in row["fail_reason"]
 
-    # 重试回放到该 FAILURE 而非重建
-    resp2 = client.post(PATH, json=BODY, headers=AUTH)
+    # 同 key 重试回放到该 FAILURE 而非重建
+    resp2 = client.post(PATH, json=BODY, headers=headers)
     assert resp2.json()["replayed"] is True
     assert resp2.json()["task_id"] == row["task_id"]
 

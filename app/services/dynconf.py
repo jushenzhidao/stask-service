@@ -124,11 +124,6 @@ MUTABLE: dict[str, Spec] = {
              minimum=0, maximum=300,
              note="必须小于 nginx proxy_read_timeout，否则客户端看到 504"),
 
-        # ---- 幂等 ----
-        Spec("idem_ttl", "int", "自动幂等窗口 (秒)", "幂等",
-             minimum=60, maximum=7 * 86400,
-             note="窗口内同请求指纹只创建一个任务"),
-
         # ---- 生命期与清理 ----
         Spec("task_max_lifetime_seconds", "int", "任务最大生命期 (秒)", "清理",
              minimum=300, maximum=20 * 3600,
@@ -152,6 +147,7 @@ IMMUTABLE_REASONS: dict[str, str] = {
     "redis_key_prefix": "启动项：改了会让在途任务的键全部失联",
     "gateway_platform": "启动项：改了会让在途任务全部失联",
     "channel_id": "启动项：共享表渠道划分依据，改了会与上游任务混行",
+    "auth_mode": "安全项：可写等于能在线关掉提交前鉴权与余额预检",
     "upstream_allowlist": "安全项：可写等于把防凭证泄露的防线挂到网上",
     "callback_allowlist": "安全项：可写等于开放 SSRF 出口",
     "callback_secret": "安全项：密钥不经 HTTP 传输",
@@ -178,7 +174,6 @@ class RuntimeConfig:
     body_max_bytes: int
     response_max_bytes: int
     poll_wait_max_seconds: int
-    idem_ttl: int
     task_max_lifetime_seconds: int
     sweep_batch_limit: int
     result_ttl_seconds: int

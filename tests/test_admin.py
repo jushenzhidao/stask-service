@@ -28,7 +28,7 @@ def admin_client(client, monkeypatch, test_settings):
     "/admin", "/admin/api/overview", "/admin/api/tasks", "/admin/api/config",
 ])
 def test_disabled_admin_returns_404(client, test_settings, path):
-    """未配置 ST_ADMIN_KEY 时整个管理面 404。
+    """未配置 ADMIN_KEY 时整个管理面 404。
 
     404 而非 401：不泄露「这里有个管理后台」。默认不开启——忘配密钥
     不等于裸奔。
@@ -165,7 +165,7 @@ def test_reset_unknown_key_rejected(admin_client):
 
 @pytest.mark.parametrize("key", [
     "database_url", "redis_url", "upstream_allowlist", "callback_secret",
-    "async_deny_prefixes", "gateway_platform", "billing_svc_url",
+    "async_deny_prefixes", "gateway_platform", "auth_mode",
 ])
 def test_immutable_keys_rejected(admin_client, key):
     """安全边界：这些项永不可运行时改。

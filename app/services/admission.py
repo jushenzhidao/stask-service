@@ -5,7 +5,7 @@
 在这里落地：
 
 1. nginx ``proxy_set_header`` 无条件覆盖客户端同名头（部署侧，见 deploy/nginx.conf）；
-2. host 必须命中 ``ST_UPSTREAM_ALLOWLIST``（本模块 ``resolve_upstream``）；
+2. host 必须命中 ``UPSTREAM_ALLOWLIST``（本模块 ``resolve_upstream``）；
 3. 仅 http(s)、拒绝 URL userinfo（同上）。
 
 第 1 道在 nginx，但**不能只靠它**：直连 8000 端口的流量绕过 nginx，
@@ -70,9 +70,15 @@ def check_path(path: str) -> None:
 def _host_matches(host: str) -> bool:
     """allowlist 比对：条目含端口则按 ``host:port`` 全等，不含端口只比 host。
 
+    **空 = 不限制**（与 ``CALLBACK_ALLOWLIST`` 同一套语义）：不配即放行，
+    配了就按条目卡。启动时会打 warning 提醒——放行意味着 ``X-Upstream-Base-Url``
+    头能决定用户令牌往哪儿发，只在前面有 nginx 无条件覆盖该头时才安全。
+
     不做通配/后缀匹配——``*.example.com`` 这类规则一旦写错就是开放重定向。
     要加就显式列全。
     """
+    if not settings.upstream_allowlist:
+        return True
     hostname = host.split(":")[0]
     for entry in settings.upstream_allowlist:
         item = entry.strip().lower()
@@ -89,7 +95,7 @@ def _host_matches(host: str) -> bool:
 def resolve_upstream(header_value: str | None) -> str:
     """确定并校验 upstream base url（防线 2 + 防线 3）。
 
-    优先级：``X-Upstream-Base-Url`` 头（nginx 注入）> ``ST_UPSTREAM_BASE_URL``。
+    优先级：``X-Upstream-Base-Url`` 头（nginx 注入）> ``UPSTREAM_BASE_URL``。
     返回值是**规整后**的 base（去尾斜杠），提交时随任务落库，worker 只认
     落库值——中途改配置不影响在途任务的目标地址。
     """

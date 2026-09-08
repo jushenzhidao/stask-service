@@ -37,12 +37,16 @@ make up          # 起全套（web + worker + redis）
 
 | 形态 | 命令 | 适用 |
 |---|---|---|
-| 三容器 | `make up` | 标准部署，worker 可独立扩副本 |
+| 四容器 | `make up` | 标准部署：web + worker + redis + taskiq-admin（看板，必选） |
 | 本机单进程 | `make standalone` | 本地开发、单机试用，一条命令起全套且**免 .env** |
 
-接真实环境时 `.env` 至少改三项：`ST_UPSTREAM_BASE_URL`（上游地址）、
-`ST_DATABASE_URL`（指向 tasks 表所在库）、`ST_UPSTREAM_ALLOWLIST`。
-**必须配 `ST_CHANNEL_ID`**：在 new-api 建一个占位渠道（可禁用）并填其 id——渠道不存在会被上游轮询批量误判 FAILURE（详见 ADR-006）。
+接真实环境时 `.env` 至少改四项：`UPSTREAM_BASE_URL`（上游地址）、
+`SQL_DSN`（指向 tasks 表所在库，new-api 的 Go DSN 格式）、`UPSTREAM_ALLOWLIST`、
+`TASKIQ_ADMIN_API_TOKEN`（看板必填，缺失时 compose 直接报错）。
+环境变量名 = 配置字段名的大写形式，**无 `ST_` 前缀**；容器内地址（Redis /
+数据库 / 看板）写死在 `docker-compose.yml` 的 `environment` 里，不重复配置。
+上游地址由 `UPSTREAM_BASE_URL` 控制，`UPSTREAM_ALLOWLIST` 留空即不限制。
+**必须配 `CHANNEL_ID`**：在 new-api 建一个占位渠道（可禁用）并填其 id——渠道不存在会被上游轮询批量误判 FAILURE（详见 ADR-006）。
 
 ---
 
@@ -73,7 +77,7 @@ curl "https://api.example.com/async/v1/images/generations/dall_e_3_ab12...?wait=
 # → 200 + 与直接调同步接口**字节级一致**的响应体
 ```
 
-- `X-Upstream-Base-Url` 可选（默认读 env `ST_UPSTREAM_BASE_URL`），host 必须
+- `X-Upstream-Base-Url` 可选（默认读 env `UPSTREAM_BASE_URL`），host 必须
   在 allowlist 内。
 - **自动幂等**：`task_id = {model}_{sha256(token|method|path|query|body|盐)[:32]}`。
   同一 token 的字节级相同请求在幂等窗口内恒返回同一任务，客户端重试**不需要
@@ -101,10 +105,10 @@ curl "https://api.example.com/async/v1/images/generations/dall_e_3_ab12...?wait=
 | 条件 | 效果 |
 |---|---|
 | `platform='stask'`（非 suno/mj） | `GetTaskAdaptorFunc` 返回 nil，原生任务轮询天然跳过 |
-| `channel_id` = **new-api 中真实存在的渠道**（`ST_CHANNEL_ID`，占位渠道可禁用） | 轮询按渠道分组；渠道必须存在——CacheGetChannel 失败先于 adaptor nil 检查，会把整组任务批量误判 FAILURE |
+| `channel_id` = **new-api 中真实存在的渠道**（`CHANNEL_ID`，占位渠道可禁用） | 轮询按渠道分组；渠道必须存在——CacheGetChannel 失败先于 adaptor nil 检查，会把整组任务批量误判 FAILURE |
 | `quota = 0` | 上游 24h 超时清理即便动到本行，退款也是 0，零资金影响 |
 | `status`/`progress` 原生枚举 | 共享表对上游看板/巡检工具可读 |
-| 生命期 6h（`ST_TASK_MAX_LIFETIME_SECONDS`）| 先于上游 24h 清理线自行收敛，正常情况上游永远碰不到我们的活跃行 |
+| 生命期 6h（`TASK_MAX_LIFETIME_SECONDS`）| 先于上游 24h 清理线自行收敛，正常情况上游永远碰不到我们的活跃行 |
 
 写读侧 WHERE 恒带 `platform`，绝不动别人的行。
 
@@ -115,7 +119,8 @@ curl "https://api.example.com/async/v1/images/generations/dall_e_3_ab12...?wait=
 1. **零资金动作**——不冻结、不结算、不对账；扣费成败是上游和用户之间的事。
 2. **令牌不落库不进日志**——只放 Redis 会话（TTL 2h），终态即清。
    loguru 固定 `backtrace=False, diagnose=False`。
-3. **tasks 表时间列必须归一**——读侧 `as_unix_seconds`，SQL 侧 `_secs(col)`。
+3. **tasks 表时间列必须归一**——读侧 `as_unix_seconds`；SQL 侧写入恒为秒，
+   时间谓词用裸列比较（不再包裹表达式，否则吃不到索引）。
    表被 new-api 原生模块用 UnixMilli 写过，两侧都不能省。
 4. **写读侧 WHERE 必带 `platform`**——共享表，绝不动别人的行。
 5. **派发锁在 = 一次调用已发出 = 绝不再调上游**——队列 at-least-once，防重全靠锁。
@@ -131,7 +136,7 @@ curl "https://api.example.com/async/v1/images/generations/dall_e_3_ab12...?wait=
 |---|---|---|
 | 幂等 | **自动**：task_id = 请求指纹 | 客户端零心智负担；`Idempotency-Key` 降级为可选盐 |
 | 共存 | platform + 独立渠道 + quota=0 + 6h 生命期 | ADR-006：外部任务不影响 new-api 内部任务 |
-| 5xx 重试 | 默认关（`ST_RETRY_MAX=0`） | ADR-002：上游调用可能有副作用 |
+| 5xx 重试 | 默认关（`RETRY_MAX=0`） | ADR-002：上游调用可能有副作用 |
 | Redis | 独立实例 + `st:` 键前缀 | ADR-004：故障域隔离，前缀是误配时的第二道防线 |
 | 建表 | 零 | ADR-001：复用上游同实例 `tasks` 表 |
 | 动态配置 | 白名单子集可热改 | ADR-005：安全项开放等于把防线挂到网上 |
@@ -144,7 +149,7 @@ curl "https://api.example.com/async/v1/images/generations/dall_e_3_ab12...?wait=
 
 ```
 app/
-├── config.py         配置单例（ST_ 前缀，禁止散读 os.environ）
+├── config.py         配置单例（env 名 = 字段名大写无前缀，禁止散读 os.environ）
 ├── db.py             MySQL 惰性引擎（零建表）
 ├── redis.py          键规范 + Lua 脚本（全部集中在此）
 ├── errors.py         {"error":{...}} 统一形制

@@ -16,7 +16,7 @@
 | 列 | 取值 | 效果 |
 |---|---|---|
 | `platform` | 自定义值 `stask`（非 suno/mj） | `GetTaskAdaptorFunc` 返回 nil，`updateVideoTasks` 报 "video adaptor not found" 只记日志，任务不动 |
-| `channel_id` | **必须是 new-api 中真实存在的渠道 id**（`ST_CHANNEL_ID`，可用禁用的占位渠道） | 见下方「轮询顺序」——渠道不存在会导致批量误判 FAILURE |
+| `channel_id` | **必须是 new-api 中真实存在的渠道 id**（`CHANNEL_ID`，可用禁用的占位渠道） | 见下方「轮询顺序」——渠道不存在会导致批量误判 FAILURE |
 | `task_id` | `{model_slug}_{fingerprint32}`（本服务生成，恒非空） | `GetUpstreamTaskID()` 回退到 task_id 列，非空 → 不进 null 判死分支 |
 | `quota` | 恒 0 | 即便被上游超时清理误标 FAILURE，退款金额也是 0，零资金影响 |
 | `user_id` | 恒 0 | 本服务不做 key 管理 |
@@ -39,11 +39,11 @@ RunTaskPollingOnce:
 **关键结论**：`CacheGetChannel` 在 adaptor nil 检查**之前**——
 platform 自定义值只能保证走到第 2 步安全退出，但走不到第 2 步的前提是
 第 1 步不炸。所以 `channel_id` 必须真实存在（`channelsIDM` 含禁用渠道，
-禁用状态的占位渠道即可）。`ST_CHANNEL_ID<=0` 时应用启动打告警。
+禁用状态的占位渠道即可）。`CHANNEL_ID<=0` 时应用启动打告警。
 
 另外两条防线（与轮询无关）：
 
-时间防线：本服务的超龄判死 sweeper（`ST_TASK_MAX_LIFETIME_SECONDS`，默认
+时间防线：本服务的超龄判死 sweeper（`TASK_MAX_LIFETIME_SECONDS`，默认
 6h）**先于** new-api 的 24h 清理线收敛自己的行——正常情况下上游的清理
 永远碰不到我们的活跃行；即便碰到，quota=0 使其零资金影响（双保险）。
 

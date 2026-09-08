@@ -1,6 +1,6 @@
 """worker 执行链路（设计 §5）：
 
-    出队 → CAS NOT_START→IN_PROGRESS
+    出队 → CAS QUEUED→IN_PROGRESS
     → 派发锁 SET NX（TTL=超时+余量）；锁被占 → 不重发，跳过
     → 取令牌 → 调上游同步接口（原样 method/path/query/body + X-Task-Id）
     → 分流 → 终态落库（gzip）→ 释放槽 + 清会话 → 可选回调
@@ -30,7 +30,7 @@ import httpx
 from app.config import settings
 from app.logging import log
 from app.redis import K_DISPATCH, r
-from app.schemas import FAILURE, IN_PROGRESS, NOT_START, SUCCESS
+from app.schemas import ACTIVE, FAILURE, IN_PROGRESS, PENDING, SUCCESS
 from app.services import codec, dynconf, httpc, slots, taskstore, tokensession
 
 
@@ -71,7 +71,7 @@ async def _finalize(task_id: str, token_hash: str, status: str, *,
     不重复释放槽（会造成计数下溢）也不重复回调。
     """
     won = await taskstore.cas(
-        task_id, (NOT_START, IN_PROGRESS), status,
+        task_id, ACTIVE, status,
         patch=patch,
         fail_reason=fail_reason,
     )
@@ -98,7 +98,7 @@ async def run(task_id: str) -> None:
     if task is None:
         log.warning("execute: task not found: task_id={}", task_id)
         return
-    if task["status"] not in (NOT_START, IN_PROGRESS):
+    if task["status"] not in ACTIVE:
         log.info("execute: task already terminal: task_id={} status={}",
                  task_id, task["status"])
         return
@@ -110,7 +110,7 @@ async def run(task_id: str) -> None:
 
     # ---- 1. CAS 抢执行权 ----
     if not await taskstore.cas(
-        task_id, (NOT_START,), IN_PROGRESS, patch={"dispatch_epoch": epoch}
+        task_id, PENDING, IN_PROGRESS, patch={"dispatch_epoch": epoch}
     ):
         # 已是 IN_PROGRESS：要么另一个 worker 在跑，要么是重投。
         # 无论哪种，派发锁都会挡住第二次调用，这里直接交给锁判定。
@@ -163,8 +163,9 @@ async def _dispatch(task_id: str, data: dict, raw_token: str,
     if query:
         url = f"{url}?{query}"
 
-    timeout_seconds = await dynconf.get_int("worker_timeout")
-    client = httpc.shared_client(timeout=httpx.Timeout(timeout_seconds))
+    # 超时随 dynconf 可变 → 必须请求级传，绝不能进 shared_client 的 key
+    timeout = httpx.Timeout(await dynconf.get_int("worker_timeout"))
+    client = httpc.shared_client("upstream")
     attempts_left = await dynconf.get_int("retry_max")
     connect_attempts_left = await dynconf.get_int("retry_max_connect")
     attempt = 0
@@ -172,7 +173,9 @@ async def _dispatch(task_id: str, data: dict, raw_token: str,
     while True:
         attempt += 1
         try:
-            resp = await client.request(method, url, headers=headers, content=body)
+            resp = await client.request(
+                method, url, headers=headers, content=body, timeout=timeout
+            )
         except (httpx.ConnectError, httpx.ConnectTimeout) as exc:
             # 连接层失败 = 请求未到达上游 = 重试零副作用
             if connect_attempts_left > 0:

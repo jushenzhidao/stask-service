@@ -1,6 +1,6 @@
 """管理面：看板页面 + 看板 API + 动态配置读写。
 
-鉴权走 ``ST_ADMIN_KEY``（`deps/admin.py`）——未配置时**整个管理面 404**。
+鉴权走 ``ADMIN_KEY``（`deps/admin.py`）——未配置时**整个管理面 404**。
 
 脱敏纪律（与 `/ops` 一致，不因为是管理面就放松）：
 - 绝不返回用户令牌（会话只给存在性 + TTL）；
@@ -71,7 +71,7 @@ async def overview(
 
 @router.get("/api/tasks")
 async def list_tasks(
-    status: str = Query("", pattern="^(NOT_START|IN_PROGRESS|SUCCESS|FAILURE|CANCELED)?$"),
+    status: str = Query("", pattern="^(QUEUED|IN_PROGRESS|SUCCESS|FAILURE|CANCELED)?$"),
     model: str = Query("", max_length=128),
     task_id: str = Query("", max_length=64),
     task_id_prefix: str = Query("", max_length=64),
@@ -110,6 +110,7 @@ async def task_detail(task_id: str, _: None = Depends(require_admin)) -> dict:
         "fail_reason": task.get("fail_reason", ""),
         "progress": task.get("progress", ""),
         "channel_id": task.get("channel_id", 0),
+        "user_id": task.get("user_id", 0),
         "created_at": task.get("created_at", 0),
         "start_time": task.get("start_time", 0),
         "finish_time": task.get("finish_time", 0),

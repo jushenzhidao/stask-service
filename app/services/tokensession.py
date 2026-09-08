@@ -6,7 +6,7 @@
 安全口径（红线）：
 - 只放 Redis（AOF everysec），**绝不**落 tasks 表、不进日志、不出任何
   HTTP 响应（ops 诊断端点只暴露存在性与剩余 TTL）；
-- TTL ``ST_SK_SESSION_TTL_SECONDS``（默认 2h），终态立即清除；
+- TTL ``SK_SESSION_TTL_SECONDS``（默认 2h），终态立即清除；
 - Redis 丢失的最坏后果是任务无法执行 → 判死 FAILURE。
   本服务零资金动作，不会造成钱款损失。
 """

@@ -1,15 +1,12 @@
-"""自动幂等：**task_id 即幂等键**。
+"""显式幂等（v0.3）：**默认不去重，带 ``Idempotency-Key`` 头才幂等**。
 
-设计（v2）：task_id 由请求指纹决定——同一 token 对同一 method/path/query/body
-的字节级相同请求，天然映射到同一个 task_id：
-
-    task_id = f"{model_slug}_{sha256(token_hash | method | path | query | body | salt)[:32]}"
-
-客户端重试**不需要**带任何头就自动幂等；想强制重跑同一请求时带
-``Idempotency-Key`` 头作为盐（参与指纹计算）换一个 task_id 即可。
+- 不带头：每次提交都创建新任务，``task_id = {slug}_{uuid4hex}``；
+- 带头：``task_id = {slug}_{sha256(token_hash | key)[:32]}`` ——同一 token
+  的同一 key 恒映射同一任务。重试回放、换 key 重跑，语义与业界
+  Stripe/OpenAI 的 Idempotency-Key 一致。
 
 去重的事实源是 tasks 表（task_id 查得到 = 已创建过）；Redis 占位只护
-「创建链路在飞」这几百毫秒的窗口，防止同键真并发双建：
+「创建链路在飞」这几百毫秒的窗口，防止同 key 真并发双建：
 
     DB 有行 → 直接回放
     DB 无行 → SET NX 占位 → 占位者创建；其余短轮询等 DB 出现行 → 回放
@@ -21,35 +18,28 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import time
+import uuid
 
-from app.config import settings
 from app.redis import K_IDEM, LUA_CAS_DELETE, r
 
 #: 占位值——task_id 形态是 ``{slug}_{32hex}``，绝不与本标记碰撞
 PENDING = "pending"
 
+#: 占位标记 TTL（秒）：只需覆盖创建链路在飞的窗口
+_PENDING_TTL_SECONDS = 30
+#: 同 key 真并发的短轮询等待上限（秒）与间隔
+_REPLAY_WAIT_SECONDS = 3.0
 _WAIT_INTERVAL_SECONDS = 0.05
 
 
-def fingerprint_task_id(
-    model_slug: str,
-    token_hash: str,
-    method: str,
-    path: str,
-    query: str,
-    body: bytes,
-    salt: str = "",
-) -> str:
-    """确定性 task_id：同请求恒同 id（自动幂等的根基）。
-
-    ``salt`` 来自可选的 ``Idempotency-Key`` 头——带不同盐即可对同一
-    请求体强制创建新任务。
-    """
+def new_task_id(model_slug: str, token_hash: str, idempotency_key: str = "") -> str:
+    """生成 task_id。带 ``idempotency_key`` 时确定性，否则随机。"""
+    if not idempotency_key:
+        return f"{model_slug}_{uuid.uuid4().hex}"
     h = hashlib.sha256()
-    for part in (token_hash, method.upper(), path, query, salt):
-        h.update(part.encode("utf-8"))
-        h.update(b"\x00")
-    h.update(body)
+    h.update(token_hash.encode("utf-8"))
+    h.update(b"\x00")
+    h.update(idempotency_key.encode("utf-8"))
     return f"{model_slug}_{h.hexdigest()[:32]}"
 
 
@@ -57,7 +47,7 @@ async def acquire(task_id: str) -> bool:
     """创建窗口占位（SET NX）。True = 本请求负责走创建链路。"""
     ok = await r.set(
         K_IDEM.format(task_id=task_id), PENDING,
-        ex=settings.idem_pending_ttl_seconds, nx=True,
+        ex=_PENDING_TTL_SECONDS, nx=True,
     )
     return bool(ok)
 
@@ -82,7 +72,7 @@ async def wait_row(task_id: str, exists) -> bool:
     返回 True = 行已出现（调用方回放）；False = 等超时/占位者失败
     （调用方按 409 处理，绝不放行重建）。
     """
-    deadline = time.monotonic() + settings.idem_replay_wait_seconds
+    deadline = time.monotonic() + _REPLAY_WAIT_SECONDS
     key = K_IDEM.format(task_id=task_id)
     while time.monotonic() < deadline:
         if await exists(task_id):

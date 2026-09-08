@@ -13,7 +13,7 @@ setup:  ## 建虚拟环境并安装依赖（含开发依赖）
 	@command -v uv >/dev/null 2>&1 || { echo "需要 uv：curl -LsSf https://astral.sh/uv/install.sh | sh"; exit 1; }
 	uv venv --python 3.12 .venv
 	uv pip install -e ".[dev]" --python $(PY)
-	@test -f .env || { cp .env.example .env && echo "已生成 .env，请检查 ST_DATABASE_URL 与 ST_BILLING_SVC_URL"; }
+	@test -f .env || { cp .env.example .env && echo "已生成 .env，请检查 SQL_DSN 与 REDIS_URL"; }
 
 check: lint type test  ## 三项门禁全跑（提交前必须绿）
 
@@ -55,12 +55,12 @@ logs:  ## 跟随日志
 build:  ## 构建镜像
 	docker build -t stask-service:local .
 
-admin-key:  ## 生成一个管理密钥（写入 .env 的 ST_ADMIN_KEY）
+admin-key:  ## 生成一个管理密钥（写入 .env 的 ADMIN_KEY）
 	@key=$$($(PY) -c "import secrets;print(secrets.token_urlsafe(32))"); \
-	if grep -q '^ST_ADMIN_KEY=' .env 2>/dev/null; then \
-		sed -i.bak "s|^ST_ADMIN_KEY=.*|ST_ADMIN_KEY=$$key|" .env && rm -f .env.bak; \
-	else echo "ST_ADMIN_KEY=$$key" >> .env; fi; \
-	echo "ST_ADMIN_KEY=$$key"; echo "看板：http://127.0.0.1:8000/admin"
+	if grep -q '^ADMIN_KEY=' .env 2>/dev/null; then \
+		sed -i.bak "s|^ADMIN_KEY=.*|ADMIN_KEY=$$key|" .env && rm -f .env.bak; \
+	else echo "ADMIN_KEY=$$key" >> .env; fi; \
+	echo "ADMIN_KEY=$$key"; echo "看板：http://127.0.0.1:8000/admin"
 
 bench:  ## 压测提交链路（需 TOKEN=sk-xxx）
 	@test -n "$(TOKEN)" || { echo "用法：make bench TOKEN=sk-xxx"; exit 1; }

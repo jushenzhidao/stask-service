@@ -8,7 +8,7 @@
 而令牌绝不能落库（红线）。丢失的最坏后果是任务无法执行 → 判死 FAILURE。
 本服务零资金动作，不会造成钱款损失。
 
-键前缀：全部经 ``_k()`` 拼 ``ST_REDIS_KEY_PREFIX``（默认 ``st``）。即便误连
+键前缀：全部经 ``_k()`` 拼 ``REDIS_KEY_PREFIX``（默认 ``st``）。即便误连
 别家实例也不会撞键（ADR-004 的第二道防线）。
 """
 
@@ -34,12 +34,14 @@ def _k(suffix: str) -> str:
 
 
 # ---- 键规范（全部集中在此，业务模块只 import 常量）----
-K_IDEM = _k("idem:{task_id}")                 # 自动幂等占位（task_id 即幂等键）
+K_IDEM = _k("idem:{task_id}")                 # 显式幂等占位（task_id 即幂等键）
 K_RL = _k("rl:{subject}")                     # 滑动窗口限流（subject = token_hash）
 K_SLOT = _k("slot:{token_hash}")              # 并发槽占用计数
 K_SK = _k("sk:{task_id}")                     # 用户令牌会话（终态即清）
 K_DISPATCH = _k("dispatch:{task_id}")         # 派发锁（防重复调用上游的核心）
 K_SWEEP_LOCK = _k("sweep:{job}")              # 定时任务重入锁
+K_AUTH = _k("auth:{token_hash}")              # 鉴权正向缓存（只存 user_id，不存 key）
+K_STATUS = _k("status:{task_id}")             # 状态 write-through 缓存（长轮询卸 DB）
 
 
 # ---- 滑动窗口限流：ARGV = [now_ms, window_ms, limit] ----
