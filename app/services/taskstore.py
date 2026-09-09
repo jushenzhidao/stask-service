@@ -291,14 +291,22 @@ _META_STR_KEYS = (
     "model", "request_method", "request_path", "request_query",
     "upstream_base_url", "upstream_content_type",
     "idempotency_key", "callback_url", "token_hash",
+    "result_url", "artifact_parser",
 )
-_META_INT_KEYS = ("upstream_status", "response_bytes", "dispatch_epoch")
+_META_INT_KEYS = ("upstream_status", "response_bytes", "dispatch_epoch", "artifact_count")
 _META_BOOL_KEYS = ("result_purged", "body_truncated")
+#: JSON 数组键：``data ->> '$.artifacts'`` 回的是 JSON **文本**，
+#: 必须再 loads 一次才是列表，否则看板拿到的是一串转义字符串。
+_META_JSON_KEYS = ("artifacts",)
 #: 三态（None = 从未回调过 / True = 已送达 / False = 重试耗尽）
 _META_TRISTATE_KEYS = ("callback_delivered",)
 
 _META_DATA_KEYS = (
-    _META_STR_KEYS + _META_INT_KEYS + _META_BOOL_KEYS + _META_TRISTATE_KEYS
+    _META_STR_KEYS
+    + _META_INT_KEYS
+    + _META_BOOL_KEYS
+    + _META_TRISTATE_KEYS
+    + _META_JSON_KEYS
 )
 
 #: ``JSON_UNQUOTE`` 对 JSON null 返回字面量字符串 'null'，等价于缺失
@@ -319,6 +327,27 @@ def _meta_int(value: Any) -> int:
         return int(str(_meta_scalar(value) or 0))
     except (TypeError, ValueError):
         return 0
+
+
+def _meta_json_list(value: Any) -> list[dict[str, Any]]:
+    """JSON 数组键的读侧归一：JSON 文本 → 元素为对象的列表。
+
+    ``data ->> '$.artifacts'`` 回的是序列化文本（缺失时为 None 或字面量
+    ``'null'``）。解析失败/非数组/元素非对象一律回空列表——看板「制品」列
+    宁可显示"无"，也不能因为一行脏数据把整页查询打成 500。
+    """
+    scalar = _meta_scalar(value)
+    if scalar is None:
+        return []
+    if isinstance(scalar, list):
+        return [item for item in scalar if isinstance(item, dict)]
+    try:
+        parsed = json.loads(str(scalar))
+    except ValueError:
+        return []
+    if not isinstance(parsed, list):
+        return []
+    return [item for item in parsed if isinstance(item, dict)]
 
 
 def _meta_row_to_dict(row: Any) -> dict:
@@ -343,6 +372,8 @@ def _meta_row_to_dict(row: Any) -> dict:
     for key in _META_TRISTATE_KEYS:
         value = _meta_scalar(raw.get(key))
         data[key] = None if value is None else value == "true"
+    for key in _META_JSON_KEYS:
+        data[key] = _meta_json_list(raw.get(key))
     result["data"] = data
     return result
 
