@@ -135,7 +135,15 @@ async def submit(
         # ---- 6. 入队 ----
         await enqueue(task_id)
 
-    except Exception:
+    except Exception as exc:
+        # 提交链路任何一步失败都先记录阶段与任务上下文再上抛（路由层
+        # 转 500）。没有这条日志时，落库/入队失败在 logfire 里只有
+        # FastAPI 的裸 500，看不到是哪一步、哪个任务。
+        log.bind(task_id=task_id, phase="submit", model=plan.model,
+                 request_path=plan.path).opt(exception=True).error(
+            "submit pipeline failed: task_id={} model={} path={} error={}",
+            task_id, plan.model, plan.path, type(exc).__name__,
+        )
         # 回滚顺序与获取顺序相反：先还槽，再处理占位。
         if slot_taken:
             await slots.release(th)

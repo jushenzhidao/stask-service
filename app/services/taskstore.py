@@ -37,7 +37,20 @@ from sqlalchemy import CursorResult, bindparam, text
 
 from app.config import settings
 from app.db import get_session_factory
+from app.logging import log
 from app.schemas import ACTIVE, TERMINAL
+
+
+def _log_write_error(op: str, task_id: str) -> None:
+    """落表异常在源头记录（含堆栈与 SQL 操作名）后原样上抛。
+
+    tasks 表写失败（连接池耗尽/锁等待超时/约束冲突）曾经完全无日志——
+    上层只看得到 500 或任务卡死，排障无从下手。这里统一补齐：
+    调用方只需记录控制流后果，不必重复打异常堆栈。
+    """
+    log.bind(taskstore_op=op, task_id=task_id).opt(exception=True).error(
+        "taskstore write failed: op={} task_id={}", op, task_id,
+    )
 
 
 def now() -> int:
@@ -136,30 +149,34 @@ async def create(task_id: str, action: str, data: dict, user_id: int = 0) -> Non
     - ``user_id`` = 鉴权直查值（查不到落 0，仅归属信息）。
     """
     ts = now()
-    async with get_session_factory()() as db:
-        await db.execute(
-            text(
-                """
-                INSERT INTO tasks
-                  (task_id, platform, action, status, progress, data,
-                   user_id, channel_id, quota, submit_time, start_time,
-                   created_at, updated_at)
-                VALUES
-                  (:task_id, :platform, :action, 'QUEUED', '0%', CAST(:data AS JSON),
-                   :user_id, :channel_id, 0, :now, 0, :now, :now)
-                """
-            ),
-            {
-                "task_id": task_id,
-                "platform": settings.gateway_platform,
-                "action": action,
-                "data": json.dumps(data, ensure_ascii=False),
-                "user_id": user_id,
-                "channel_id": settings.channel_id,
-                "now": ts,
-            },
-        )
-        await db.commit()
+    try:
+        async with get_session_factory()() as db:
+            await db.execute(
+                text(
+                    """
+                    INSERT INTO tasks
+                      (task_id, platform, action, status, progress, data,
+                       user_id, channel_id, quota, submit_time, start_time,
+                       created_at, updated_at)
+                    VALUES
+                      (:task_id, :platform, :action, 'QUEUED', '0%', CAST(:data AS JSON),
+                       :user_id, :channel_id, 0, :now, 0, :now, :now)
+                    """
+                ),
+                {
+                    "task_id": task_id,
+                    "platform": settings.gateway_platform,
+                    "action": action,
+                    "data": json.dumps(data, ensure_ascii=False),
+                    "user_id": user_id,
+                    "channel_id": settings.channel_id,
+                    "now": ts,
+                },
+            )
+            await db.commit()
+    except Exception:
+        _log_write_error("create", task_id)
+        raise
     # write-through：长轮询读侧优先命中缓存（失败静默，见 statuscache）
     from app.services import statuscache
 
@@ -207,10 +224,14 @@ async def cas(
         "p": settings.gateway_platform,
         "froms": from_statuses,
     }
-    async with get_session_factory()() as db:
-        res = cast("CursorResult[Any]", await db.execute(stmt, params))
-        await db.commit()
-        won = res.rowcount == 1
+    try:
+        async with get_session_factory()() as db:
+            res = cast("CursorResult[Any]", await db.execute(stmt, params))
+            await db.commit()
+            won = res.rowcount == 1
+    except Exception:
+        _log_write_error(f"cas:{from_statuses}->{to_status}", task_id)
+        raise
     if won:
         # write-through：先 DB 后缓存，长轮询秒级看见终态
         from app.services import statuscache
@@ -221,24 +242,28 @@ async def cas(
 
 async def patch_data(task_id: str, patch: dict) -> None:
     """非迁移性的数据合并（观测字段回填等）。"""
-    async with get_session_factory()() as db:
-        await db.execute(
-            text(
-                """
-                UPDATE tasks
-                SET updated_at = :now,
-                    data = JSON_MERGE_PATCH(COALESCE(data, JSON_OBJECT()), CAST(:patch AS JSON))
-                WHERE task_id = :tid AND platform = :p
-                """
-            ),
-            {
-                "now": now(),
-                "patch": json.dumps(patch, ensure_ascii=False),
-                "tid": task_id,
-                "p": settings.gateway_platform,
-            },
-        )
-        await db.commit()
+    try:
+        async with get_session_factory()() as db:
+            await db.execute(
+                text(
+                    """
+                    UPDATE tasks
+                    SET updated_at = :now,
+                        data = JSON_MERGE_PATCH(COALESCE(data, JSON_OBJECT()), CAST(:patch AS JSON))
+                    WHERE task_id = :tid AND platform = :p
+                    """
+                ),
+                {
+                    "now": now(),
+                    "patch": json.dumps(patch, ensure_ascii=False),
+                    "tid": task_id,
+                    "p": settings.gateway_platform,
+                },
+            )
+            await db.commit()
+    except Exception:
+        _log_write_error("patch_data", task_id)
+        raise
 
 
 # ---------------------------------------------------------------------------

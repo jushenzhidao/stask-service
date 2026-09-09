@@ -9,7 +9,14 @@
 ``backtrace=False, diagnose=False``——异常回溯绝不带帧局部变量值。
 worker 任务参数里就有 raw_token（从令牌会话取出后传给上游调用），
 开 diagnose 会把它直接打进日志。业务日志只打 task_id / user_id /
-token_hash / 状态码，绝不打 raw token 与响应体。
+token_hash / 状态码，绝不打 raw token 与响应体。唯一豁免：worker 失败
+路径的上游**错误响应体预览**（``execute._error_preview``，截断 300 字符
+且原文本就落库可见），错误页/错误 JSON 是排障关键线索且不含令牌。
+
+结构化口径：给 logfire 用的维度字段（task_id / status / fail_reason /
+model 等）一律 ``log.bind(...)`` 挂 extra——logfire 的 loguru 桥接会把
+extra 转成顶层可检索属性；位置 ``{}`` 参数只会落进 logfire.logging_args
+数组，无法按字段过滤。
 """
 
 from __future__ import annotations

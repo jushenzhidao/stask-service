@@ -30,6 +30,10 @@ from app.services import httpc, taskstore
 _SIGNATURE_HEADER = "X-Stask-Signature"
 _TIMESTAMP_HEADER = "X-Stask-Timestamp"
 
+#: 摘要里回显的对端响应/错误消息截断长度——摘要要进 result backend，
+#: 对端可能回一整页 HTML 错误页，不设限会把 Redis 撑成日志存储。
+_EXCERPT_LIMIT = 500
+
 
 def sign(body: bytes, timestamp: int) -> str:
     """``sha256=<hex>``。密钥未配置时返回空串（不发签名头）。"""
@@ -60,20 +64,30 @@ def _url_allowed(url: str) -> bool:
     )
 
 
-async def deliver(task_id: str, attempt: int = 1) -> None:
-    """推送一次；失败按退避重投（taskiq 任务体调用）。"""
+async def deliver(task_id: str, attempt: int = 1) -> dict:
+    """推送一次；失败按退避重投（taskiq 任务体调用）。
+
+    返回本次投递摘要，供 taskiq-admin 的 ``Return Value`` 直接排障：
+    ``delivered`` / ``skipped``（无回调地址、任务行已消失、地址不在白名单）
+    / ``rejected``（HTTP 非 2xx）/ ``transport_error`` / ``exhausted``。
+    与 execute 一致：本函数**从不抛异常**，失败靠返回值表达。
+    """
     # 元数据投影：回调体不含结果原文，没有任何理由把 10MB 的
     # upstream_response 拉进 worker 内存
     task = await taskstore.get_meta(task_id)
     if task is None:
-        return
+        return {"ok": False, "task_id": task_id, "attempt": attempt,
+                "result": "skipped", "reason": "task_row_missing"}
     data: dict = task.get("data") or {}
     url = str(data.get("callback_url") or "")
     if not url:
-        return
+        return {"ok": True, "task_id": task_id, "attempt": attempt,
+                "result": "skipped", "reason": "no_callback_url"}
     if not _url_allowed(url):
         log.warning("callback url rejected by allowlist: task_id={}", task_id)
-        return
+        return {"ok": False, "task_id": task_id, "attempt": attempt,
+                "result": "skipped", "reason": "url_not_allowlisted",
+                "callback_host": urlsplit(url).netloc}
 
     payload = {
         "task_id": task_id,
@@ -92,25 +106,37 @@ async def deliver(task_id: str, attempt: int = 1) -> None:
 
     # callback_timeout 是只读 env（不进 dynconf）→ 可安全作为构造参数
     client = httpc.shared_client("callback", timeout=settings.callback_timeout)
+    summary: dict = {"task_id": task_id, "attempt": attempt,
+                     "task_status": task["status"],
+                     "callback_host": urlsplit(url).netloc}
     try:
         resp = await client.post(url, content=body, headers=headers)
         if 200 <= resp.status_code < 300:
             await taskstore.patch_data(task_id, {"callback_delivered": True})
             log.info("callback delivered: task_id={} attempt={}", task_id, attempt)
-            return
+            return {**summary, "ok": True, "result": "delivered",
+                    "http_status": resp.status_code}
         log.warning("callback rejected: task_id={} status={} attempt={}",
                     task_id, resp.status_code, attempt)
+        summary |= {"result": "rejected", "http_status": resp.status_code,
+                    "response_excerpt": resp.text[:_EXCERPT_LIMIT]}
     except httpx.HTTPError as exc:
         log.warning("callback transport error: task_id={} err={} attempt={}",
                     task_id, type(exc).__name__, attempt)
+        summary |= {"result": "transport_error", "error_type": type(exc).__name__,
+                    "error_message": str(exc)[:_EXCERPT_LIMIT]}
 
     if attempt >= settings.callback_max_attempts:
         await taskstore.patch_data(task_id, {"callback_delivered": False,
                                              "callback_attempts": attempt})
         log.error("callback exhausted: task_id={} attempts={}", task_id, attempt)
-        return
+        return {**summary, "ok": False, "result": "exhausted",
+                "last_failure": summary["result"],
+                "max_attempts": settings.callback_max_attempts}
 
     from app.queue import publish_notify
 
     delay = min(2 ** attempt, 300)
     await publish_notify(task_id, attempt + 1, delay_seconds=delay)
+    return {**summary, "ok": False, "retry_in_seconds": delay,
+            "next_attempt": attempt + 1}

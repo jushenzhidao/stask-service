@@ -36,6 +36,7 @@ broker = **RedisStreamBroker**（Redis Stream + consumer group，at-least-once�
 
 from __future__ import annotations
 
+import dataclasses
 import datetime as dt
 
 from taskiq import Context, TaskiqDepends, TaskiqMessage, TaskiqResult, TaskiqScheduler
@@ -45,6 +46,11 @@ from taskiq_redis import ListRedisScheduleSource, RedisAsyncResultBackend, Redis
 
 from app.config import settings
 from app.logging import log, setup_logging
+from app.services.outcome import Outcome, TaskExecutionError
+
+#: ``Outcome`` 的字段名集合——从 admin 回填的 dict 重建对象时过滤未知键，
+#: 避免任务体与本模块版本不一致（滚动升级窗口）时 TypeError。
+_OUTCOME_FIELDS = frozenset(f.name for f in dataclasses.fields(Outcome))
 
 QUEUE_NAME = f"{settings.redis_key_prefix}:taskiq"
 SCHED_PREFIX = f"{settings.redis_key_prefix}:sched"
@@ -91,6 +97,38 @@ class ObservabilityMiddleware(TaskiqMiddleware):
         )
 
 
+class OutcomeMiddleware(TaskiqMiddleware):
+    """把任务返回的执行摘要翻译成 taskiq-admin 能显示的错误。
+
+    背景：我们的任务体**从不抛异常**（抛 = taskiq 判失败 = 按 ack 策略重投，
+    而重投正是派发锁要防的）。代价是 admin 的 ``Error`` 列恒为空、
+    ``State`` 恒 success——上游 500、令牌丢失、响应超限这些真失败在面板上
+    与正常成功毫无区别，排障只能回 DB 捞。
+
+    这里在 ``post_execute`` 里读任务返回的 ``Outcome``：``ok=False`` 时给
+    ``result.error`` 赋一个**不抛出**的 ``TaskExecutionError``，于是 admin
+    的 Error 列有内容、State 显示 failure。
+
+    为什么安全（已核对 taskiq 0.12 receiver 源码）：
+    - ack 时机由 ``AcknowledgeType`` 决定，**不看** ``result.error``
+      （``WHEN_SAVED`` 在 ``post_execute`` 之后无条件 ack）——填 error 不会重投；
+    - ``post_execute`` 按 ``reversed(broker.middlewares)`` 调用，所以本
+      middleware 必须**排在 admin 之后**入链，反转后才先于 admin 执行。
+
+    ``on_error`` 不会因此被触发：它只在任务真抛异常时由 receiver 调用。
+    """
+
+    async def post_execute(self, message: TaskiqMessage, result: TaskiqResult) -> None:
+        if result.error is not None:
+            return  # 真异常已有错误对象，别覆盖真实堆栈
+        value = result.return_value
+        if not isinstance(value, dict) or value.get("ok") is not False:
+            return
+        outcome = Outcome(**{k: v for k, v in value.items() if k in _OUTCOME_FIELDS})
+        result.error = TaskExecutionError(outcome)
+        result.is_err = True
+
+
 def _build_middlewares() -> list[TaskiqMiddleware]:
     """按配置装配 middleware 链。顺序：observability → admin。
 
@@ -109,6 +147,9 @@ def _build_middlewares() -> list[TaskiqMiddleware]:
             api_token=settings.taskiq_admin_api_token,
             taskiq_broker_name="stask",
         ))
+    # 必须排在 admin 之后：post_execute 按 reversed(middlewares) 调用，
+    # 本 middleware 要先于 admin 跑才能把 error 填好再被上报
+    chain.append(OutcomeMiddleware())
     return chain
 
 
@@ -121,72 +162,84 @@ broker.add_middlewares(*_build_middlewares())
 
 
 @broker.task
-async def execute_task(task_id: str, _context: Context = TaskiqDepends()) -> None:
+async def execute_task(task_id: str, _context: Context = TaskiqDepends()) -> dict:
     """执行一个任务（设计 §5）。
 
     队列是 at-least-once：本函数可能被同一个 task_id 调用多次（崩溃后
     XAUTOCLAIM 重投、可见性超时）。防重的责任**全在 execute 内部的
     派发锁**上，不靠队列。
+
+    返回执行摘要（``Outcome.as_dict()``）——taskiq 落进 result backend，
+    taskiq-admin 的 ``Return Value`` 直接显示：终态、上游状态码、失败原因、
+    制品数与 URL、命中的解析级别。失败摘要另由 ``OutcomeMiddleware``
+    转成 admin 的 ``Error`` 列。
     """
     from app.services.execute import run
 
-    await run(task_id)
+    return await run(task_id)
 
 
 @broker.task
 async def notify_task(task_id: str, attempt: int = 1,
-                      _context: Context = TaskiqDepends()) -> None:
-    """终态回调推送（失败按指数退避重投，上限 ``CALLBACK_MAX_ATTEMPTS``）。"""
+                      _context: Context = TaskiqDepends()) -> dict:
+    """终态回调推送（失败按指数退避重投，上限 ``CALLBACK_MAX_ATTEMPTS``）。
+
+    返回投递摘要（delivered / rejected+HTTP 码 / transport_error / exhausted），
+    admin 上可直接看出回调是被对端拒了还是根本没送到。
+    """
     from app.services.notify import deliver
 
-    await deliver(task_id, attempt)
+    return await deliver(task_id, attempt)
 
 
 @broker.task(schedule=[{"cron": "*/2 * * * *"}])
-async def sweep_stale(_context: Context = TaskiqDepends()) -> None:
+async def sweep_stale(_context: Context = TaskiqDepends()) -> dict:
     """每 2 分钟：卡死任务收敛（消息丢失重投 / 派发后失联判死）。
 
     Stream broker 下队列层已不丢消息，本任务退化为**第二道保险**：
     覆盖「入队调用本身失败但行已建」「stream 被人工清空」等队列外场景。
+
+    返回本轮统计（扫描数 / 重投数 / 判死数），让 admin 上能直接看出
+    「这一轮到底动了什么」——恒 0 才是健康态。
     """
     if not settings.sweep_enabled:
-        return
+        return {"skipped": "sweep_disabled"}
     from app.services.sweeper import sweep_stale as run
 
-    await run()
+    return await run()
 
 
 @broker.task(schedule=[{"cron": "*/5 * * * *"}])
-async def sweep_overdue(_context: Context = TaskiqDepends()) -> None:
+async def sweep_overdue(_context: Context = TaskiqDepends()) -> dict:
     """每 5 分钟：超龄任务判死（必须先于 new-api 的 24h 清理线收敛）。"""
     if not settings.sweep_enabled:
-        return
+        return {"skipped": "sweep_disabled"}
     from app.services.sweeper import sweep_overdue as run
 
-    await run()
+    return await run()
 
 
 @broker.task(schedule=[{"cron": "*/5 * * * *"}])
-async def sweep_slots(_context: Context = TaskiqDepends()) -> None:
+async def sweep_slots(_context: Context = TaskiqDepends()) -> dict:
     """每 5 分钟：并发槽计数按 tasks 表事实校准。"""
     if not settings.sweep_enabled:
-        return
+        return {"skipped": "sweep_disabled"}
     from app.services.sweeper import recalibrate_slots
 
-    await recalibrate_slots()
+    return await recalibrate_slots()
 
 
 @broker.task(schedule=[{"cron": "17 * * * *"}])
-async def sweep_results(_context: Context = TaskiqDepends()) -> None:
+async def sweep_results(_context: Context = TaskiqDepends()) -> dict:
     """每小时第 17 分：清理超期结果体（设计 §9）。
 
     错开整点：整点是各类定时任务的高峰，DB 上再叠一个批量 UPDATE 不划算。
     """
     if not settings.sweep_enabled:
-        return
+        return {"skipped": "sweep_disabled"}
     from app.services.sweeper import purge_results
 
-    await purge_results()
+    return await purge_results()
 
 
 # ---------------------------------------------------------------------------
