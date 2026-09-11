@@ -60,7 +60,7 @@ graceful_timeout = min(
 
 # 突发排队的接纳队列；nginx 那层也要接得住，否则排队发生在内核而非这里
 backlog = _env_int("GUNICORN_BACKLOG", 2048)
-keepalive = _env_int("GUNICORN_KEEPALIVE", 5)
+keepalive = _env_int("GUNICORN_KEEPALIVE", 15)
 
 # /dev/shm 上的心跳文件：容器里 /tmp 可能是慢速 overlay，会导致 worker 被误杀。
 # 兜底：/dev/shm 不存在或不可写时退回 /tmp，别让目录探测直接崩掉 master。
