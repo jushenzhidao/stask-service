@@ -221,8 +221,8 @@
         <table>
           <thead><tr>
             <th>task_id</th><th>状态</th><th>模型</th><th>路径</th>
-            <th class="num">上游</th><th class="num">耗时</th>
-            <th class="num">字节</th><th>创建</th>
+            <th class="num">上游</th><th>失败原因 / 产出</th>
+            <th class="num">耗时</th><th class="num">字节</th><th>创建</th>
           </tr></thead>
           <tbody id="tkBody"></tbody>
         </table>
@@ -337,6 +337,45 @@ function bytes(n) {
   return (n / 1048576).toFixed(2) + " MB";
 }
 function dur(s) { return s ? (s < 60 ? s + "s" : Math.floor(s / 60) + "m" + (s % 60) + "s") : "-"; }
+
+// 列表页的「失败原因 / 产出」单元格。同一列两用：失败任务显示原因
+// （fail_reason 现在带上游具体消息），成功任务显示制品数与主产出链接。
+// 拆成两列会把表挤爆，而这两种状态互斥，共用一列不会有歧义。
+function reasonCell(t) {
+  if (t.status === "FAILURE" || t.status === "CANCELED") {
+    const r = String(t.fail_reason || "");
+    if (!r) return '<span class="faint">-</span>';
+    // 完整原因可能上百字符（含上游返回的 message），列表页截断 +
+    // title 悬浮看全文，详情弹窗里给完整版
+    return `<span class="err" style="margin:0;padding:2px 7px;display:inline-block;
+             max-width:280px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
+             vertical-align:middle" title="${esc(r)}">${esc(r)}</span>`;
+  }
+  if (t.status === "SUCCESS") {
+    if (!t.artifact_count) return '<span class="faint">无制品</span>';
+    const label = `${t.artifact_count} 个制品`;
+    return t.result_url
+      ? `<a href="${esc(t.result_url)}" target="_blank" rel="noopener noreferrer"
+           title="${esc(t.result_url)}">${esc(label)}</a>`
+      : esc(label);
+  }
+  return '<span class="faint">-</span>';
+}
+
+// 制品清单渲染（详情弹窗）。key/type/mime 都来自后端归一后的结构，
+// inline 制品没有 URL（字节在 upstream_response 里），只标类型不给链接。
+function artifactList(items) {
+  if (!items || !items.length) return '<span class="faint">无</span>';
+  return items.map((a) => {
+    const meta = `<span class="faint mono">${esc(a.type || "?")}${a.mime_type ? " · " + esc(a.mime_type) : ""}</span>`;
+    const body = a.url
+      ? `<a href="${esc(a.url)}" target="_blank" rel="noopener noreferrer"
+           class="mono" title="${esc(a.url)}">${esc(a.key || "artifact")}</a>`
+      : `<span class="mono">${esc(a.key || "artifact")}</span>
+         <span class="tag t-warn">内联字节</span>`;
+    return `<div style="margin-bottom:4px">${body} ${meta}</div>`;
+  }).join("");
+}
 
 async function api(path, opts = {}) {
   const res = await fetch("/admin/api" + path, {
@@ -454,7 +493,7 @@ async function loadTasks() {
     if (e.message !== "unauthorized") {
       $("tkErr").innerHTML = `<div class="err">${esc(e.message)}</div>`;
     }
-    $("tkBody").innerHTML = '<tr><td colspan="8" class="faint">查询未执行</td></tr>';
+    $("tkBody").innerHTML = '<tr><td colspan="9" class="faint">查询未执行</td></tr>';
     $("tkTotal").textContent = "";
     $("pageInfo").textContent = "";
     $("prevBtn").disabled = offset === 0;
@@ -472,10 +511,11 @@ async function loadTasks() {
       <td>${esc(t.model || "-")}</td>
       <td class="mono faint">${esc(t.request_path || "-")}</td>
       <td class="num mono">${esc(t.upstream_status || "-")}</td>
+      <td>${reasonCell(t)}</td>
       <td class="num">${dur(t.duration)}</td>
       <td class="num">${t.result_purged ? '<span class="faint">已清理</span>' : bytes(t.response_bytes)}</td>
       <td class="faint">${ago(t.created_at)}</td>
-    </tr>`).join("") : '<tr><td colspan="8" class="faint">无匹配任务</td></tr>';
+    </tr>`).join("") : '<tr><td colspan="9" class="faint">无匹配任务</td></tr>';
 
   $("pageInfo").textContent = `${offset + 1} – ${Math.min(offset + limit, d.total)}`;
   $("prevBtn").disabled = offset === 0;
@@ -487,15 +527,34 @@ async function loadTasks() {
 async function showTask(id) {
   const d = await api("/tasks/" + encodeURIComponent(id));
   $("dlgTitle").textContent = d.task_id;
+  // 失败原因单独用醒目样式，并且完整展示（不截断）——它现在含上游返回的
+  // 具体 message，是排障的第一落点，藏在灰色小字里等于没有
+  const failRow = d.fail_reason
+    ? `<dt>失败原因</dt><dd><div class="err" style="margin:0">${esc(d.fail_reason)}</div></dd>`
+    : "";
+  // private_data.result_url 与 data.result_url 应当一致。不一致说明终态
+  // 落库时 private 补丁没写上，宿主 new-api 看板的「结果」列会是空的。
+  const urlMismatch = d.result_url && d.private_result_url !== d.result_url;
   const rows = [
     ["状态", `<span class="tag t-${esc(d.status)}">${esc(d.status)}</span>`],
-    ["失败原因", d.fail_reason || "-"],
     ["模型", d.model || "-"],
     ["请求", `${esc(d.request_method)} ${esc(d.request_path)}${d.request_query ? "?" + esc(d.request_query) : ""}`],
     ["上游地址", d.upstream_base_url || "-"],
     ["上游状态码", d.upstream_status || "-"],
     ["响应类型", d.upstream_content_type || "-"],
-    ["响应大小", d.result_purged ? "已按 TTL 清理" : bytes(d.response_bytes)],
+    ["响应大小", d.result_purged ? "已按 TTL 清理"
+      : `${bytes(d.response_bytes)}${d.response_encoding
+          ? ` <span class="tag ${d.response_encoding === "plain" ? "t-SUCCESS" : "t-QUEUED"}">${esc(d.response_encoding)}</span>` : ""}`],
+    ["制品", artifactList(d.artifacts)],
+    ["主产出 URL", d.result_url
+      ? `<a href="${esc(d.result_url)}" target="_blank" rel="noopener noreferrer"
+           class="mono">${esc(d.result_url.slice(0, 90))}${d.result_url.length > 90 ? "…" : ""}</a>
+         ${urlMismatch ? '<div class="err" style="margin:6px 0 0">private_data.result_url 与 data.result_url 不一致——宿主看板可能显示不出结果</div>' : ""}`
+      : '<span class="faint">-</span>'],
+    ["解析级别", d.artifact_parser
+      ? `<span class="mono">${esc(d.artifact_parser)}</span>
+         <span class="faint">（known=精确路径 / walk=键名递归 / inline=内联字节 / none=无制品）</span>`
+      : "-"],
     ["渠道", d.channel_id || "-"],
     ["创建", d.created_at ? new Date(d.created_at * 1000).toLocaleString() : "-"],
     ["开始 / 结束", `${d.start_time ? new Date(d.start_time * 1000).toLocaleTimeString() : "-"}
@@ -508,7 +567,7 @@ async function showTask(id) {
         ? `存在，剩余 ${d.token_session.ttl_seconds}s` : "不存在（已清理或已过期）"],
     ["该用户在途占槽", d.slots_in_use],
   ];
-  let html = rows.map(([k, v]) => `<dt>${esc(k)}</dt><dd>${v}</dd>`).join("");
+  let html = failRow + rows.map(([k, v]) => `<dt>${esc(k)}</dt><dd>${v}</dd>`).join("");
   if (d.status === "QUEUED" || d.status === "IN_PROGRESS") {
     html += `<dt>操作</dt><dd>
       <button id="rq">重投队列</button>

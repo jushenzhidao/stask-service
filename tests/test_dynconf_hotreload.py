@@ -120,3 +120,32 @@ async def test_result_ttl_seconds_in_410_message(
     assert resp.status_code == 410
     assert "120s" in resp.text
 
+
+
+async def test_model_policies_write_replaces_whole_table(
+    patch_redis, test_settings, monkeypatch
+):
+    """``model_policies`` 是**整表替换**，不是按模型合并。
+
+    这条是给运维的警告做成断言：配置存在 Redis 的一个 hash 字段里，值是一整个
+    JSON 串，``hset(mapping={key: json})`` 直接覆盖该字段。于是「给第二个模型
+    开启攒批」时如果只发自己那条，**第一个模型的策略会被静默清掉**——它不再
+    攒批、也不再受并发上限约束，而请求侧一切正常，没人会注意到。
+
+    所以开启第二个模型时必须把已有条目一起带上（先 GET 现表 → 改 → 整表 PUT）。
+    """
+    from app.services import modelpolicy
+
+    await dynconf.set_many({"model_policies": {"model-a": {
+        "batch": 10, "batch_wait": 60}}})
+    await dynconf.set_many({"model_policies": {"model-b": {
+        "batch": 5, "batch_wait": 30}}})
+
+    table = await dynconf.get_model_policies()
+    assert "model-b" in table, "新写入的必须生效"
+    assert "model-a" not in table, (
+        "整表替换语义：只发自己的那条会把别人的策略清掉（这正是要警告的坑）"
+    )
+    # 顺手确认「batch 就是开关」：0 = 不攒批，>=2 = 攒批
+    off = modelpolicy.resolve(model="model-c", policies=table)
+    assert off.batch == 0 and off.queues is False, "未配置的模型默认不攒批"

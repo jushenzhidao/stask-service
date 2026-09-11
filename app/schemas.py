@@ -53,16 +53,35 @@ class SubmitPlan(BaseModel):
     path: str
     query: str
     headers: dict[str, str]
-    body_b64: str
+    body: str
+    """落库形态的请求体。``body_encoding`` 说明它是明文还是 gzip+base64。"""
+    body_encoding: str = ""
+    """``plain`` / ``gzip+b64``；空体时为空串（见 services/codec）。"""
     body_truncated: bool = False
     upstream_base_url: str
     idempotency_key: str = ""
     callback_url: str = ""
+    #: 计划执行时刻（unix 秒）。``0`` = 无延迟（默认，与改造前一致）。
+    #: 由路由层解析调度头算出并落库；等待期任务保持 ``QUEUED``，不引入新状态。
+    scheduled_at: int = 0
+    #: 客户端分批参数（R-14~R-17）。``None`` = 本次请求未声明，交服务端策略。
+    #: 声明了就在这里带着走，落库与入批都用**生效值**而不是原始头。
+    batch_size: int | None = None
+    batch_wait: int | None = None
+    batch_key: str | None = None
 
 
 class TaskView(BaseModel):
-    """对外的非终态任务视图（202 响应体）。"""
+    """对外的非终态任务视图（202 响应体）。
+
+    ``scheduled_at`` / ``batch_key`` / ``batch_state`` 是增量字段：未使用
+    延迟或攒批时分别为 ``0`` / 空串 / 空串，老客户端的既有字段语义不变
+    （客户端能据此区分「排队中」与「计划中」）。
+    """
 
     task_id: str
     status: str
     created_at: int = 0
+    scheduled_at: int = 0
+    batch_key: str = ""
+    batch_state: str = ""

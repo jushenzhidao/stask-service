@@ -524,11 +524,6 @@ def _loads(raw: bytes) -> Any:
         return None
 
 
-def parse_to_dicts(payload: Any) -> list[dict[str, Any]]:
-    """``parse`` 的落库形态（供 ``data.artifacts`` 直接写入）。"""
-    return [a.to_dict() for a in parse(payload)]
-
-
 def parse_for_store(payload: Any) -> dict[str, Any]:
     """一次解析产出全部落库字段（``_settle_response`` 的唯一入口）。
 

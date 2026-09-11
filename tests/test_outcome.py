@@ -15,8 +15,9 @@ import pytest
 from taskiq import TaskiqResult
 
 from app.queue import OutcomeMiddleware
-from app.services import codec, execute, slots, tokensession
+from app.services import execute, slots, tokensession
 from app.services.outcome import Outcome, TaskExecutionError, preview
+from tests.conftest import stored_body
 
 TASK = "dall_e_3_" + "b" * 32
 TH = "tokenhash1111111111111111111111"
@@ -29,10 +30,12 @@ async def _seed(task_store, *, status="QUEUED", body=b'{"model":"dall-e-3"}') ->
         "callback_url": "",
         "request_method": "POST", "request_path": "/v1/images/generations",
         "request_query": "", "request_headers": {"Content-Type": "application/json"},
-        "request_body": codec.encode(body),
+        **stored_body("request_body", body),
         "upstream_base_url": "http://newapi:3000",
-        "upstream_response": "", "upstream_content_type": "", "upstream_status": 0,
+        "upstream_response": "", "upstream_response_encoding": "",
+        "upstream_content_type": "", "upstream_status": 0,
         "dispatch_epoch": 0,
+        "slot_flags": slots.FLAG_TOKEN, "slot_model": "dall-e-3",
     })
     task_store.rows[TASK]["status"] = status
     await tokensession.store(TASK, "sk-test-token")
@@ -138,7 +141,8 @@ async def test_upstream_error_outcome_has_preview(task_store, patch_redis,
     assert out["status"] == "FAILURE"
     assert out["upstream_status"] == 401
     assert "invalid api key" in out["upstream_preview"]
-    assert out["fail_reason"] == "upstream 401"
+    # 本轮改造：fail_reason 携带上游具体消息，不再只是 "upstream 401"
+    assert out["fail_reason"] == "upstream 401: invalid api key"
 
 
 async def test_unreachable_outcome_reports_attempts(task_store, patch_redis,

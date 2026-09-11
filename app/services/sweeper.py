@@ -19,7 +19,7 @@ from typing import TypeVar
 
 from app.config import settings
 from app.logging import log
-from app.redis import K_DISPATCH, K_SWEEP_LOCK, r
+from app.redis import K_DISPATCH, K_DUE, K_SWEEP_LOCK, r
 from app.schemas import ACTIVE, FAILURE
 from app.services import dynconf, slots, taskstore, tokensession
 
@@ -81,9 +81,7 @@ async def _kill(task: dict, reason: str) -> bool:
     )
     if not won:
         return False
-    token_hash = str(data.get("token_hash") or "")
-    if token_hash:
-        await slots.release(token_hash)
+    await slots.release_for_task(data)
     await tokensession.clear(task_id)
     callback_url = str(data.get("callback_url") or "")
     if callback_url:
@@ -109,6 +107,10 @@ async def sweep_stale() -> dict:
     超龄阈值取 ``worker_timeout + margin + 60``：正常执行中的任务绝不会
     被误捞（IN_PROGRESS 期间 updated_at 就是派发那一刻，一次调用最长
     worker_timeout，锁 TTL = timeout + margin）。
+
+    重投分两条路（见 :func:`handle` 内注释）：已持槽的立即任务直接重投消息，
+    未持槽的等待态任务（批次成员 / 计划任务）必须经 ``dispatch.release``
+    占槽——直接 publish 会绕过三层闸门，而这条路径很容易被触发。
     """
     if not await _lock("stale", 110):
         return {"skipped": "locked"}
@@ -119,9 +121,10 @@ async def sweep_stale() -> dict:
         threshold, await dynconf.get_int("sweep_batch_limit")
     )
     killed = 0
+    rescheduled = 0
 
     async def handle(task: dict) -> bool:
-        nonlocal killed
+        nonlocal killed, rescheduled
         task_id = str(task["task_id"])
         if task["status"] not in ACTIVE:
             return False
@@ -137,18 +140,114 @@ async def sweep_stale() -> dict:
             if await _kill(task, "stale after dispatch (result unavailable)"):
                 killed += 1
             return False
-        from app.queue import publish_execute
 
-        await publish_execute(task_id)
-        await taskstore.patch_data(task_id, {"requeued_at": now()})
-        log.warning("stale task requeued: task_id={}", task_id)
-        return True
+        # 重投必须区分「是否已持有并发槽」——这是 B2 的落点。
+        #
+        # 立即路径在提交时就已经占了第一层（掩码 > 0），入队消息丢了只是
+        # 「再送一次消息」，**不能再占一次槽**，否则同一个任务占两份额度，
+        # 该 token 会被自己挤到 429。
+        #
+        # 而批次成员 / 计划任务在放行前掩码恒为 0：它们必须走
+        # ``dispatch.release`` 由放行单点占槽后再入队。直接 publish 会**绕过
+        # 三层闸门**——而且这条路径很容易被触发：stale 阈值约 210s
+        # （worker_timeout + margin + 60），而 ``batch_wait`` 可以配到 3600s，
+        # 于是「正在正常等待凑批」的成员会先被判为卡死、再被无槽直接执行：
+        # 既击穿了并发上限，也让攒批彻底失效。
+        holds_slot = int((task.get("data") or {}).get("slot_flags") or 0) > 0
+        if holds_slot:
+            from app.queue import publish_execute
+
+            await publish_execute(task_id)
+            await taskstore.patch_data(task_id, {"requeued_at": now()})
+            log.warning("stale task requeued (slot already held): task_id={}", task_id)
+            return True
+
+        from app.services import dispatch
+
+        ceiling = max(10, await dynconf.get_int("batch_backoff_max_seconds"))
+        outcome = await dispatch.release(task_id, source="stale")
+        if outcome is dispatch.Released.OK:
+            log.warning("stale task released via dispatch: task_id={}", task_id)
+            return True
+        if outcome is dispatch.Released.NO_SLOT:
+            # 占不到槽：退避重排，不判死——客户端还在等这个结果
+            await dispatch.requeue(task_id, backoff_ceiling=ceiling)
+            rescheduled += 1
+            return False
+        # 已终态 / 已被放行 / 未到点：静默丢弃（release 内部已重挂索引）
+        return False
 
     requeued = await _gather_bounded(tasks, handle, label="stale")
-    if requeued or killed:
-        log.info("stale sweep: scanned={} requeued={} killed={}",
-                 len(tasks), requeued, killed)
-    return {"scanned": len(tasks), "requeued": requeued, "killed": killed}
+    rearmed = await _rearm_due_index()
+    rebuilt = await _rebuild_batch_index()
+    if requeued or killed or rescheduled or rearmed or rebuilt["members"]:
+        log.info("stale sweep: scanned={} requeued={} killed={} rescheduled={} "
+                 "due_rearmed={} batch_members_rebuilt={}",
+                 len(tasks), requeued, killed, rescheduled, rearmed,
+                 rebuilt["members"])
+    return {"scanned": len(tasks), "requeued": requeued, "killed": killed,
+            "rescheduled": rescheduled, "due_rearmed": rearmed,
+            "batch_members_rebuilt": rebuilt["members"]}
+
+
+async def _rebuild_batch_index() -> dict:
+    """按 DB 事实重建攒批索引（``st:batch:{model}`` / ``st:batch:due``）。
+
+    与 :func:`_rearm_due_index` 对称：那条补的是**延迟侧**的索引丢失，
+    这条补的是**批次侧**的。两侧都补才是完整的——只补一侧就是「同一种故障
+    在一个子系统能自愈、在另一个子系统不能」。
+
+    不补的后果比「任务卡住」更隐蔽：批次索引一丢，N 触发永远不会命中，
+    成员会被兜底扫描逐条单独放行——**任务照跑，只是攒批静默失效**，
+    削峰能力没了而看板一切正常。这类「降级但不报错」最难被发现。
+
+    ``rebuild_from_db`` 内部用 ``zadd(nx=True)``，重复调用不覆盖已有成员
+    与已算好的 deadline，所以每 2min 跑一轮是幂等且安全的。
+    """
+    from app.services import batching
+
+    try:
+        stat = await batching.rebuild_from_db(now=now())
+    except Exception:
+        log.opt(exception=True).warning("batch index rebuild failed")
+        return {"models": 0, "members": 0, "overdue": 0}
+    return stat
+
+
+async def _rearm_due_index() -> int:
+    """把 DB 里仍在等待期的计划任务补回 ``st:due`` 索引。
+
+    补齐一个**不对称**：普通任务「入队消息丢了」有 ``sweep_stale`` 重投兜底，
+    而延迟任务在等待期被 sweeper 豁免（不能重投也不能判死，这是对的），
+    于是 Redis 一旦丢掉 ``st:due``（重启无持久化 / FLUSHDB / 键被逐出），
+    就没有任何东西会把它们放回去——任务会一直卡到超龄被判 FAILURE。
+    执行有恢复路径、延迟没有，这个不对称本身就是缺陷。
+
+    架构 §9 风险登记承诺过「从 DB 事实回补，最迟 2min 恢复，功能不失效」，
+    本函数是它的落地（本任务每 2min 跑一轮）。
+
+    只补不覆盖：已存在于索引的保持原 score，避免把已算好的到期时刻重置。
+    """
+    pending = await taskstore.pending_scheduled(now())
+    if not pending:
+        return 0
+    rearmed = 0
+    for item in pending:
+        task_id = str(item["task_id"])
+        try:
+            if await r.zscore(K_DUE, task_id) is not None:
+                continue
+        except Exception:
+            log.opt(exception=True).warning("due index probe failed: task_id={}",
+                                            task_id)
+            return rearmed
+        from app.services import dispatch
+
+        await dispatch.schedule(task_id, int(item["scheduled_at"]))
+        rearmed += 1
+    if rearmed:
+        log.warning("due index rearmed from db: count={}", rearmed)
+    return rearmed
 
 
 async def sweep_overdue() -> dict:
@@ -174,26 +273,63 @@ async def sweep_overdue() -> dict:
 
 
 async def recalibrate_slots() -> dict:
-    """并发槽计数按 tasks 表事实回写。
+    """并发槽计数按 tasks 表事实回写——**三层都要校准**。
 
     两个方向都要修：释放失败让计数虚高（用户被永久限流），崩溃丢计数
     让计数虚低（并发保护失效）。事实源是 tasks 表的活跃任务数，直接覆盖。
+
+    第三层自 2026-09-11 接线后真正被占用，所以三层都得有校准口径：
+    - 第一层 ``st:slot:{th}``：漏了它 → 该 token 被自己的漂移卡住；
+    - 第二层 ``st:mslot:{th}:{model}``：漏了它 → 该 (模型,token) 组合在
+      泄漏后持续排队，直到 ``slot_ttl_seconds``（6h）自然过期；
+    - 第三层 ``st:gslot:{model}``：漏了它 → **在途明明是 0 却判定为满**，
+      该模型永久卡死，且没有任何自愈路径。
+
+    事实源谓词（``SQL_HOLDS_LAYER*``）只数**真正持有该层**的任务：等待期
+    任务掩码为 0，若被算进来，校准会把闸门往紧里拉——自造漂移。
     """
     if not await _lock("slots", 280):
         return {"skipped": "locked"}
-    truth = await taskstore.active_counts_by_token()
 
-    async def fix(item: tuple[str, int]) -> bool:
+    token_truth = await taskstore.active_counts_by_token()
+    mt_truth = await taskstore.active_counts_by_model_token()
+    model_truth = await taskstore.active_counts_by_model()
+
+    async def fix_token(item: tuple[str, int]) -> bool:
         token_hash, count = item
         if await slots.current(token_hash) == count:
             return False
         await slots.reset(token_hash, count)
         return True
 
-    fixed = await _gather_bounded(list(truth.items()), fix, label="slots")
-    if fixed:
-        log.info("slot recalibration: tokens={} fixed={}", len(truth), fixed)
-    return {"tokens": len(truth), "fixed": fixed}
+    async def fix_model_token(item: tuple[tuple[str, str], int]) -> bool:
+        (token_hash, model), count = item
+        if await slots.current_model_token(token_hash, model) == count:
+            return False
+        await slots.reset_model_token(token_hash, model, count)
+        return True
+
+    async def fix_model(item: tuple[str, int]) -> bool:
+        model, count = item
+        if await slots.current_global(model) == count:
+            return False
+        await slots.reset_global(model, count)
+        return True
+
+    fixed = await _gather_bounded(list(token_truth.items()), fix_token,
+                                  label="slots")
+    fixed_mt = await _gather_bounded(list(mt_truth.items()), fix_model_token,
+                                     label="slots-mt")
+    fixed_g = await _gather_bounded(list(model_truth.items()), fix_model,
+                                    label="slots-global")
+    if fixed or fixed_mt or fixed_g:
+        log.info("slot recalibration: tokens={} fixed={} model_token={} "
+                 "fixed_mt={} models={} fixed_global={}",
+                 len(token_truth), fixed, len(mt_truth), fixed_mt,
+                 len(model_truth), fixed_g)
+    return {"tokens": len(token_truth), "fixed": fixed,
+            "model_token": len(mt_truth), "fixed_model_token": fixed_mt,
+            "models": len(model_truth), "fixed_global": fixed_g}
 
 
 async def purge_results() -> dict:

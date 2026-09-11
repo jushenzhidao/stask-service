@@ -8,7 +8,8 @@ from __future__ import annotations
 import httpx
 import pytest
 
-from app.services import codec, execute, slots, tokensession
+from app.services import execute, slots, tokensession
+from tests.conftest import read_body, stored_body
 
 TASK = "dall_e_3_" + "a" * 32
 TH = "tokenhash0000000000000000000000"
@@ -22,10 +23,12 @@ async def _seed(task_store, patch_redis, *, status="QUEUED", callback_url="",
         "callback_url": callback_url,
         "request_method": "POST", "request_path": "/v1/images/generations",
         "request_query": "", "request_headers": {"Content-Type": "application/json"},
-        "request_body": codec.encode(body),
+        **stored_body("request_body", body),
         "upstream_base_url": "http://newapi:3000",
-        "upstream_response": "", "upstream_content_type": "", "upstream_status": 0,
+        "upstream_response": "", "upstream_response_encoding": "",
+        "upstream_content_type": "", "upstream_status": 0,
         "dispatch_epoch": 0,
+        "slot_flags": slots.FLAG_TOKEN, "slot_model": "dall-e-3",
     })
     task_store.rows[TASK]["status"] = status
     await tokensession.store(TASK, "sk-test-token")
@@ -41,7 +44,11 @@ async def _seed(task_store, patch_redis, *, status="QUEUED", callback_url="",
 async def test_success_stores_replayable_response(task_store, patch_redis,
                                                   test_settings, respx_router,
                                                   queue_events):
-    """2xx → SUCCESS，原文 gzip 落库，Content-Type 保留。"""
+    """2xx → SUCCESS，原文落库可回放，Content-Type 保留。
+
+    小体 JSON 走**明文**分支：``upstream_response`` 直接就是原文，
+    ``SELECT data ->> '$.upstream_response'`` 一眼可读（这是本轮改造的目的）。
+    """
     await _seed(task_store, patch_redis)
     payload = b'{"created":1,"data":[{"url":"https://cdn/x.png"}]}'
     respx_router.post(URL).mock(
@@ -54,8 +61,44 @@ async def test_success_stores_replayable_response(task_store, patch_redis,
     row = task_store.rows[TASK]
     assert row["status"] == "SUCCESS"
     assert row["progress"] == "100%"
-    assert codec.decode(row["data"]["upstream_response"]) == payload
+    assert read_body(row["data"], "upstream_response") == payload
+    # 明文落库：存的就是原文本身，不是 base64
+    assert row["data"]["upstream_response_encoding"] == "plain"
+    assert row["data"]["upstream_response"] == payload.decode()
     assert row["data"]["upstream_content_type"] == "application/json"
+
+
+async def test_large_response_falls_back_to_gzip(task_store, patch_redis, monkeypatch,
+                                                  test_settings, respx_router):
+    """超 ``plain_max_bytes`` → gzip+base64，并显式标记编码。"""
+    monkeypatch.setattr(test_settings, "plain_max_bytes", 64)
+    await _seed(task_store, patch_redis)
+    payload = b'{"data":"' + b"x" * 500 + b'"}'
+    respx_router.post(URL).mock(return_value=httpx.Response(200, content=payload))
+
+    await execute.run(TASK)
+
+    data = task_store.rows[TASK]["data"]
+    assert data["upstream_response_encoding"] == "gzip+b64"
+    assert data["upstream_response"] != payload.decode()      # 确实被编码了
+    assert read_body(data, "upstream_response") == payload     # 但可完整还原
+
+
+async def test_binary_response_always_gzips(task_store, patch_redis, test_settings,
+                                             respx_router):
+    """二进制体（非 UTF-8）无条件走 gzip——JSON 列存不了非法 UTF-8 字节。"""
+    await _seed(task_store, patch_redis)
+    payload = bytes(range(256)) * 4               # 含 0x80-0xFF，不是合法 UTF-8
+    respx_router.post(URL).mock(
+        return_value=httpx.Response(200, content=payload,
+                                    headers={"Content-Type": "audio/mpeg"})
+    )
+
+    await execute.run(TASK)
+
+    data = task_store.rows[TASK]["data"]
+    assert data["upstream_response_encoding"] == "gzip+b64"
+    assert read_body(data, "upstream_response") == payload
 
 
 async def test_success_releases_slot_and_session(task_store, patch_redis,
@@ -94,7 +137,11 @@ async def test_upstream_request_carries_token_and_task_id(task_store, patch_redi
 async def test_4xx_becomes_failure_with_replayable_body(task_store, patch_redis,
                                                         test_settings, respx_router,
                                                         status):
-    """4xx → FAILURE，原文与状态码保留供重放（401 = 上游判定令牌无效）。"""
+    """4xx → FAILURE，原文与状态码保留供重放（401 = 上游判定令牌无效）。
+
+    ``fail_reason`` 必须带上游的**具体消息**，不能只有 ``upstream 401``——
+    否则看板与回调都只能告诉用户"上游拒了"，真实原因还得回 DB 解原文。
+    """
     await _seed(task_store, patch_redis)
     body = b'{"error":{"message":"invalid token"}}'
     respx_router.post(URL).mock(return_value=httpx.Response(status, content=body))
@@ -104,7 +151,58 @@ async def test_4xx_becomes_failure_with_replayable_body(task_store, patch_redis,
     row = task_store.rows[TASK]
     assert row["status"] == "FAILURE"
     assert row["data"]["upstream_status"] == status
-    assert codec.decode(row["data"]["upstream_response"]) == body
+    assert read_body(row["data"], "upstream_response") == body
+    assert row["fail_reason"] == f"upstream {status}: invalid token"
+
+
+# ---------------------------------------------------------------------------
+# fail_reason 的上游错误消息提取
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(("body", "expected"), [
+    # OpenAI / Ark 风格信封 + code
+    (b'{"error":{"message":"model not found","code":"model_not_found"}}',
+     "upstream 400: model not found (model_not_found)"),
+    # 扁平 message
+    (b'{"message":"\\u5185\\u5bb9\\u5ba1\\u6838\\u672a\\u901a\\u8fc7","code":1002}',
+     "upstream 400: 内容审核未通过 (1002)"),
+    # error 是字符串
+    (b'{"error":"no available channel"}', "upstream 400: no available channel"),
+    # 非 JSON：回落原文预览
+    (b"<html><body>502 Bad Gateway</body></html>",
+     "upstream 400: <html><body>502 Bad Gateway</body></html>"),
+    # 空体：保持原样，不拼冒号
+    (b"", "upstream 400"),
+    # JSON 但没有任何可识别的消息字段：回落原文预览
+    (b'{"foo":1}', 'upstream 400: {"foo":1}'),
+])
+async def test_fail_reason_carries_upstream_message(task_store, patch_redis,
+                                                    test_settings, respx_router,
+                                                    body, expected):
+    await _seed(task_store, patch_redis)
+    respx_router.post(URL).mock(return_value=httpx.Response(400, content=body))
+
+    await execute.run(TASK)
+
+    assert task_store.rows[TASK]["fail_reason"] == expected
+
+
+async def test_fail_reason_is_bounded(task_store, patch_redis, test_settings,
+                                      respx_router):
+    """超长错误消息必须截断——fail_reason 是看板 Top10 的 GROUP BY 键，
+    不截断会让每条失败都自成一组，排行榜彻底失效。"""
+    await _seed(task_store, patch_redis)
+    long_message = "x" * 5000
+    respx_router.post(URL).mock(
+        return_value=httpx.Response(400, json={"error": {"message": long_message}})
+    )
+
+    await execute.run(TASK)
+
+    reason = task_store.rows[TASK]["fail_reason"]
+    assert len(reason) <= 320                    # 300 详情 + "upstream 400: "
+    assert reason.startswith("upstream 400: xxx")
 
 
 async def test_5xx_no_retry_by_default(task_store, patch_redis, test_settings,
@@ -188,6 +286,71 @@ async def test_oversized_response_fails_loudly(task_store, patch_redis, monkeypa
     assert row["status"] == "FAILURE"
     assert "too large" in row["fail_reason"]
     assert row["data"]["upstream_response"] == ""       # 不落超限内容
+
+
+# ---------------------------------------------------------------------------
+# private_data.result_url（new-api 原生列契约）
+# ---------------------------------------------------------------------------
+
+
+async def test_success_writes_private_result_url(task_store, patch_redis,
+                                                  test_settings, respx_router):
+    """SUCCESS 必须把主产出 URL 写进 ``private_data.result_url``。
+
+    宿主 new-api 的 ``Task.GetResultURL()`` 先读该键，为空才回落
+    ``fail_reason``（它的历史兼容分支）。不写 = 宿主看板的「结果」列
+    对我们的行永远是空的。
+    """
+    await _seed(task_store, patch_redis)
+    video = "https://cdn.example/out.mp4?X-Tos-Signature=abc"
+    respx_router.post(URL).mock(
+        return_value=httpx.Response(200, json={"content": {"video_url": video}})
+    )
+
+    await execute.run(TASK)
+
+    row = task_store.rows[TASK]
+    assert row["status"] == "SUCCESS"
+    # 两侧都要有：data 供本服务看板轻量投影，private_data 供宿主看板
+    assert row["data"]["result_url"] == video
+    assert row["private_data"]["result_url"] == video
+    assert row["data"]["artifact_count"] == 1
+    assert row["data"]["artifact_parser"] == "known"
+
+
+async def test_success_without_artifacts_leaves_private_data_untouched(
+    task_store, patch_redis, test_settings, respx_router
+):
+    """无制品的成功任务（纯文本补全类）不写 private_data。
+
+    写一个空 ``result_url`` 会让宿主的 ``GetResultURL()`` 判定逻辑多一种
+    "键存在但值为空"的状态；不写就是干净的"没有结果地址"。
+    """
+    await _seed(task_store, patch_redis)
+    respx_router.post(URL).mock(
+        return_value=httpx.Response(200, json={"text": "hello", "usage": {"tokens": 3}})
+    )
+
+    await execute.run(TASK)
+
+    row = task_store.rows[TASK]
+    assert row["status"] == "SUCCESS"
+    assert row["data"]["artifact_count"] == 0
+    assert row["private_data"] == {}
+    assert "result_url" not in row["data"]
+
+
+async def test_failure_does_not_write_private_result_url(task_store, patch_redis,
+                                                          test_settings, respx_router):
+    """失败任务绝不写 result_url——否则宿主看板会把错误体当成产出地址。"""
+    await _seed(task_store, patch_redis)
+    respx_router.post(URL).mock(
+        return_value=httpx.Response(400, json={"error": {"message": "bad prompt"}})
+    )
+
+    await execute.run(TASK)
+
+    assert task_store.rows[TASK]["private_data"] == {}
 
 
 # ---------------------------------------------------------------------------

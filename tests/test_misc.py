@@ -19,7 +19,7 @@ from app import main
 from app.config import normalize_database_url, settings
 from app.services import admission, codec, notify, taskstore
 from app.services.admission import AdmissionError
-from tests.conftest import AUTH
+from tests.conftest import AUTH, stored_body
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -76,19 +76,61 @@ def test_write_side_timestamps_are_seconds():
     "中文内容测试".encode(),
 ])
 def test_codec_roundtrip(payload):
-    assert codec.decode(codec.encode(payload)) == payload
+    """任何输入、任一分支，编解码都必须字节级还原。"""
+    assert codec.decode(*codec.encode(payload, codec.PLAIN_MAX_DEFAULT)) == payload
 
 
-def test_codec_compresses_json():
-    """JSON 型响应压缩率应显著——b64 会 ×4/3，压不动就是净亏。"""
+@pytest.mark.parametrize("payload", [
+    b"",
+    b"{}",
+    b'{"data":[{"url":"https://cdn/a.png"}]}',
+    "中文内容测试".encode(),
+])
+def test_small_utf8_payloads_stay_plain(payload):
+    """小体 UTF-8 → 明文直存，DB 里肉眼可读（本轮改造的核心诉求）。"""
+    encoded, encoding = codec.encode(payload, codec.PLAIN_MAX_DEFAULT)
+    assert encoding == codec.PLAIN
+    assert encoded == payload.decode()
+
+
+def test_non_utf8_payload_forced_to_gzip():
+    """非 UTF-8 字节无法进 JSON 列 → 无条件压缩，与体积阈值无关。"""
+    encoded, encoding = codec.encode(b"\xff\xfe\x00", codec.PLAIN_MAX_DEFAULT)
+    assert encoding == codec.GZIP_B64
+    assert codec.decode(encoded, encoding) == b"\xff\xfe\x00"
+
+
+def test_codec_compresses_large_json():
+    """超阈值的 JSON 压缩率应显著——b64 会 ×4/3，压不动就是净亏。"""
     payload = json.dumps({"data": [{"url": "https://cdn/x.png"} for _ in range(200)]}
                          ).encode()
-    assert len(codec.encode(payload)) < len(payload) * 0.5
+    encoded, encoding = codec.encode(payload, plain_max_bytes=1024)
+    assert encoding == codec.GZIP_B64
+    assert len(encoded) < len(payload) * 0.5
+
+
+def test_plain_max_bytes_is_the_only_switch():
+    """阈值恰好等于体长时仍走明文（边界取 <=）。"""
+    payload = b"x" * 100
+    assert codec.encode(payload, 100)[1] == codec.PLAIN
+    assert codec.encode(payload, 99)[1] == codec.GZIP_B64
 
 
 def test_codec_rejects_garbage():
     with pytest.raises(ValueError):
-        codec.decode("!!!not-base64!!!")
+        codec.decode("!!!not-base64!!!", codec.GZIP_B64)
+
+
+def test_codec_rejects_unknown_encoding():
+    """未知编码标记必须显式报错，不能静默当明文——静默会把压缩数据
+    当原文回放给客户端，是最难查的一类污染。"""
+    with pytest.raises(ValueError):
+        codec.decode("whatever", "zstd+b64")
+
+
+def test_legacy_empty_encoding_treated_as_plain():
+    """空标记 = 明文。仅为容忍手工插入/外部写入的行，不为兼容旧版本。"""
+    assert codec.decode('{"a":1}', "") == b'{"a":1}'
 
 
 # ---------------------------------------------------------------------------
@@ -340,8 +382,8 @@ async def test_ops_task_detail_never_leaks_sk_or_body(client, task_store,
     task_id = "img_" + "9" * 32
     await task_store.create(task_id, "/x", {
         "token_hash": "th", "model": "dall-e-3",
-        "request_body": codec.encode(b'{"prompt":"secret prompt"}'),
-        "upstream_response": codec.encode(b'{"url":"x"}'),
+        **stored_body("request_body", b'{"prompt":"secret prompt"}'),
+        **stored_body("upstream_response", b'{"url":"x"}'),
         "response_bytes": 11,
     })
     await tokensession.store(task_id, "sk-test-token")
@@ -396,3 +438,129 @@ def test_no_emoji_in_source():
         if pattern.search(text):
             offenders.append(str(path.relative_to(ROOT)))
     assert not offenders, f"emoji found in: {offenders}"
+
+
+#: 允许调用 ``taskstore.get``（= ``SELECT *``，含 request_body / upstream_response
+#: 大字段）的模块白名单。**只有真正需要原始体的路径可以在这里**：
+#: - ``execute.py``：worker 要把 request_body 发给上游；
+#: - ``flow.py``：终态回放要把 upstream_response 原文还给客户端。
+#:
+#: 其余读取一律走 ``get_meta`` 投影。这条不变式（设计 §6 第 6 条）用测试
+#: 钉住而不是靠人记得——热路径误用 get 会静默拉回每条最多 12MB 的列，
+#: 功能完全正常、只是把 DB 带宽烧穿，评审很难看出来。
+_GET_ALLOWLIST = {"services/execute.py", "services/flow.py"}
+
+
+def test_select_star_only_in_allowlisted_modules():
+    """``taskstore.get``（SELECT *）只允许出现在白名单模块里。
+
+    背景（实测）：到期通道与批次放行曾是每任务一次 ``SELECT *``，而它们只用
+    到几个标量字段。一轮 200 条到期放行的额外 DB 流量，按提交体中位数计约
+    数 MB、按 2MB 上限计约 800MB——纯属浪费，且**没有任何行为测试会发现**
+    （返回值完全正确）。故用结构断言把读取入口锁死。
+    """
+    import re
+
+    call = re.compile(r"taskstore\.get\(")
+    offenders = []
+    for path in ROOT.glob("app/**/*.py"):
+        rel = str(path.relative_to(ROOT / "app"))
+        if rel in _GET_ALLOWLIST:
+            continue
+        for lineno, line in enumerate(path.read_text().splitlines(), 1):
+            if call.search(line):
+                offenders.append(f"{rel}:{lineno}")
+    assert not offenders, (
+        "这些位置用了 taskstore.get（SELECT *），应改为 get_meta 投影；"
+        "若确实需要原始体，请把它加进 _GET_ALLOWLIST 并写明理由：\n  "
+        + "\n  ".join(offenders)
+    )
+
+
+#: 允许「生产代码无调用方」的 services 公开函数，**每条都必须写明理由**。
+#: 白名单是豁免清单，不是垃圾桶——不写理由就等于默许死代码堆积。
+_ORPHAN_ALLOWLIST = {
+    # 测试专用的缓存清理钩子。Redis 层靠 TTL 自然过期，进程内层只有测试需要
+    # 在用例之间重置。docstring 已声明「测试用」。
+    "clear_cache",
+    # 为未实现的看板需求（PRD R-21/R-22）预留的读取入口，口径已对齐
+    # batch_waiting()。见其 docstring。
+    "batch_counts_by_model",
+}
+
+
+def test_no_orphan_service_functions():
+    """``app/services`` 里不得存在「没人调用」的公开函数。
+
+    这一类缺陷（实现了但没有任何调用方）**测试发现不了**——被测函数本身是
+    绿的，缺的只是调用点。实测过一次：``artifacts.parse_for_store`` 是文档里
+    写明的「唯一入口」，但 ``execute.py`` 内联了同样的四个字段，于是
+    ``parse_for_store`` 成了只被测试调用的死代码。危害不是「多几行」，
+    而是**同一个契约有了两份实现**：改了一份、另一份静默漂移，
+    而测试盯着的恰好是不跑的那份。
+
+    判据：模块外无引用，且模块内除定义行外也无引用（路由与 cron 任务用
+    装饰器注册，故有装饰器的一律跳过）。测试文件的引用**不算数**——
+    「只被测试调用」正是本测试要抓的信号。
+
+    **匹配口径要按「名字是否有歧义」分两档**（这里踩过两次坑）：
+
+    - 裸名匹配（默认）：函数名在全仓唯一时，`from ...idem import new_task_id`
+      这类导入后直呼的名字也算调用。早期的「只认模块限定」版本会因为
+      漏掉这种形式而**大量误报**。
+    - 限定匹配：名字在多个模块里都有同名定义时（如 `stats` 同时存在于
+      `batching` / `dispatch` / `ops`），裸名无法判断指向谁，必须写成
+      `batching.stats`。早期版本一律按裸名匹配，于是 `ops.py` 的路由处理器
+      `stats` 把 `batching.stats` 的孤儿身份盖住了——**同名不同物**是这类
+      扫描最常见的假阴性来源。
+    """
+    import ast
+    import re
+    from collections import defaultdict
+
+    app_src = {p: p.read_text(encoding="utf-8")
+               for p in (ROOT / "app").rglob("*.py")}
+
+    def top_level_defs(source: str) -> list:
+        try:
+            tree = ast.parse(source)
+        except SyntaxError:
+            return []
+        return [n for n in tree.body
+                if isinstance(n, ast.FunctionDef | ast.AsyncFunctionDef)]
+
+    # 名字 → 定义了它的模块集合（用于判断名字是否有歧义）
+    owners: dict[str, set] = defaultdict(set)
+    for path, source in app_src.items():
+        for node in top_level_defs(source):
+            owners[node.name].add(path)
+
+    offenders = []
+    for path, source in sorted(app_src.items()):
+        if "services" not in path.parts:
+            continue
+        own = re.escape(path.stem)
+        for node in top_level_defs(source):
+            if node.name.startswith("_") or node.decorator_list:
+                continue
+            if node.name in _ORPHAN_ALLOWLIST:
+                continue
+            bare = r"\b" + re.escape(node.name) + r"\b"
+            if len(owners[node.name]) > 1:
+                # 有歧义：只认 "<模块名>.<函数名>" 形式的限定引用
+                outside = sum(
+                    len(re.findall(rf"\b{own}\.{bare}", s))
+                    for q, s in app_src.items() if q != path)
+            else:
+                outside = sum(
+                    len(re.findall(bare, s))
+                    for q, s in app_src.items() if q != path)
+            inside = len(re.findall(bare, source)) - 1     # 减去定义行
+            if outside == 0 and inside == 0:
+                offenders.append(
+                    f"{node.name} ({path.relative_to(ROOT)})")
+    assert not offenders, (
+        "以下 services 公开函数没有任何调用方。要么接上调用点、要么删除；"
+        "确实要保留（如为未实现需求预留）请加进 _ORPHAN_ALLOWLIST 并写明理由：\n  "
+        + "\n  ".join(offenders)
+    )

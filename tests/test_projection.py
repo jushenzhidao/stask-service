@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 from app.services import codec, taskstore
+from tests.conftest import read_body, stored_body
 
 
 TASK_ID = "test_projection_123456789012345678"
@@ -16,23 +17,26 @@ TASK_ID = "test_projection_123456789012345678"
 async def test_get_meta_excludes_upstream_response(task_store):
     """核心：轻量投影不返回 `upstream_response` 大字段。"""
     large_body = b"X" * (10 * 1024 * 1024)  # 10MB
+    stored = stored_body("upstream_response", large_body)
     await task_store.create(TASK_ID, "/v1/images/generations", {
         "model": "dall-e-3",
-        "upstream_response": codec.encode(large_body),
+        **stored,
         "upstream_status": 200,
     })
 
-    # 轻量投影：不含 upstream_response
+    # 轻量投影：不含 upstream_response 本体，但**含**编码标记
+    # （标记只有十几个字节，排障时要靠它判断该怎么读原文）
     meta = await taskstore.get_meta(TASK_ID)
     assert meta is not None
     assert "upstream_response" not in meta["data"]
+    assert meta["data"]["upstream_response_encoding"] == codec.GZIP_B64
     assert meta["data"]["upstream_status"] == 200
     assert meta["data"]["model"] == "dall-e-3"
 
     # 完整 get() 仍然能拿到原始结果体
     full = await taskstore.get(TASK_ID)
     assert full is not None
-    assert full["data"]["upstream_response"] == codec.encode(large_body)
+    assert read_body(full["data"], "upstream_response") == large_body
 
 
 async def test_get_meta_boolean_fields_are_native_bool(task_store):
@@ -176,7 +180,7 @@ async def test_result_replay_still_uses_get(task_store):
     payload = b'{"created":1234567890,"data":[{"url":"https://..."}]}'
     await task_store.create(TASK_ID, "/v1/images/generations", {
         "model": "dall-e-3",
-        "upstream_response": codec.encode(payload),
+        **stored_body("upstream_response", payload),
         "upstream_status": 200,
         "upstream_content_type": "application/json",
     })
@@ -191,8 +195,38 @@ async def test_result_replay_still_uses_get(task_store):
     # 完整 get() 必须能拿到，否则回放路径会坏
     full = await taskstore.get(TASK_ID)
     assert full is not None
-    assert full["data"]["upstream_response"] == codec.encode(payload)
-    assert codec.decode(full["data"]["upstream_response"]) == payload
+    assert full["data"]["upstream_response"] == payload.decode()   # 小体 → 明文
+    assert read_body(full["data"], "upstream_response") == payload
+
+
+async def test_get_meta_exposes_private_result_url(task_store):
+    """``private_data`` 的白名单投影：只出 result_url / upstream_task_id。
+
+    该列是 new-api 的 ``TaskPrivateData``，可能含渠道 ``key``（Gemini /
+    Vertex 渠道会写）。这条用例守的是"绝不整列返回"——一旦有人图省事
+    改成 ``SELECT private_data``，宿主哪天往里加敏感字段，我们的管理面
+    就跟着泄露。
+    """
+    await task_store.create(TASK_ID, "/v1/videos", {"model": "seedance"})
+    await taskstore.cas(
+        TASK_ID, ("QUEUED",), "SUCCESS",
+        patch={"result_url": "https://cdn/out.mp4"},
+        private_patch={
+            "result_url": "https://cdn/out.mp4",
+            # 模拟宿主写入的敏感字段：绝不能出现在投影里
+            "key": "sk-upstream-channel-secret",
+        },
+    )
+
+    meta = await taskstore.get_meta(TASK_ID)
+    assert meta is not None
+    assert meta["private_data"] == {
+        "result_url": "https://cdn/out.mp4",
+        "upstream_task_id": "",
+    }
+    assert "key" not in meta["private_data"]
+    # 整个响应里都不该出现渠道密钥
+    assert "sk-upstream-channel-secret" not in str(meta)
 
 
 async def test_get_meta_returns_none_for_missing_task(task_store):

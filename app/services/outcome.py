@@ -68,6 +68,8 @@ class Outcome:
     request_path: str = ""
     response_bytes: int = 0
     content_type: str = ""
+    response_encoding: str = ""
+    """落库的响应体编码：``plain`` / ``gzip+b64``。排障时一眼看出该按哪种方式读 ``upstream_response``。"""
     artifact_count: int = 0
     artifact_parser: str = ""
     """命中的解析级别（known/walk/inline/none），区分「三级全空」与「首级误命中」。"""
@@ -126,3 +128,86 @@ def preview(raw: bytes, limit: int = PREVIEW_LIMIT) -> str:
     if len(raw) > limit:
         head += f" ...(truncated, {len(raw)} bytes total)"
     return head
+
+
+#: ``fail_reason`` 落 tasks 表的 TEXT 列，写侧另有 500 字符截断（``taskstore.cas``）。
+#: 这里先截到更短的长度：``fail_reason`` 是看板「失败原因 Top 10」的 GROUP BY 键，
+#: 太长会让每条失败都成为独立分组，排行榜彻底失去聚合意义。
+REASON_DETAIL_LIMIT = 300
+
+#: 上游错误消息的常见字段名，按「越具体越先试」排列。
+#: OpenAI 系 ``{"error":{"message":...}}`` 最常见；国产厂商多用扁平
+#: ``message`` / ``msg`` / ``error_msg``；Ark 用 ``{"error":{"message","code"}}``。
+_MESSAGE_KEYS = ("message", "msg", "error_msg", "errorMessage", "detail", "reason",
+                 "error_message", "description")
+_CODE_KEYS = ("code", "error_code", "errorCode", "type", "status")
+
+
+def _first_str(node: dict[str, Any], keys: tuple[str, ...]) -> str:
+    for key in keys:
+        value = node.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+        # 有些厂商的 code 是整数（HTTP 风格错误码）
+        if isinstance(value, int) and not isinstance(value, bool):
+            return str(value)
+    return ""
+
+
+def upstream_error_detail(raw: bytes, content_type: str = "") -> str:
+    """从上游非 2xx 响应体里提取**人类可读的错误消息**。
+
+    存在的理由：原先 ``fail_reason`` 只写 ``"upstream 400"``——看板、
+    回调、``/async`` 查询三处都只能告诉用户"上游返回了 400"，真正的原因
+    （模型不存在 / 参数非法 / 内容审核不通过 / 渠道无可用 key）全都躺在
+    ``upstream_response`` 里等人手工解码。
+
+    解析策略（逐级退化，任何一级失败都回落到下一级，**绝不抛异常**）：
+
+    1. JSON 且是 dict → 试 ``error``/``data``/``result`` 信封，逐层找
+       ``message`` 类字段；找到后拼上 ``code``（若有）；
+    2. JSON 但形状不认识 → 回落到截断的原文预览；
+    3. 非 JSON（HTML 错误页、纯文本）→ 截断的原文预览。
+
+    返回空串表示"没有任何可读信息"（响应体为空），调用方保持原有的
+    ``upstream {status}`` 即可。
+    """
+    if not raw:
+        return ""
+    text = _extract_from_json(raw)
+    if not text:
+        # 非 JSON 或未识别形状：原文截断。HTML 错误页会被压成一行，
+        # 信息密度低但至少能看出是不是网关拦截（"502 Bad Gateway" 之类）。
+        text = " ".join(preview(raw, REASON_DETAIL_LIMIT).split())
+    return text[:REASON_DETAIL_LIMIT]
+
+
+def _extract_from_json(raw: bytes) -> str:
+    """JSON 体 → ``"message (code)"``；解析失败或形状不认识返回空串。"""
+    import json
+
+    try:
+        parsed = json.loads(raw)
+    except (ValueError, UnicodeDecodeError):
+        return ""
+    if isinstance(parsed, str):
+        return parsed.strip()
+    if not isinstance(parsed, dict):
+        return ""
+
+    # 候选节点：根 + 常见错误信封（一层足够——没见过嵌两层的错误体）
+    candidates: list[dict[str, Any]] = [parsed]
+    for key in ("error", "data", "result", "response", "body"):
+        child = parsed.get(key)
+        if isinstance(child, dict):
+            candidates.append(child)
+        elif isinstance(child, str) and child.strip() and key == "error":
+            # ``{"error": "invalid model"}`` 这种扁平写法
+            return child.strip()
+
+    for node in candidates:
+        message = _first_str(node, _MESSAGE_KEYS)
+        if message:
+            code = _first_str(node, _CODE_KEYS)
+            return f"{message} ({code})" if code and code not in message else message
+    return ""

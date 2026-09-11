@@ -30,6 +30,7 @@ task_id。上游调用可能有副作用（生成、扣费由上游自理）—�
 from __future__ import annotations
 
 import asyncio
+from typing import Any
 
 import httpx
 
@@ -46,7 +47,7 @@ from app.services import (
     taskstore,
     tokensession,
 )
-from app.services.outcome import Outcome, preview
+from app.services.outcome import Outcome, preview, upstream_error_detail
 
 #: 摘要里最多带几条制品 URL（预签名地址很长，多了会撑爆 result backend）
 _OUTCOME_URL_LIMIT = 5
@@ -93,12 +94,13 @@ _error_preview = preview
 
 async def _finalize(
     task_id: str,
-    token_hash: str,
+    data: dict,
     status: str,
     *,
     patch: dict,
     fail_reason: str = "",
     callback_url: str = "",
+    private_patch: dict | None = None,
 ) -> None:
     """终态落库 → 释放槽 → 清会话 → 可选回调。
 
@@ -107,6 +109,14 @@ async def _finalize(
 
     ``cas`` 返回 False 表示别人（取消/兜底 sweeper）已经推进过——此时
     不重复释放槽（会造成计数下溢）也不重复回调。
+
+    收 ``data``（不是 ``token_hash``）是因为释放必须按**落库的占位掩码**
+    ``slot_flags`` 逐层回退：三层闸门下只还第一层会让 ``st:mslot`` /
+    ``st:gslot`` 单调累积，模型全局闸门在若干次任务后永久卡死。
+
+    ``private_patch`` 合并进 ``tasks.private_data``（new-api 原生列），
+    目前只用来写 ``result_url``——让宿主看板的 ``GetResultURL()`` 能读到
+    我们的主产出，而不是回落到 ``fail_reason``（那是它的 legacy 兼容分支）。
     """
     try:
         won = await taskstore.cas(
@@ -115,6 +125,7 @@ async def _finalize(
             status,
             patch=patch,
             fail_reason=fail_reason,
+            private_patch=private_patch,
         )
     except Exception:
         # 终态落表失败（DB 挂/锁超时等）：任务停在原状态，交给
@@ -132,7 +143,7 @@ async def _finalize(
         log.info("terminal race lost (already advanced): task_id={}", task_id)
         return
 
-    await slots.release(token_hash)
+    await slots.release_for_task(data)
     await tokensession.clear(task_id)
 
     if callback_url:
@@ -222,7 +233,7 @@ async def _run(task_id: str) -> Outcome:
         reason = "token session missing (expired or redis lost)"
         await _finalize(
             task_id,
-            token_hash,
+            data,
             FAILURE,
             patch={"upstream_status": 0},
             fail_reason=reason,
@@ -249,16 +260,17 @@ async def _dispatch(
     path = str(data.get("request_path") or "/")
     query = str(data.get("request_query") or "")
     headers = dict(data.get("request_headers") or {})
-    body_b64 = str(data.get("request_body") or "")
+    stored_body = str(data.get("request_body") or "")
+    body_encoding = str(data.get("request_body_encoding") or "")
 
     model = str(data.get("model") or "")
 
     try:
-        body = codec.decode(body_b64) if body_b64 else b""
+        body = codec.decode(stored_body, body_encoding) if stored_body else b""
     except ValueError as exc:
         await _finalize(
             task_id,
-            token_hash,
+            data,
             FAILURE,
             patch={"upstream_status": 0},
             fail_reason=str(exc),
@@ -319,7 +331,7 @@ async def _dispatch(
             )
             await _finalize(
                 task_id,
-                token_hash,
+                data,
                 FAILURE,
                 patch={"upstream_status": 0},
                 fail_reason=reason,
@@ -354,7 +366,7 @@ async def _dispatch(
             )
             await _finalize(
                 task_id,
-                token_hash,
+                data,
                 FAILURE,
                 patch={"upstream_status": 0},
                 fail_reason=reason,
@@ -414,7 +426,7 @@ async def _settle_response(
     if len(raw) > config.response_max_bytes:
         await _finalize(
             task_id,
-            token_hash,
+            data,
             FAILURE,
             patch={
                 "upstream_status": status,
@@ -462,35 +474,57 @@ async def _settle_response(
     patch = {
         "upstream_status": status,
         "upstream_content_type": content_type,
-        "upstream_response": codec.encode(raw),
         "response_bytes": len(raw),
     }
+    # 落库形态：小体明文（SQL 直接可读），超阈值或二进制才 gzip+base64。
+    # 编码标记与体同写，读侧不做嗅探（见 app.services.codec）。
+    stored, encoding = codec.encode(raw, config.plain_max_bytes)
+    patch["upstream_response"] = stored
+    patch["upstream_response_encoding"] = encoding
+
     if 200 <= status < 300:
         # 制品解析与成功落库同一次写入：看板「制品」列读 data.artifacts，
         # 分两次写会出现「已成功但制品暂缺」的中间态。解析恒不抛（内部兜底），
         # 空清单是合法结果（纯文本任务本无制品），绝不因此改判失败。
-        result = artifacts.parse_result(raw)
-        found = result.items
-        patch["artifacts"] = [a.to_dict() for a in found]
-        patch["artifact_count"] = len(found)
+        #
+        # 走 ``parse_for_store``（而不是在这里 parse_result + primary_url 各调
+        # 一次）有两个理由：一是同一响应只解析一遍；二是**避免出现两份实现**。
+        # 此前这里内联了同样的四个字段，而 ``parse_for_store`` 成了没人调用的
+        # 死代码却仍被测试覆盖——改了其中一份、另一份静默漂移，
+        # 而测试只盯着那份不跑的，正好把问题盖住。
+        parsed = artifacts.parse_for_store(raw)
+        found = parsed["artifacts"]
+        primary = str(parsed["result_url"])
+        patch["artifacts"] = found
+        patch["artifact_count"] = parsed["artifact_count"]
         # 命中级别（known/walk/inline/none）：线上「成功却无制品」时，
         # 这一个字段即可区分「三级全空」与「首级误命中」，免回捞原始响应
-        patch["artifact_parser"] = result.tier
-        if found:
-            primary = artifacts.primary_url(found)
-            if primary:
-                # 与 new-api 原生任务对齐：看板「结果」列读这个字段
-                patch["result_url"] = primary
-        await _finalize(task_id, token_hash, SUCCESS, patch=patch, callback_url=callback_url)
+        patch["artifact_parser"] = parsed["artifact_parser"]
+        # ``private_data.result_url`` 是 new-api 原生列的契约字段：宿主的
+        # ``Task.GetResultURL()`` 先读它，为空才回落 ``fail_reason``
+        # （历史兼容分支）。不写它 = 宿主看板的「结果」列对我们的行恒空。
+        # ``data.result_url`` 同时保留：本服务自己的看板与 ops 视图读它，
+        # 走的是轻量投影（``data ->> '$.result_url'``），不必再碰 private_data。
+        # 空值不落库（保持与改造前一致：无主产出时不写该键，而不是写空串）。
+        private_patch: dict[str, Any] = {}
+        if primary:
+            patch["result_url"] = primary
+            private_patch["result_url"] = primary
+        await _finalize(
+            task_id, data, SUCCESS, patch=patch,
+            callback_url=callback_url,
+            private_patch=private_patch or None,
+        )
         _blog(
             task_id,
             upstream_status=status,
             response_bytes=len(raw),
             model=model,
             request_path=path,
-            artifact_count=len(found),
-            artifact_types=",".join(sorted({a.type for a in found})),
-            artifact_parser=result.tier,
+            artifact_count=parsed["artifact_count"],
+            artifact_types=",".join(sorted({str(a.get("type")) for a in found})),
+            artifact_parser=parsed["artifact_parser"],
+            response_encoding=encoding,
         ).info(
             "task success: task_id={} status={} bytes={} model={} path={} artifacts={} parser={}",
             task_id,
@@ -499,7 +533,7 @@ async def _settle_response(
             model,
             path,
             len(found),
-            result.tier,
+            parsed["artifact_parser"],
         )
         return Outcome(
             task_id=task_id,
@@ -512,21 +546,30 @@ async def _settle_response(
             request_path=path,
             content_type=content_type,
             response_bytes=len(raw),
-            artifact_count=len(found),
-            artifact_parser=result.tier,
-            artifact_types=sorted({a.type for a in found}),
-            artifact_urls=[a.url for a in found[:_OUTCOME_URL_LIMIT]],
-            result_url=str(patch.get("result_url") or ""),
+            response_encoding=encoding,
+            artifact_count=parsed["artifact_count"],
+            artifact_parser=parsed["artifact_parser"],
+            # ``found`` 现在是 ``to_dict()`` 之后的形态，取值一律走 ``.get``：
+            # ``to_dict`` 只在字段非空时才写键（``url`` / ``mime_type`` 都可能缺），
+            # 直接下标会在「内联制品无 URL」时 KeyError。
+            artifact_types=sorted({str(a.get("type")) for a in found}),
+            artifact_urls=[str(a.get("url") or "")
+                           for a in found[:_OUTCOME_URL_LIMIT]],
+            result_url=primary,
             detail=(
                 f"upstream {status}, {len(raw)} bytes, {len(found)} artifact(s) "
-                f"via tier={result.tier}"
+                f"via tier={parsed['artifact_parser']}"
             ),
         )
 
-    fail_reason = f"upstream {status}"
+    # 失败原因必须带上游的**具体错误消息**——只写 "upstream 400" 时，
+    # 看板/回调/查询三处都只能说"上游拒了"，真实原因（模型不存在、
+    # 参数非法、内容审核、无可用渠道）全躺在 upstream_response 里等人解码。
+    detail = upstream_error_detail(raw, content_type)
+    fail_reason = f"upstream {status}: {detail}" if detail else f"upstream {status}"
     await _finalize(
         task_id,
-        token_hash,
+        data,
         FAILURE,
         patch=patch,
         fail_reason=fail_reason,
@@ -564,6 +607,10 @@ async def _settle_response(
         request_path=path,
         content_type=content_type,
         response_bytes=len(raw),
+        response_encoding=encoding,
         upstream_preview=_error_preview(raw),
-        detail=f"upstream returned {status}; full body stored for replay",
+        detail=(
+            f"upstream returned {status}: {detail}" if detail
+            else f"upstream returned {status}; full body stored for replay"
+        ),
     )

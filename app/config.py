@@ -181,8 +181,45 @@ class Settings(BaseSettings):
     async_deny_prefixes: Annotated[tuple[str, ...], NoDecode] = ("/api/", "/console/")
 
     # ---- 并发保护（本服务不做资金判定，纯固定闸门）----
-    max_slots: int = 10                  # 单 token 在途上限
+    max_slots: int = 10                  # 单 token 在途上限（第三层闸门的最后回落值）
     slot_ttl_seconds: int = 3600         # 槽键 TTL 兜底（进程崩溃不永久泄漏）
+
+    # ---- 攒批与模型策略（按模型控制下发节奏与并发上限）----
+    #: 攒批总开关。关闭 = 所有模型收到即发（忽略策略里的 batch 声明）。
+    #: 灰度起步与线上止血用：出问题时一个开关回到改造前行为。
+    batch_enabled: bool = True
+    #: 整批放行时的有界并发（与 sweeper 同量级，避免放行瞬间打满连接池）
+    batch_release_concurrency: int = 8
+    #: 放行时占不到槽的退避上限（秒）。指数退避：30/60/120/240/…封顶本值，
+    #: 带 ±10% 抖动防整批同相重试形成惊群。
+    batch_backoff_max_seconds: int = 300
+    #: ``X-Batch-Wait`` 的上限（秒），同时是「客户端只给 N 不给 T」时的兜底等待
+    #: （R-17/AC-57：客户端的 N 声明不能变成无限等待）。
+    max_batch_wait_seconds: int = 300
+    #: 攒批的**归组维度**（结构性开关，故只读 env 不放热改白名单）：
+    #: - ``model``：按归一化模型名归组。**默认**，跨 token 合并——批次更大、
+    #:   N 更容易触发、削峰效果更好，且语义简单（「同模型的一批」）。
+    #: - ``token_model``：按 ``token_hash + model`` 归组，与并发维度严格对齐
+    #:   （ARCH Q5 / PRD R-15 / AC-58 的原裁决口径）；代价是每个 token 各自
+    #:   成批、批次显著变小，更依赖 T 触发兜底。
+    #: 两者都不会改变「放行时各自占各自 token 的槽」这一事实，区别只在
+    #: **谁和谁算同一批**。``X-Batch-Key`` 可逐请求覆盖本项。
+    #:
+    #: **2026-09-11 产品决定取 ``model``**：优先「简单 + 批次大」，
+    #: 与 ARCH Q5 的原始裁决不同，属**有意的偏离**（已在 ARCH §6 Q5 注记录）。
+    #: 改回 ``token_model`` 只需改这个值，无需动逻辑——但那会改变所有既有
+    #: 接入方的批次数与放行节奏，属行为变更。
+    batch_group_by: str = "model"
+    #: 允许的最大延迟（秒）。PRD 默认 6h。
+    #: **实际生效值是它与「令牌 TTL 容量」的较小值**（见 services/schedule）：
+    #: 延迟 + 执行 + 余量 超过令牌会话 TTL 时，任务到点必然取不到令牌而判死，
+    #: 所以那一段区间必须在提交时就拒掉，而不是放进来看它必然失败。
+    max_delay_seconds: int = 21600
+    #: 模型策略表（json）。键 = 模型名（小写）/ 端点前缀 / ``__default__``；
+    #: 字段 batch / batch_wait / limit_per_token / limit_global。
+    #: 默认空 = 不启用任何策略，行为与改造前逐字节一致。
+    #: 通常不写 env，在管理看板上热改。
+    model_policies: dict[str, dict[str, int]] = Field(default_factory=dict)
 
     # ---- 限流 ----
     rate_limit: int = 60                 # 每窗口提交次数
@@ -210,11 +247,21 @@ class Settings(BaseSettings):
     retry_backoff_base: float = 1.0
     dispatch_lock_margin_seconds: int = 30   # 派发锁 TTL = worker_timeout + margin
     queue_concurrency: int = 64          # worker 并发度（taskiq --max-async-tasks）
-    sk_session_ttl_seconds: int = 7200   # 令牌会话 TTL（2h，终态即清）
+    #: 令牌会话 TTL（终态即清）。**必须 > task_max_lifetime_seconds（6h）**：
+    #: 否则任务还在生命期内、令牌却已过期，重投/长排队后执行必然取不到令牌
+    #: （token_missing）判死，`task_max_lifetime_seconds` 形同虚设。
+    #: 7h = 6h + 1h 余量。它同时是**延迟上限的天花板**（见 services/schedule）：
+    #: 延迟 D + 执行 + 余量 ≤ 本值，所以 7h 给出约 6.8h 的延迟容量。
+    sk_session_ttl_seconds: int = 25200
 
     # ---- 提交/响应体上限 ----
     body_max_bytes: int = 2 * 1024 * 1024        # 提交体落库上限（2MB）
     response_max_bytes: int = 10 * 1024 * 1024   # 响应体落库上限（10MB）
+    #: 明文落库的体量上限（字节）。≤ 本值且是合法 UTF-8 的请求体/响应体
+    #: **原样存明文**，超过或含二进制字节才 gzip+base64（见 services/codec）。
+    #: 默认 32KB：覆盖绝大多数生成类接口的 JSON 响应（URL + 元数据），
+    #: 让 `SELECT data ->> '$.upstream_response'` 直接可读，排障不必解码。
+    plain_max_bytes: int = 32 * 1024
 
     # ---- 查询长轮询（§2）----
     poll_wait_max_seconds: int = 60      # ?wait= 的上限（须 < nginx proxy_read_timeout）
@@ -273,6 +320,24 @@ class Settings(BaseSettings):
     @classmethod
     def _normalize_database_url(cls, value: object) -> object:
         return normalize_database_url(value) if isinstance(value, str) else value
+
+    @field_validator("model_policies", mode="before")
+    @classmethod
+    def _parse_model_policies(cls, value: object) -> object:
+        """env 里手写 JSON 字符串 → dict（``.env`` 里只能写一行文本）。
+
+        与 ``_parse_str_tuple`` 同一套宽容策略：空串 = 空表，非法 JSON
+        在启动时报错而不是静默忽略——一份写坏的策略表会让下发节奏出错，
+        静默忽略等于让人以为配置生效了。
+        """
+        if value is None or isinstance(value, dict):
+            return value or {}
+        if isinstance(value, str):
+            raw = value.strip()
+            if not raw:
+                return {}
+            return json.loads(raw)
+        return value
 
 
 @lru_cache

@@ -7,7 +7,8 @@ from __future__ import annotations
 
 import pytest
 
-from app.services import codec, dynconf
+from app.services import dynconf
+from tests.conftest import AUTH, stored_body
 
 ADMIN = {"X-Admin-Key": "admin-secret"}
 
@@ -231,16 +232,23 @@ async def test_rate_limit_reads_dynconf(client, patch_redis, test_settings):
 
 
 async def test_task_detail_never_leaks_secrets(admin_client, task_store, patch_redis):
-    """脱敏纪律不因为是管理面就放松：不返回 sk、不返回请求体与结果原文。"""
+    """脱敏纪律不因为是管理面就放松：不返回 sk、不返回请求体与结果原文。
+
+    同时守一条新增的边界：``private_data`` 里若被宿主写了渠道 ``key``
+    （Gemini/Vertex 渠道会写），管理面也绝不吐出去——那是 new-api 自己都
+    标了 ``json:"-"`` 的字段。这里用一条任务同时验证 data 与 private 两侧。
+    """
     from app.services import tokensession
 
     task_id = "img_" + "1" * 32
     await task_store.create(task_id, "/x", {
         "token_hash": "th", "model": "dall-e-3",
-        "request_body": codec.encode(b'{"prompt":"top secret prompt"}'),
-        "upstream_response": codec.encode(b'{"url":"https://cdn/secret.png"}'),
+        **stored_body("request_body", b'{"prompt":"top secret prompt"}'),
+        **stored_body("upstream_response", b'{"url":"https://cdn/secret.png"}'),
         "response_bytes": 33,
     })
+    # 模拟宿主往 private_data 写渠道密钥（new-api 原生行为）
+    task_store.rows[task_id]["private_data"] = {"key": "sk-upstream-chan-secret"}
     await tokensession.store(task_id, "sk-test-token")
 
     resp = admin_client.get(f"/admin/api/tasks/{task_id}", headers=ADMIN)
@@ -249,6 +257,7 @@ async def test_task_detail_never_leaks_secrets(admin_client, task_store, patch_r
     assert "sk-test-token" not in text
     assert "top secret prompt" not in text
     assert "secret.png" not in text
+    assert "sk-upstream-chan-secret" not in text
     assert resp.json()["token_session"]["exists"] is True
     assert resp.json()["response_bytes"] == 33
 
@@ -370,3 +379,88 @@ def test_job_trigger(admin_client):
 def test_unknown_job_404(admin_client):
     assert admin_client.post("/admin/api/jobs/nope",
                              headers=ADMIN).status_code == 404
+
+
+# ---------------------------------------------------------------------------
+# 调度视图（PRD R-21）
+# ---------------------------------------------------------------------------
+
+
+def test_schedule_view_requires_admin(admin_client):
+    """调度视图含归组键（可能带 token 指纹），**不得**对用户面开放。"""
+    assert admin_client.get("/admin/api/schedule").status_code == 401
+    assert admin_client.get(
+        "/admin/api/schedule", headers=AUTH).status_code == 401
+
+
+async def test_schedule_view_reports_planned_batches_and_requeue(
+    admin_client, task_store, patch_redis
+):
+    """三类等待必须各归各位：等时刻 / 等凑批 / 等槽。
+
+    这条用例同时是「不加新功能就把孤儿函数接上」的验收：调度视图的数据源
+    就是此前无人调用的 ``batching.stats`` 与 ``dispatch.stats``。
+    """
+    from app.services import dispatch, taskstore
+
+    now = taskstore.now()
+    # 计划中（延迟未到点），落在一个明确的小时桶里
+    await task_store.create("dl_" + "1" * 32, "/x", {
+        "token_hash": "th", "model": "m", "batch_state": "scheduled",
+        "scheduled_at": now + 7200,
+    })
+    # 等待凑批的批次成员
+    await task_store.create("img_" + "2" * 32, "/v1/images/generations", {
+        "token_hash": "th", "model": "m", "slot_model": "m", "slot_flags": 0,
+        "batch_state": "waiting", "batch_size": 5, "batch_wait": 60,
+        "batch_due_at": now + 60,
+    })
+    from app.services import batching
+
+    await batching.join("img_" + "2" * 32, "m", batch_size=5, batch_wait=60)
+    # 等待槽的重排任务
+    await dispatch.requeue("img_" + "2" * 32, backoff_ceiling=60)
+
+    resp = admin_client.get("/admin/api/schedule", headers=ADMIN)
+    assert resp.status_code == 200
+    body = resp.json()
+
+    assert body["planned_total"] == 1
+    assert body["planned_by_hour"], "按小时分桶不得为空"
+    bucket = body["planned_by_hour"][0]
+    assert bucket["bucket"] % 3600 == 0, "桶边界必须对齐整小时"
+    assert bucket["count"] == 1
+    assert any(b["key"] == "m" for b in body["batches"])
+    assert body["requeue_pending"] >= 1
+
+
+async def test_slot_watermark_reports_in_flight_and_limit(
+    admin_client, task_store, patch_redis
+):
+    """AC-62：按 (模型, token) 给出在途占用与上限。
+
+    两处最容易做错的地方：
+    1. ``in_flight`` 必须只数**真正持第二层**的任务——等待期任务掩码为 0，
+       若按「活跃行数」统计就会显示「明明满了其实空闲」；
+    2. 必须同时给 ``limit``，否则「满了」这个结论无从判断。
+    """
+    await task_store.create("img_" + "7" * 32, "/v1/images/generations", {
+        "token_hash": "th-abc", "model": "dall-e-3", "slot_model": "dall-e-3",
+        "slot_flags": 0b011,          # 占了第一层 + 第二层
+    })
+    # 等待期任务：不该被算进第二层占用
+    await task_store.create("img_" + "8" * 32, "/v1/images/generations", {
+        "token_hash": "th-abc", "model": "dall-e-3", "slot_model": "dall-e-3",
+        "slot_flags": 0, "batch_state": "waiting",
+    })
+
+    resp = admin_client.get("/admin/api/slots", headers=ADMIN)
+    assert resp.status_code == 200
+    row = next(r for r in resp.json()["slots"] if r["token_hash"] == "th-abc")
+    assert row["in_flight"] == 1, "等待期任务不得被算成在途占用"
+    assert row["model"] == "dall-e-3"
+    assert "limit" in row and "global_limit" in row
+
+
+def test_slot_watermark_requires_admin(admin_client):
+    assert admin_client.get("/admin/api/slots").status_code == 401

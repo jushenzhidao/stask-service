@@ -192,6 +192,44 @@ async def notify_task(task_id: str, attempt: int = 1,
     return await deliver(task_id, attempt)
 
 
+@broker.task
+async def release_batch(model: str, source: str = "batch",
+                        _context: Context = TaskiqDepends()) -> dict:
+    """放行一个模型的整批任务（N 触发 / T 触发 / 人工放行共用）。
+
+    N 触发时 web 侧只 ``kiq`` 这个任务就返回 202——**绝不在提交响应里同步
+    放行整批**：一批 500 条的放行要做 500 次 DB 条件更新加 500 次占槽 EVAL，
+    压在第 500 个提交者的响应延迟里，等于让最后一个提交的人替所有人付账。
+
+    重复投递无害：``batching.claim`` 的原子摘取保证只有一方拿到成员，
+    后到的那次拿到空列表直接返回。
+    """
+    from app.services.batching import release_model
+
+    return await release_model(model, source=source)
+
+
+@broker.task(schedule=[{"cron": "* * * * *"}])
+async def tick_batches(_context: Context = TaskiqDepends()) -> dict:
+    """每分钟：T 触发 + 占槽失败重排的到期扫描。
+
+    cron 的最小粒度是 1 分钟，而 ``batch_wait`` 允许配到秒级——所以本任务
+    内部**自旋多轮**（每轮间隔 ``_TICK_INTERVAL`` 秒），把有效扫描频率提到
+    亚分钟级。这是为了让 ``batch_wait=30`` 这类配置的实际放行延迟不被
+    cron 粒度放大到「最坏 +60s」。
+
+    自旋总时长略短于一分钟，避免与下一轮 cron 叠在一起跑。
+
+    **不在这里判 ``batch_enabled``**：本任务同时驱动「批次 T 触发」与「到期
+    通道（计划任务到点 / 占槽失败重排）」，后者与攒批无关。在这个入口一刀
+    切掉等于「关攒批止血」会连延迟任务与重排一起停掉。止血开关的去处在
+    ``batching.tick_once`` 内部，那里只精确地跳过批次放行那一段。
+    """
+    from app.services.batching import tick
+
+    return await tick()
+
+
 @broker.task(schedule=[{"cron": "*/2 * * * *"}])
 async def sweep_stale(_context: Context = TaskiqDepends()) -> dict:
     """每 2 分钟：卡死任务收敛（消息丢失重投 / 派发后失联判死）。
@@ -249,6 +287,11 @@ async def sweep_results(_context: Context = TaskiqDepends()) -> dict:
 
 async def publish_execute(task_id: str) -> None:
     await execute_task.kiq(task_id)
+
+
+async def publish_release_batch(model: str, source: str = "batch") -> None:
+    """N 触发的放行入口：只投递，不在请求线程里做整批放行。"""
+    await release_batch.kiq(model, source)
 
 
 async def publish_notify(task_id: str, attempt: int = 1, delay_seconds: int = 0) -> None:

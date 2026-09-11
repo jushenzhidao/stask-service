@@ -21,10 +21,13 @@ from app.logging import log
 from app.schemas import QUEUED, SubmitPlan
 from app.services import (
     admission,
+    batching,
     codec,
     dynconf,
     flow,
+    schedule,
     submit,
+    taskstore,
     upstream,
 )
 from app.services.admission import AdmissionError
@@ -94,6 +97,35 @@ async def submit_task(path: str, request: Request) -> Response:
     # 一次请求只取一次快照，后续判定全部复用（body 上限可在管理页热改）
     config = await dynconf.get_runtime_config()
 
+    # 调度头（X-Delay-Seconds / X-Execute-After，均可选、互斥）。
+    # 在落库前就判超限：超出令牌 TTL 容量的延迟是**必然失败**的任务，
+    # 提前拒掉才不会留下一条注定判死的行。
+    try:
+        scheduled_at = schedule.parse(
+            request.headers,
+            now=taskstore.now(),
+            max_delay=schedule.resolve_max_delay(config.max_delay_seconds),
+        )
+    except schedule.ScheduleError as exc:
+        raise HTTPException(
+            exc.status,
+            error_body(exc.message, "invalid_request_error",
+                       code=exc.code, param=exc.param),
+        ) from exc
+
+    # 分批头（X-Batch-Size / X-Batch-Wait / X-Batch-Key，均可选）。
+    # 归组维度与上限都在服务端裁定，客户端只能声明意图。
+    try:
+        overrides = batching.parse_overrides(
+            request.headers, max_wait=config.max_batch_wait_seconds,
+        )
+    except batching.BatchParamError as exc:
+        raise HTTPException(
+            exc.status,
+            error_body(exc.message, "invalid_request_error",
+                       code=exc.code, param=exc.param),
+        ) from exc
+
     body = await request.body()
     if len(body) > config.body_max_bytes:
         raise HTTPException(
@@ -112,6 +144,11 @@ async def submit_task(path: str, request: Request) -> Response:
 
     task_id = new_task_id(model_slug(model), caller.token_hash, idem_key)
 
+    # 落库形态：小体明文（可直接 SQL 查看），超阈值或二进制才 gzip+base64
+    stored_body, body_encoding = (
+        codec.encode(body, config.plain_max_bytes) if body else ("", "")
+    )
+
     plan = SubmitPlan(
         task_id=task_id,
         token_hash=caller.token_hash,
@@ -121,11 +158,16 @@ async def submit_task(path: str, request: Request) -> Response:
         path=upstream_path,
         query=query,
         headers=headers,
-        body_b64=codec.encode(body) if body else "",
+        body=stored_body,
+        body_encoding=body_encoding,
         body_truncated=False,
         upstream_base_url=upstream_base,
         idempotency_key=idem_key,
         callback_url=callback_url,
+        scheduled_at=scheduled_at,
+        batch_size=overrides.size,
+        batch_wait=overrides.wait,
+        batch_key=overrides.key,
     )
 
     async def enqueue(tid: str) -> None:
@@ -134,7 +176,7 @@ async def submit_task(path: str, request: Request) -> Response:
         await publish_execute(tid)
 
     try:
-        task_id, replayed = await submit.submit(
+        result = await submit.submit(
             caller.raw_token, plan, enqueue=enqueue, config=config,
         )
     except submit.SubmitConflict as exc:
@@ -145,10 +187,31 @@ async def submit_task(path: str, request: Request) -> Response:
             headers={"Retry-After": str(await submit.retry_after_seconds(config))},
         ) from exc
 
+    # 幂等回放必须回报**原始**排期，不得因本次请求的调度头而重新排期
+    # （AC-60）：否则同一个 Idempotency-Key 二次提交会悄悄改掉执行时刻。
+    task_id, replayed = result.task_id, result.replayed
+    stored: dict = {}
+    if replayed:
+        # 幂等回放回报**原始**状态：本次请求带的调度头/分批头一律不生效
+        # （AC-60），所以要回头读库里那一行而不是用本次算出的值。
+        existing = await taskstore.get_meta(task_id)
+        stored = (existing or {}).get("data") or {}
+        scheduled_at = int(stored.get("scheduled_at") or 0)
+
     location = f"/async{upstream_path}/{task_id}"
     return JSONResponse(
         status_code=202,
-        content={"task_id": task_id, "status": QUEUED, "replayed": replayed},
+        content={
+            "task_id": task_id,
+            "status": QUEUED,
+            "created_at": taskstore.now(),
+            "scheduled_at": scheduled_at,
+            "batch_key": stored.get("batch_key", "") or result.batch_key,
+            # 与查询视图同口径：内部状态名不外漏（PRD R-20）
+            "batch_state": batching.public_batch_state(
+                stored.get("batch_state", "") or result.batch_state),
+            "replayed": replayed,
+        },
         headers={"Location": location},
     )
 

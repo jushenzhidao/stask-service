@@ -80,7 +80,7 @@
 
 | Method | Path | 功能 | 认证 | 请求 | 响应 |
 |---|---|---|---|---|---|
-| POST/PUT | `/async/{path:path}` | 提交任务 | Bearer sk | 原文 path/query/body；头 `Idempotency-Key`、`X-Callback-Url` | `202 {task_id,status,created_at}` + `Location` |
+| POST/PUT | `/async/{path:path}` | 提交任务 | Bearer sk | 原文 path/query/body；头 `Idempotency-Key`、`X-Callback-Url`、`X-Delay-Seconds`、`X-Execute-After`、`X-Batch-Size`、`X-Batch-Wait`、`X-Batch-Key` | `202 {task_id,status,created_at,scheduled_at,batch_key,batch_state,replayed}` + `Location` |
 | GET | `/async/{path:path}` （末段为 task_id） | 查询/回放 | 无（task_id 即凭证） | `?wait=0..60` | `202` 进行中 / `200` 原生回放 / 重放上游错误码 |
 | DELETE | `/async/{path:path}` （末段为 task_id） | 取消 | 无 | - | `200 {task_id,status:CANCELED}` / `409` |
 | GET | `/healthz/live` | 存活探针 | 无 | - | `200 {"status":"ok"}` |
@@ -135,8 +135,24 @@
 | `dispatch_epoch` | int | 派发轮次，防重投观测 |
 | `reconcile_pending` | bool | 超时标记，对账扫描依据 |
 | `reconcile_checked_at` | int | 上次对账时间（秒） |
+| `scheduled_at` | int | 计划执行时刻（unix 秒）；`0` = 无延迟。延迟任务保持 `QUEUED`，等待期不占槽；同时是 sweeper 豁免与生命期计时口径的依据 |
+| `batch_state` | str | `""` / `immediate` / `scheduled`（延迟未到点）/ `waiting`（批次成员或等槽）/ `releasing` / `released` |
+| `batch_size` / `batch_wait` | int | 生效的 N/T（客户端头覆盖后的值，非策略原值） |
+| `batch_key` | str | 批次归组键，`""` = 未使用 |
+| `slot_flags` | int | 三层槽占位掩码（1=token / 2=(模型,token) / 4=模型全局）。**释放的唯一依据**，绝不按当前配置重算 |
+| `slot_model` | str | 占槽用的归一化模型名。占与释放必须同一字符串 |
 
-状态机：`SUBMITTED → IN_PROGRESS → SUCCESS / FAILURE / CANCELED`。无 QUEUED、无 HELD、无孤儿判死。
+> 注：本表仍保留 `freeze_amount` / `settled` / `inflight_slot` / `reconcile_*` 等
+> **已不存在的字段**（v0.3 去计费化后移除，占槽标记改为 `slot_flags` 掩码）。
+> 本表待一次完整对齐；新增字段请以上方几行为准。
+
+延迟/定时下发（`X-Delay-Seconds` / `X-Execute-After`）的完整需求与验收线见
+`docs/PRD-scheduling-and-concurrency.md`（R-01~R-13 / AC-37~AC-45），架构裁决见
+`docs/ARCH-scheduling-and-concurrency.md`。要点：等待期不占并发槽（R-04）、
+兜底扫描豁免未到点任务（R-05）、生命期起点取 `max(created_at, scheduled_at)`（R-06）、
+延迟上限由令牌 TTL 反推（超限在提交时即 `400 delay_too_long`）。
+
+状态机：`QUEUED → IN_PROGRESS → SUCCESS / FAILURE / CANCELED`。无 HELD、无孤儿判死；计划任务与批次成员**不引入新状态**，一律保持 `QUEUED`（等待期天然可取消）。
 
 ---
 
@@ -204,6 +220,146 @@
 - `?wait` 上限 60s，必须 < nginx `proxy_read_timeout`（样例 65s）。
 - 不支持流式响应、不支持 GET 型生成接口任务化。
 - 性能目标：提交链路 P99 < 80ms（不含 billing RTT），单 worker 并发 64。
+
+---
+
+## 10.1 如何开启攒批（运维速查）
+
+攒批是**可选**能力：不配置时所有任务保持「收到即发」，与改造前完全一致。
+开启方式有两条，可以叠加。
+
+### 方式 A：服务端策略（推荐，对客户端透明）
+
+**某个模型要开启攒批，就必须在模型策略表 `model_policies` 里给它写一条**——
+没有单独的「开启」布尔位，**`batch >= 2` 本身就是开关**。没写到的模型一律
+`batch=0`（不攒批、收到即发）。
+
+```bash
+# 热改，5 秒内对新提交生效；校验失败整批拒绝并 400
+curl -X PUT "$BASE/admin/api/config" \
+  -H "X-Admin-Key: $ADMIN_KEY" -H 'Content-Type: application/json' \
+  -d '{"model_policies": {"dall-e-3": {"batch": 10, "batch_wait": 60}}}'
+```
+
+> **坑：`model_policies` 是整表替换，不是按模型合并。**
+> 配置存在 Redis 的一个 hash 字段里（值是一整个 JSON 串），写入即覆盖该字段。
+> 因此**给第二个模型开启时，必须把已有条目一起带上**，否则第一个模型的策略会被
+> 静默清掉——它不再攒批、也不再受并发上限约束，而请求侧毫无异常，没人会发现。
+>
+> 安全做法：先 GET 现表 → 本地改 → 整表 PUT。
+>
+> ```bash
+> # 1) 读出当前生效值
+> curl -s "$BASE/admin/api/config" -H "X-Admin-Key: $ADMIN_KEY" \
+>   | jq '.groups[].items[] | select(.key=="model_policies") | .value'
+> # 2) 把已有条目和新条目合并后整表写回
+> curl -X PUT "$BASE/admin/api/config" -H "X-Admin-Key: $ADMIN_KEY" \
+>   -H 'Content-Type: application/json' \
+>   -d '{"model_policies": {"dall-e-3": {"batch":10,"batch_wait":60},
+>                            "sora":     {"batch":5, "batch_wait":30}}}'
+> ```
+>
+> 这条语义有测试钉着：`test_dynconf_hotreload.py::test_model_policies_write_replaces_whole_table`。
+
+策略表的键支持三种写法，**按优先级从高到低**命中一个：
+
+| 键写法 | 含义 | 例 |
+|---|---|---|
+| 模型名 | 精确匹配归一化后的模型名 | `"dall-e-3"` |
+| 端点前缀（以 `/` 开头） | 最长前缀匹配 | `"/v1/images"` |
+| `__default__` | 兜底，仅在以上都没命中时用 | `"__default__"` |
+
+可用字段（写侧逐项校验，越界/拼错/非法 JSON 一律整批拒绝）：
+
+| 字段 | 含义 | 范围 |
+|---|---|---|
+| `batch` | 攒够多少条放行（N） | 0–1000（`0`/`1` = 不攒批） |
+| `batch_wait` | 最长等待秒数（T） | 1–3600，且须满足下方 TTL 约束 |
+| `limit_per_token` | 该 token 总在途上限 | 0–10000（`0` = 回落 `MAX_SLOTS`） |
+| `limit_model_token` | (模型, token) 上限。**`>0` 即强制排队** | 0–10000 |
+| `limit_global` | 模型全局上限（多 key 合计不超发的唯一保证） | 0–10000 |
+
+两条硬约束（写侧会拦，报 400）：
+
+1. **`batch >= 2` 必须同时给 `batch_wait`** —— 否则「只发了 3 条却声明 N=100」
+   的批次可能永远等不到放行。
+2. **`batch_wait + 执行时长 + 余量 ≤ SK_SESSION_TTL_SECONDS`** —— 令牌只在 Redis
+   且绝不落库，等过头 = 到点取不到令牌 = 100% `token_missing` 失败。
+   这条比「任务最大生命期」更紧，是等待时长的真天花板（当前 TTL 7h ⇒ 上限约 6.8h）。
+
+### 方式 B：客户端请求头（逐请求，无需服务端配置）
+
+| 头 | 含义 | 非法时 |
+|---|---|---|
+| `X-Batch-Size: N` | 期望批量 | 非正整数 / 超 1000 → 400 `invalid_batch_size` |
+| `X-Batch-Wait: T` | 最长等待秒 | 超 `MAX_BATCH_WAIT_SECONDS`(默认 300) → 400 `batch_wait_too_long` |
+| `X-Batch-Key: <≤64>` | 显式归组键（可跨模型混批） | 超长**截断不报错**；非法字符替换为 `_` |
+
+`X-Batch-Size` **可以单独开启攒批**（即使服务端没配策略）——这是「客户端主动要求
+凑批」的正当用法。只给 N 不给 T 时，T 自动兜底为 `MAX_BATCH_WAIT_SECONDS`
+（AC-57：不得无限等待）。逐字段覆盖：只声明 N 时 T 仍取服务端策略值。
+
+### 总开关与「谁来决定是否攒批」
+
+`BATCH_ENABLED`（热改项 `batch_enabled`）**默认就是 `true`**——它是**允许**攒批，
+不是**启用**攒批。实际是否攒批由两层决定，任一层不满足就不攒批：
+
+| 层 | 谁控制 | 怎么算作「要攒批」 |
+|---|---|---|
+| 总开关 | 运维（配置中心热改，或 env） | `batch_enabled = true`（默认） |
+| 逐模型/逐请求 | 配置中心策略 **或** 客户端请求头 | 策略 `batch >= 2`（或 `limit_model_token/limit_global > 0`）；客户端 `X-Batch-Size >= 2` |
+
+所以：**总开关保持开着**，是否攒批交给「配置中心的模型策略」或「客户端参数」。
+只有线上需要全局止血时才把 `batch_enabled` 关掉（此时客户端头也开不起来）。
+
+### 归组维度
+
+批次归组键默认按**归一化模型名**（`BATCH_GROUP_BY=model`）——跨 token 合并、
+批次更大、N 更容易触发。另一种是 `token_model`（按 `token_hash + model`，
+与并发维度对齐，但每个 token 各自成批、批次显著变小）。两者都不改变
+「放行时各自占各自 token 的槽」这一事实。详见 ARCH §6 Q5 注。
+
+### 验证是否生效
+
+```bash
+curl -s "$BASE/admin/api/schedule" -H "X-Admin-Key: $ADMIN_KEY" | jq
+# batches[]     : 当前每个批次的归组键、成员数、剩余等待秒
+# planned_by_hour: 计划中任务（延迟未到点）按小时分桶
+# requeue_pending: 等槽重排的积压量
+```
+
+提交后看 202 响应的 `batch_state`：`waiting` = 在批次里等 N/T，
+`""` = 未参与批次（`batch_key` 同时为空）。
+
+### 紧急止血
+
+```bash
+# 全局关闭攒批（热改，5 秒内生效）
+curl -X PUT "$BASE/admin/api/config" -H "X-Admin-Key: $ADMIN_KEY" \
+  -H 'Content-Type: application/json' -d '{"batch_enabled": false}'
+```
+
+关闭后的精确行为（**开关语义是精确的，只停它该停的那件事**）：
+
+| 对象 | 行为 |
+|---|---|
+| 新提交的任务 | 不再入批，回到「收到即发」（除非策略里还有分层上限要排队） |
+| 已在等待的批次成员 | 不再由 T 触发整批放行；约 2 分钟内被兜底扫描 `sweep_stale` **逐条**放行——仍会执行，只是不再成批 |
+| **延迟任务** | **不受影响**，照常在 `scheduled_at` 到点放行 |
+| **占槽失败的退避重排** | **不受影响**，照常重试 |
+
+后两行是刻意的：批次 T 触发与到期通道共用同一个 ticker（实现复用），但语义无关。
+早前止血开关是在 ticker 入口一刀切，会把延迟任务与重排一起停掉——而延迟任务在
+等待期被 sweeper 豁免（不能重投也不能判死），没有第二条恢复路径，只能等超龄判死。
+现在开关只在 `batching.tick_once` 内部跳过批次放行那一段。
+
+止血开关只有**一个**事实源：热改白名单里的 `batch_enabled`（不再有第二个读 env 的
+判定点——同一开关两套语义会让「管理面止血」与「改 env 止血」效果不同）。
+
+### 版本锚定
+
+- 攒批 N/T 双触发：`batching` 模块；放行单点 `dispatch.release`（占槽唯一位置）
+- 批次索引（`st:batch:*`）丢失由 `sweep_stale` 每 2 分钟按 DB 事实重建
 
 ---
 

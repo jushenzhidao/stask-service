@@ -30,14 +30,23 @@ from app.schemas import (
     TERMINAL,
 )
 from app.services import codec, dynconf, slots, statuscache, taskstore, tokensession
+from app.services.batching import public_batch_state
 from app.services.dynconf import RuntimeConfig
 
 
 def _view(task: dict) -> dict:
+    data = task.get("data") or {}
     return {
         "task_id": task["task_id"],
         "status": task["status"],
         "created_at": task.get("created_at", 0),
+        # 调度/批次是增量字段：未使用时为 0 / 空串，既有字段语义不变。
+        # 客户端据此区分「排队中」与「计划中」。
+        "scheduled_at": int(data.get("scheduled_at") or 0),
+        "batch_key": str(data.get("batch_key") or ""),
+        # 内部状态名不外漏（PRD R-20 只允许 waiting/released/""）：
+        # `immediate` 非空会让客户端误以为自己在等一个批次
+        "batch_state": public_batch_state(str(data.get("batch_state") or "")),
     }
 
 
@@ -48,7 +57,8 @@ def _replay(task: dict, config: RuntimeConfig) -> Response:
     task_id 写错了；410 明确表达「任务存在过、结果已过期」。
     """
     data: dict = task.get("data") or {}
-    encoded = str(data.get("upstream_response") or "")
+    stored = str(data.get("upstream_response") or "")
+    encoding = str(data.get("upstream_response_encoding") or "")
     upstream_status = int(data.get("upstream_status") or 0)
     content_type = str(data.get("upstream_content_type") or "application/json")
 
@@ -57,7 +67,7 @@ def _replay(task: dict, config: RuntimeConfig) -> Response:
     if task["status"] == CANCELED:
         return JSONResponse(status_code=200, content=_view(task))
 
-    if not encoded:
+    if not stored:
         if data.get("result_purged"):
             return JSONResponse(
                 status_code=410,
@@ -78,7 +88,7 @@ def _replay(task: dict, config: RuntimeConfig) -> Response:
         )
 
     try:
-        raw = codec.decode(encoded)
+        raw = codec.decode(stored, encoding)
     except ValueError as exc:
         log.error("replay decode failed: task_id={} err={}", task["task_id"], exc)
         return JSONResponse(
@@ -185,9 +195,33 @@ async def cancel(task_id: str) -> JSONResponse:
             409, f"task advanced before cancel: {latest['status'] if latest else 'unknown'}"
         )
 
-    token_hash = str((task.get("data") or {}).get("token_hash") or "")
-    if token_hash:
-        await slots.release(token_hash)
+    data: dict = task.get("data") or {}
+    # 等待期任务从未占过槽（掩码 0），release_for_task 什么都不做——
+    # 这正是 R-07 要求的「取消不得释放未占用的槽」。若这里无条件还第一层，
+    # 就会还掉同 token 其他在途任务的槽。
+    await slots.release_for_task(data)
+
+    if int(data.get("scheduled_at") or 0) > 0:
+        # 计划任务必须从到期索引摘掉：留着的话 ticker 每轮都会把它捞出来，
+        # 虽然 dispatch.release 会因非 QUEUED 而 SKIPPED（不会误执行），
+        # 但每次多一轮无用的 DB 读，且日志里持续出现「该放却没放」的噪音。
+        from app.services import dispatch
+
+        await dispatch.unschedule(task_id)
+    elif data.get("batch_state") == "waiting":
+        # 攒批等待期被取消：必须从批次计数里摘掉自己。留着的话这一条永远
+        # 凑数但永远不会被放行执行——一批声明 N=100 而其中 5 条被取消，计数
+        # 就永远差 5 条到不了 N，只能干等 T 兜底，等待时长凭空变长。
+        #
+        # 退批必须用**落库的归组键**（batch_key），不能用模型名：客户端可能用
+        # X-Batch-Key 指定了别的维度，用模型名会去删另一个批次的成员——本批
+        # 计数不减、另一个批次被误删成员。
+        from app.services import batching
+
+        key = str(data.get("batch_key") or "") or str(
+            data.get("slot_model") or "")
+        await batching.leave(task_id, key)
+
     await tokensession.clear(task_id)
 
     log.info("task canceled: task_id={}", task_id)

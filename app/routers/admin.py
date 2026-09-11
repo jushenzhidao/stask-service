@@ -69,6 +69,75 @@ async def overview(
     return data
 
 
+@router.get("/api/slots")
+async def slot_watermark(
+    limit: int = Query(50, ge=1, le=500),
+    _: None = Depends(require_admin),
+) -> dict:
+    """按 (模型, token) 的在途占用与上限 Top N（PRD R-22 / AC-62）。
+
+    回答的是运维最常问的那个问题：「闸门到底是满的还是坏的」。
+
+    两个字段必须同时给，缺一个就会误判：
+    - ``in_flight`` 来自 tasks 表的掩码谓词（**只数真正持该层**的任务，见
+      ``SQL_HOLDS_LAYER2``）；若按「活跃行数」统计，等待期任务会被算成占用，
+      于是「看起来满了」而实际是空闲；
+    - ``limit`` 来自当前策略快照。它与 ``in_flight`` 的口径必须来自同一套
+      语义，否则「满了」这个结论无从判断。
+
+    同时回 ``global`` 一层：第二层没满而第三层满了是**跨 token 的**饱和，
+    只看 (模型, token) 会得出「明明没人用却是 429」的错觉。
+
+    管理面才看得到 token_hash（与 ``/ops`` 只给调用者自己的占用不同）——
+    PRD §4.4 明确要求按 (模型, token) 列出，那必然要跨 token。
+    """
+    from app.services import modelpolicy
+
+    usage = await taskstore.active_counts_by_model_token()
+    policies = await dynconf.get_model_policies()
+    cfg = await dynconf.get_runtime_config()
+
+    rows: list[dict[str, Any]] = []
+    for (token_hash, model), in_flight in usage.items():
+        policy = modelpolicy.resolve(
+            model=model, policies=policies,
+            default_limit_per_token=cfg.max_slots,
+        )
+        rows.append({
+            "token_hash": token_hash,
+            "model": model,
+            "in_flight": in_flight,
+            "limit": policy.limit_model_token,
+            "global_limit": policy.limit_global,
+            "source": policy.source,
+        })
+    rows.sort(key=lambda r: (-r["in_flight"], r["model"], r["token_hash"]))
+    return {"slots": rows[:limit], "total": len(rows)}
+
+
+@router.get("/api/schedule")
+async def schedule_overview(_: None = Depends(require_admin)) -> dict:
+    """调度视图（PRD R-21）：计划中任务（按小时分桶）+ 等待中批次 + 重排积压。
+
+    **必须挂在管理面，不能挂用户面的 ``/ops``**：批次归组键在
+    ``token_model`` 维度下含 token_hash 前缀、也可能是客户端自定义串，
+    暴露给任意已鉴权调用者等于泄露别人家的 key 指纹。管理面才看得到全局面貌。
+
+    三类数据合在一个端点：运维判断「系统是不是在等」时，这三者是同一个问题的
+    三个侧面（等时刻 / 等凑批 / 等槽），分开看会来回切页面。
+    """
+    from app.services import batching, dispatch
+
+    now = taskstore.now()
+    planned = await taskstore.scheduled_overview(now)
+    return {
+        "planned_by_hour": planned,
+        "planned_total": sum(item["count"] for item in planned),
+        "batches": (await batching.stats())["batches"],
+        "requeue_pending": (await dispatch.stats())["requeue_pending"],
+    }
+
+
 @router.get("/api/tasks")
 async def list_tasks(
     status: str = Query("", pattern="^(QUEUED|IN_PROGRESS|SUCCESS|FAILURE|CANCELED)?$"),
@@ -99,11 +168,20 @@ async def list_tasks(
 
 @router.get("/api/tasks/{task_id}")
 async def task_detail(task_id: str, _: None = Depends(require_admin)) -> dict:
-    """单任务详情（脱敏，走 ``get_meta`` 元数据投影，不拉结果体大字段）。"""
+    """单任务详情（脱敏，走 ``get_meta`` 元数据投影，不拉结果体大字段）。
+
+    ``fail_reason`` 现在带上游的具体错误消息（``upstream 400: <message>``），
+    看板不必再让人回 DB 解 ``upstream_response`` 才知道为什么失败。
+
+    ``artifacts`` / ``result_url`` 是产出侧的事实；``private_result_url``
+    是写进 new-api 原生 ``private_data`` 列的那一份——两者应当一致，
+    不一致就说明终态落库时 private 补丁没写上（宿主看板会显示不出结果）。
+    """
     task = await taskstore.get_meta(task_id)
     if task is None:
         raise HTTPException(404, "task not found")
     data: dict = task.get("data") or {}
+    private: dict = task.get("private_data") or {}
     return {
         "task_id": task["task_id"],
         "status": task["status"],
@@ -122,12 +200,20 @@ async def task_detail(task_id: str, _: None = Depends(require_admin)) -> dict:
         "upstream_status": data.get("upstream_status", 0),
         "upstream_content_type": data.get("upstream_content_type", ""),
         "response_bytes": data.get("response_bytes", 0),
+        "response_encoding": data.get("upstream_response_encoding", ""),
+        "request_body_encoding": data.get("request_body_encoding", ""),
         "result_purged": bool(data.get("result_purged", False)),
         "body_truncated": bool(data.get("body_truncated", False)),
         "dispatch_epoch": data.get("dispatch_epoch", 0),
         "idempotency_key": data.get("idempotency_key", ""),
         "callback_url": data.get("callback_url", ""),
         "callback_delivered": data.get("callback_delivered"),
+        # 产出侧
+        "artifacts": data.get("artifacts", []),
+        "artifact_count": data.get("artifact_count", 0),
+        "artifact_parser": data.get("artifact_parser", ""),
+        "result_url": data.get("result_url", ""),
+        "private_result_url": private.get("result_url", ""),
         "slots_in_use": await slots.current(str(data.get("token_hash") or "")),
         "token_session": await tokensession.session_info(task_id),
     }
