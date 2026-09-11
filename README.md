@@ -190,8 +190,37 @@ curl -X POST "$BASE/admin/api/config/reset" \
 ### 不改服务端配置的旁路
 
 客户端可用请求头**逐请求**开启/覆盖攒批，无需动策略表：
-`X-Batch-Size`（N，可单独开启攒批）、`X-Batch-Wait`（T，上限
-`MAX_BATCH_WAIT_SECONDS`）、`X-Batch-Key`（≤64，显式归组键，可跨模型混批）。
+
+| 头 | 作用 | 备注 |
+|---|---|---|
+| `X-Batch-Size: N` | 声明批量（N），**可单独开启攒批** | 只给 N 不给 T 时，T 兜底为 `MAX_BATCH_WAIT_SECONDS` |
+| `X-Batch-Wait: T` | 声明最长等待（T） | 超 `MAX_BATCH_WAIT_SECONDS` → 400 `batch_wait_too_long` |
+| `X-Batch-Key: <≤64>` | **批次的名字**：决定「谁和谁算同一批」 | **不改变 N/T，也不是攒批开关**；可强制跨模型混批 |
+
+`X-Batch-Key` 的用法与坑：
+
+```bash
+# 默认（不带 Key）：按模型名归组 —— 同模型的**所有**请求（含其他 token）进同一批
+curl -X POST "$BASE/async/v1/images/generations" ... \
+  -d '{"model":"doubao-seedream-5-0-pro-260628", ...}'
+#   → 202 {"batch_key":"doubao-seedream-5-0-pro-260628","batch_state":"waiting"}
+
+# 带 Key：自成一档，与别人的流量互不干扰（批量与放行时刻只和自己人凑）
+curl -X POST "$BASE/async/v1/images/generations" ... \
+  -H 'X-Batch-Key: order-20260911-a' \
+  -d '{"model":"doubao-seedream-5-0-pro-260628", ...}'
+#   → 202 {"batch_key":"order-20260911-a","batch_state":"waiting"}
+```
+
+- **头名必须用连字符**：`X_Batch_Key` 会被 nginx 按默认 `underscores_in_headers off` 整条丢弃，
+  表现为「头不生效」（服务端按默认维度归组，`batch_key` 回落成模型名）
+- **键值建议只用 ASCII**：白名单是 `A-Za-z0-9._:-`，其余字符（含中文）一律替换成 `_`——
+  不同的中文键可能归一到同一个下划线串而**意外合并**
+- 键名是**公开且无鉴权**的：谁知道这个字符串谁就能进同一批，别用 `batch1` 这类可猜名，
+  建议带上业务前缀与日期/租户标识
+- 它能解决什么：①自己的请求不被别人的流量「带跑」或「拖住」；②同一 Key 下不同模型可混批，
+  把一次业务动作产生的多个请求对齐下发
+
 完整语义见 [`docs/SPEC.md`](docs/SPEC.md) §10.1。
 
 ---
