@@ -77,9 +77,21 @@ def setup_logging() -> None:
     if observability.is_configured():
         import logfire
 
-        logger.add(**logfire.loguru_handler())
+        # level 必须显式给：logfire.loguru_handler() 只返回
+        # ``{'sink':…, 'format':'{message}'}``，**不带 level**，而 loguru 的
+        # ``add()`` 默认 level=0 —— 等于把 DEBUG 全量送去 logfire。实测后果：
+        # redis-py 每次建连的 ``Failed to enable maintenance notifications``
+        # （DEBUG）会出现在 logfire 看板上，而 stderr 那边被 LOG_LEVEL 挡着
+        # 看不见，形成"同一行日志两个地方不一样"的错觉。
+        # 对齐 stderr sink 的级别：要 DEBUG 就一起调 LOG_LEVEL。
+        logger.add(**logfire.loguru_handler(), level=settings.log_level.upper())
     logging.basicConfig(handlers=[InterceptHandler()], level=0, force=True)
 
     logging.getLogger("httpcore").setLevel(logging.WARNING)
     logging.getLogger("httpx").setLevel(logging.INFO)
     logging.getLogger("taskiq").setLevel(logging.WARNING)
+    # redis-py 8.x：协议默认 RESP3（utils.DEFAULT_RESP_VERSION = 3），于是每次
+    # 新建连接都会尝试 ``CLIENT MAINT_NOTIFICATIONS ON``；redis:7 不认识这个
+    # 子命令 → 抛 ResponseError → 以 DEBUG 记一行"失败但不影响连接"。
+    # 功能无害，但会在看板上伪装成故障，直接压到 WARNING。
+    logging.getLogger("redis").setLevel(logging.WARNING)

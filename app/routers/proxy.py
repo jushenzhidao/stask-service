@@ -74,7 +74,12 @@ def _extract_model(body: bytes, content_type: str) -> str:
 
 @router.api_route("/{path:path}", methods=["POST", "PUT"], status_code=202)
 async def submit_task(path: str, request: Request) -> Response:
-    """提交。带 ``Idempotency-Key`` 头时同 token 同 key 幂等回放。"""
+    """提交。带 ``Idempotency-Key`` 头时同 token 同 key 幂等回放。
+
+    回放分支回报的是**库里那一行**的状态与创建/排期时刻（不是本次请求算出的值）：
+    同一个 key 命中一个已结束的任务时，客户端必须能直接看出它是终态任务，
+    而不是一个刚入队的新任务。
+    """
     try:
         upstream_path = _normalize_path(path)
         admission.check_path(upstream_path)
@@ -187,24 +192,49 @@ async def submit_task(path: str, request: Request) -> Response:
             headers={"Retry-After": str(await submit.retry_after_seconds(config))},
         ) from exc
 
-    # 幂等回放必须回报**原始**排期，不得因本次请求的调度头而重新排期
-    # （AC-60）：否则同一个 Idempotency-Key 二次提交会悄悄改掉执行时刻。
+    # 幂等回放必须回报**库里那一行的原始事实**（排期 / 状态 / 创建时刻），
+    # 不得因本次请求而重新排期（AC-60），也不得把终态任务粉饰成"新任务在排队"。
+    #
+    # 恒定 `status: QUEUED` 曾把客户端推进死循环：任务早已 FAILURE，客户端拿
+    # 同一个 Idempotency-Key 反复提交，每次收到 202 + QUEUED（看起来像刚入队），
+    # 于是「提交 → 等 → 轮询失败 → 再提交」永远转不出去。回放要报**真实状态**，
+    # 让客户端一眼看出这是同一笔已结束的任务（要重来必须先换 key）。
     task_id, replayed = result.task_id, result.replayed
     stored: dict = {}
+    status = QUEUED
+    created_at = taskstore.now()
     if replayed:
-        # 幂等回放回报**原始**状态：本次请求带的调度头/分批头一律不生效
-        # （AC-60），所以要回头读库里那一行而不是用本次算出的值。
+        # 本次请求带的调度头/分批头一律不生效，所以回头读库里那一行，
+        # 而不是用本次请求算出来的值（AC-60）。
         existing = await taskstore.get_meta(task_id)
-        stored = (existing or {}).get("data") or {}
+        if existing is None:
+            # 行在 ``submit`` 的 exists() 与这次读之间消失了（上游 new-api 的 24h
+            # 清理线会删行，人工删行同样命中）。这里**没有**第二条能救的路径，
+            # 所以既不粉饰成"新任务在排队"（客户端随后 GET 只会 404），也不假装
+            # 成功：明确告诉它「这一笔的目标已不在」，让客户端重发——重发走创建
+            # 分支，同 key 仍得到同一个 task_id，无需换键。
+            log.warning("replay row vanished mid-request: task_id={}", task_id)
+            raise HTTPException(
+                409,
+                error_body(
+                    "idempotency replay target no longer exists; resend to recreate it",
+                    "invalid_request_error", code="replay_target_missing",
+                ),
+            )
+        stored = existing.get("data") or {}
         scheduled_at = int(stored.get("scheduled_at") or 0)
+        status = str((existing or {}).get("status") or "") or QUEUED
+        # 创建时刻同理：`now()` 会用回放时刻冒充原始时刻，让一个几天前
+        # 就结束的任务看起来是刚创建的。
+        created_at = int((existing or {}).get("created_at") or 0) or created_at
 
     location = f"/async{upstream_path}/{task_id}"
     return JSONResponse(
         status_code=202,
         content={
             "task_id": task_id,
-            "status": QUEUED,
-            "created_at": taskstore.now(),
+            "status": status,
+            "created_at": created_at,
             "scheduled_at": scheduled_at,
             "batch_key": stored.get("batch_key", "") or result.batch_key,
             # 与查询视图同口径：内部状态名不外漏（PRD R-20）

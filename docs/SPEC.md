@@ -105,6 +105,14 @@
 
 错误响应统一 `{"error": {"message","type","param","code"}}`。
 
+**幂等回放的回报口径**（`POST` 带 `Idempotency-Key` 命中已有 task_id 时）：
+响应里的 `status` / `created_at` / `scheduled_at` / `batch_key` / `batch_state`
+**全部是库里那一行的原始值**，本次请求携带的调度头与分批头一律不生效，
+`replayed=true` 标明这是回放。含义：若命中的任务已经结束（FAILURE/SUCCESS/CANCELED），
+响应里就是那个**终态**——不得粉饰成 `QUEUED`，也不得用回放时刻冒充创建时刻；
+否则客户端会把一条早已死掉的任务当成"刚入队、正在跑"，在同一个 key 上无限重试。
+（要真正发起一次新的尝试，客户端必须换一个 `Idempotency-Key` 或去掉该头。）
+
 ---
 
 ## 6. 数据模型（锁定 — 复用 new-api `tasks` 表，零建表）

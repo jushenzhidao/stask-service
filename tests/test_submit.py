@@ -137,6 +137,113 @@ def test_idempotency_key_replays(client, task_store, queue_events):
     assert len(queue_events.execute) == 1
 
 
+def test_replay_reports_real_status_and_created_at(client, task_store):
+    """回放一个**终态**任务必须报库里真实状态与原始创建时刻，不得恒定 QUEUED。
+
+    真实事故（线上）：任务早已 FAILURE，客户端拿同一个 Idempotency-Key 反复
+    提交，每次收到 `202 + status=QUEUED`——看起来像"刚入队、正在跑"，
+    于是「提交 → 等 → 轮询失败 → 同 key 再提交」永远转不出去。
+    回放必须让客户端一眼看出这是同一笔**已结束**的任务。
+
+    AC-60 只写了排期要回报原始值，这里把同一个理由扩展到 status / created_at。
+    """
+    headers = {**AUTH, "Idempotency-Key": "terminal-1"}
+    first = client.post(PATH, json=BODY, headers=headers).json()
+    tid = first["task_id"]
+    assert first["status"] == "QUEUED"
+
+    # 让行进入终态（等价于 worker 落终态），并把创建时刻改成明显的过去值
+    row = task_store.rows[tid]
+    row["status"] = "FAILURE"
+    row["fail_reason"] = "upstream 500"
+    row["created_at"] = 1_600_000_000
+
+    replay = client.post(PATH, json=BODY, headers=headers)
+    assert replay.status_code == 202
+    body = replay.json()
+
+    assert body["task_id"] == tid and body["replayed"] is True
+    assert body["status"] == "FAILURE", "回放不得把终态任务报成 QUEUED"
+    assert body["created_at"] == 1_600_000_000, "回放不得用回放时刻冒充创建时刻"
+    assert len(task_store.rows) == 1, "回放绝不新建任务"
+
+
+def test_replay_row_vanished_returns_409(client, task_store, monkeypatch):
+    """回放途中行消失（上游 new-api 24h 清理线删行）必须显式 409。
+
+    不得静默回落到「QUEUED + now()」：那等于替一个**不存在**的任务撒谎——
+    响应里出现一个"刚入队"的任务，客户端随后查询只会 404，排障时看不出
+    这一笔到底发生了什么。显式 409 让客户端重发（重发走创建分支，同 key
+    仍得同一个 task_id），既不粉饰也不假装成功。
+    """
+    headers = {**AUTH, "Idempotency-Key": "vanish-1"}
+    tid = client.post(PATH, json=BODY, headers=headers).json()["task_id"]
+
+    real_get_meta = task_store.get_meta
+
+    async def vanish_then_read(task_id: str):
+        # 模拟「submit 里的 exists() 之后、路由读元数据之前」行被删
+        task_store.rows.pop(task_id, None)
+        return await real_get_meta(task_id)
+
+    # 路由层（app.routers.proxy）不在 ``_TASKSTORE_CONSUMERS`` 里：它对
+    # taskstore 的调用走**模块级函数**（conftest 逐名替换），所以这里要打模块属性；
+    # 实例属性一并打上，覆盖两种解析路径。
+    from app.services import taskstore as taskstore_mod
+
+    monkeypatch.setattr(taskstore_mod, "get_meta", vanish_then_read)
+    monkeypatch.setattr(task_store, "get_meta", vanish_then_read)
+
+    resp = client.post(PATH, json=BODY, headers=headers)
+    assert resp.status_code == 409, "行消失不得粉饰成 202 + QUEUED"
+    assert resp.json()["error"]["code"] == "replay_target_missing"
+    assert tid not in task_store.rows
+
+
+def test_same_key_different_body_replays_old_task(client, task_store):
+    """钉住当前契约：``Idempotency-Key`` 的哈希**不含请求体**。
+
+    同 token + 同 key ⇒ 恒同一个 task_id，**换 body 也回放**（显式幂等的定义
+    是"同一笔提交"）。代价是：客户端不能在一个 key 上换内容重试，否则会静默
+    拿到旧任务。若要改成 Stripe 式「键同体不同 → 409」，**先改这个用例**——
+    别让语义在无声中变化。
+    """
+    headers = {**AUTH, "Idempotency-Key": "samekey-body"}
+    first = client.post(PATH, json=BODY, headers=headers).json()
+
+    other = client.post(
+        PATH, json={**BODY, "prompt": "完全不同的提示词"}, headers=headers
+    )
+    assert other.status_code == 202
+    body = other.json()
+    assert body["replayed"] is True
+    assert body["task_id"] == first["task_id"]
+    assert len(task_store.rows) == 1, "同 key 换 body 不新建任务（回放旧任务）"
+
+
+def test_same_key_different_model_same_slug_replays_old_task(client, task_store):
+    """同 key 换**模型**也会回放——模型名只经由**截断 16 字符**的 slug 参与身份。
+
+    `model_slug` 截断（`submit.py:51-58`）让同前缀的模型名坍缩成同一个 slug，
+    例如 `seedream-4-0-250828` 与 `seedream-4-0-250829` 都是
+    `seedream_4_0_250`；而幂等哈希只吃 ``(token_hash, key)``。两者叠加 ⇒
+    同 key 换模型命中同一个 task_id，静默回放旧任务。
+
+    这与上一条同源（幂等身份不含请求内容），这里单独钉住是因为它更隐蔽：
+    客户端往往认为"换模型 = 换请求"。
+    """
+    headers = {**AUTH, "Idempotency-Key": "samekey-model"}
+    a_body = {"model": "seedream-4-0-250828", "prompt": "x"}
+    b_body = {"model": "seedream-4-0-250829", "prompt": "x"}
+
+    first = client.post(PATH, json=a_body, headers=headers).json()
+    second = client.post(PATH, json=b_body, headers=headers).json()
+
+    assert second["replayed"] is True
+    assert second["task_id"] == first["task_id"], "两个不同模型坍缩到同一个 task_id"
+    assert len(task_store.rows) == 1
+
+
 def test_different_body_creates_new_task(client, task_store):
     """不带 key：不同请求体自然是不同任务。"""
     a = client.post(PATH, json=BODY, headers=AUTH).json()["task_id"]
@@ -249,10 +356,13 @@ def test_enqueue_failure_rolls_back(client, monkeypatch, patch_redis, task_store
     assert row["status"] == "FAILURE"
     assert "aborted" in row["fail_reason"]
 
-    # 同 key 重试回放到该 FAILURE 而非重建
+    # 同 key 重试回放到该 FAILURE 而非重建；**回放必须把 FAILURE 如实报出来**
+    # （报成 QUEUED 会让客户端以为重试又排上了队，于是无限重试同一条死任务）
     resp2 = client.post(PATH, json=BODY, headers=headers)
     assert resp2.json()["replayed"] is True
     assert resp2.json()["task_id"] == row["task_id"]
+    assert resp2.json()["status"] == "FAILURE"
+    assert resp2.json()["created_at"] == row["created_at"]
 
 
 def test_rollback_before_create_releases_placeholder(client, monkeypatch,
