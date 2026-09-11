@@ -241,25 +241,34 @@ curl -X PUT "$BASE/admin/api/config" \
   -d '{"model_policies": {"dall-e-3": {"batch": 10, "batch_wait": 60}}}'
 ```
 
-> **坑：`model_policies` 是整表替换，不是按模型合并。**
+> **写入语义：默认整表替换，可选合并（`?mode=merge`）。**
 > 配置存在 Redis 的一个 hash 字段里（值是一整个 JSON 串），写入即覆盖该字段。
-> 因此**给第二个模型开启时，必须把已有条目一起带上**，否则第一个模型的策略会被
-> 静默清掉——它不再攒批、也不再受并发上限约束，而请求侧毫无异常，没人会发现。
+> 默认（`replace`）是**整表替换**：**给第二个模型开启时必须把已有条目一起带上**，
+> 否则第一个模型的策略会被静默清掉——它不再攒批、也不再受并发上限约束，而请求侧
+> 毫无异常，没人会发现。
 >
-> 安全做法：先 GET 现表 → 本地改 → 整表 PUT。
+> 不想承担这个心智负担就加 **`?mode=merge`**（看板上是配置区的「覆盖 / 合并」下拉）：
+> 只覆盖/新增本次写到的模型条目，未写到的保持原值。合并粒度到**顶层键（模型名）**
+> 为止，同名条目整条替换（不做字段级深合并）。
 >
 > ```bash
-> # 1) 读出当前生效值
+> # 推荐：合并写入（已有条目自动保留，不必先读全表）
+> curl -X PUT "$BASE/admin/api/config?mode=merge" -H "X-Admin-Key: $ADMIN_KEY" \
+>   -H 'Content-Type: application/json' \
+>   -d '{"model_policies": {"sora": {"batch":5, "batch_wait":30}}}'
+>
+> # 整表替换（默认，不带 mode）：先 GET 现表 → 本地合并 → 再整表 PUT
 > curl -s "$BASE/admin/api/config" -H "X-Admin-Key: $ADMIN_KEY" \
 >   | jq '.groups[].items[] | select(.key=="model_policies") | .value'
-> # 2) 把已有条目和新条目合并后整表写回
 > curl -X PUT "$BASE/admin/api/config" -H "X-Admin-Key: $ADMIN_KEY" \
 >   -H 'Content-Type: application/json' \
 >   -d '{"model_policies": {"dall-e-3": {"batch":10,"batch_wait":60},
 >                            "sora":     {"batch":5, "batch_wait":30}}}'
 > ```
 >
-> 这条语义有测试钉着：`test_dynconf_hotreload.py::test_model_policies_write_replaces_whole_table`。
+> 两条语义都有测试钉着：整表替换见
+> `test_dynconf_hotreload.py::test_model_policies_write_replaces_whole_table`，
+> 合并见 `::test_model_policies_merge_keeps_untouched_entries`。
 
 策略表的键支持三种写法，**按优先级从高到低**命中一个：
 

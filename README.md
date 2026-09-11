@@ -11,7 +11,7 @@ allowlist 即可）。鉴权、渠道选择、配额扣费、限流全部在上�
 nginx（同一域名）
 ├─ /async/ → stask-service          其余 → 上游 HTTP
 │
-stask web    提交：鉴权（AUTH_MODE）→ 幂等占位 → 占槽 → 落库 QUEUED → 令牌会话 → 入队 → 202
+stask web    提交：鉴权（AUTH_MODE）→ 幂等占位（可选）→ 占槽 → 落库 QUEUED → 令牌会话 → 入队 → 202
 stask worker 执行：派发锁 → 用户令牌调上游同步接口 → 响应即终态落库 → 释放槽/清会话/回调
 上游          鉴权 / 渠道 / 扣费 / 限流，零改动
 ```
@@ -77,7 +77,8 @@ curl -X POST https://api.example.com/async/v1/images/generations \
   -H "X-Callback-Url: https://myapp.com/hook" \
   -H "X-Upstream-Base-Url: https://newapi.com" \
   -d '{"model":"dall-e-3","prompt":"a red cube","n":1}'
-# → 202 {"task_id":"dall_e_3_ab12...","status":"NOT_START","replayed":false}
+# → 202 {"task_id":"dall_e_3_ab12...","status":"QUEUED","scheduled_at":0,
+#        "batch_key":"","batch_state":"","replayed":false}
 #   Location: /async/v1/images/generations/dall_e_3_ab12...
 
 curl "https://api.example.com/async/v1/images/generations/dall_e_3_ab12...?wait=60"
@@ -86,9 +87,11 @@ curl "https://api.example.com/async/v1/images/generations/dall_e_3_ab12...?wait=
 
 - `X-Upstream-Base-Url` 可选（默认读 env `UPSTREAM_BASE_URL`），host 必须
   在 allowlist 内。
-- **自动幂等**：`task_id = {model}_{sha256(token|method|path|query|body|盐)[:32]}`。
-  同一 token 的字节级相同请求在幂等窗口内恒返回同一任务，客户端重试**不需要
-  带任何头**；想强制重跑同一请求，带 `Idempotency-Key: 任意新值` 作盐即可。
+- **显式幂等（可选）**：默认每次提交都是**新任务**，`task_id = {slug}_{uuid4}`。
+  带 `Idempotency-Key` 时改为确定的 `task_id = {slug}_{sha256(token_hash‖key)[:32]}`——
+  同一 token 的同一 key 恒映射同一任务，重试只需复用同一个 key；回放返回**原始**
+  排期（本次请求带的调度头/分批头不生效）。事实源是 `tasks` 表，Redis 只护
+  「创建链路在飞」的几百毫秒窗口。
 
 管理面（`X-Admin-Key` 鉴权，未配置密钥时全部 404）：
 
@@ -102,6 +105,94 @@ curl "https://api.example.com/async/v1/images/generations/dall_e_3_ab12...?wait=
 | GET/PUT | `/admin/api/config` | 读写运行时配置 |
 | POST | `/admin/api/config/reset` | 重置回落 env |
 | POST | `/admin/api/jobs/{stale\|overdue\|slots\|purge}` | 手工触发定时任务 |
+
+---
+
+## 模型策略表（`model_policies`）：按模型控制攒批与并发
+
+`model_policies` 是**唯一的逐模型调度开关**——没有「开启攒批」这种布尔位，
+**`batch >= 2` 本身就是开关**。没写到的模型一律 `batch=0`：不攒批、收到即发，
+行为与改造前完全一致。
+
+### 怎么改：三条路径（读取优先级从高到低）
+
+| # | 路径 | 写入方式 | 生效 | 写侧校验 |
+|---|---|---|---|---|
+| 1 | **管理面 API**（推荐） | `PUT /admin/api/config`（可加 `?mode=merge`）+ `X-Admin-Key` | ≤5s | **有**——非法整批 400，一个值都不改 |
+| 2 | Redis 覆盖值 | `HSET st:dynconf model_policies '<JSON>'` | ≤5s | **无**——坏值被读侧丢弃并回落 env，日志留 `dynconf value invalid, ignoring` |
+| 3 | env `MODEL_POLICIES` | 写 `.env` 后重启 | 重启 | 启动时校验，非法 JSON 直接起不来 |
+
+读取序为 **Redis 覆盖 > env > 代码默认**。**写侧默认整表替换**（Redis / env 两条路径
+天然如此），管理面 API 额外提供 **`?mode=merge`**——只覆盖/新增写到的模型条目，
+未写到的保持原值。且 Redis 里一旦存在该字段，env 那份**整份被忽略**（改了 `.env`
+却不生效，先查 Redis 有没有残留覆盖值）。
+
+推荐走路径 1：**加模型用 `merge`，别用默认的整表替换**。
+
+```bash
+BASE=https://<stask 入口>
+ADMIN_KEY=<管理密钥>
+
+# 1) 加一个模型（merge：已有条目自动保留，不必先读全表）
+curl -X PUT "$BASE/admin/api/config?mode=merge" \
+  -H "X-Admin-Key: $ADMIN_KEY" -H 'Content-Type: application/json' \
+  -d '{"model_policies": {
+         "doubao-seedream-5-0-pro-260628": {"batch": 3, "batch_wait": 30}
+       }}'
+
+# 2) 整表替换（默认，不带 mode）：**没带上的模型会被清掉**，慎用。
+#    真要整表写，先读出现值 → 本地合并 → 再写回：
+curl -s "$BASE/admin/api/config" -H "X-Admin-Key: $ADMIN_KEY" \
+  | jq '.groups[].items[] | select(.key=="model_policies") | .value'
+
+# 3) 回退到 env 值（删除覆盖值）
+curl -X POST "$BASE/admin/api/config/reset" \
+  -H "X-Admin-Key: $ADMIN_KEY" -H 'Content-Type: application/json' \
+  -d '["model_policies"]'
+```
+
+> **`merge` 的粒度到顶层键（模型名）为止**：只覆盖/新增本次写到的模型，
+> 同名条目**整条替换**（不做字段级深合并——那会让「改一个字段」与「删一个字段」
+> 不可区分，排障时也说不清生效了哪套参数）。看板上是配置区按钮行的
+> 「覆盖 / 合并」下拉；未知 mode 一律 422，不会静默退化成 replace。
+
+> ⚠️ **网关没放开管理面时**（不少部署只对外暴露 `/async/`，`/admin` 被上游
+> SPA 吞掉，返回 200 但内容是 HTML）路径 1 走不通：改走内网
+> `http://<容器>:8000/admin`，或用路径 2 直连 Redis——**注意它绕过校验**。
+
+### 键与字段
+
+> 本节与下面两节的要点，**同样就近标注在管理看板的 `model_policies` 项下方**
+> （即 `GET /admin/api/config` 返回的 `note` 字段）——页面上改配置时不必翻本文档。
+
+键三选一，按优先级命中最先匹配的一条：**精确模型名**（小写归一）>
+**端点前缀**（如 `/v1/images`，最长匹配）> `__default__`（兜底）。
+
+| 字段 | 含义 | 范围 |
+|---|---|---|
+| `batch` | 攒够多少条放行（N） | 0–1000，`>= 2` 才攒批 |
+| `batch_wait` | 最长等待秒数（T）。**`batch >= 2` 时必须显式给** | 1–3600 |
+| `limit_per_token` | 该 token 总在途上限 | 0–10000，`0` = 回落 `MAX_SLOTS` |
+| `limit_model_token` | (模型, token) 上限，**`> 0` 即强制排队** | 0–10000 |
+| `limit_global` | 模型全局上限（多 key 合计不超发的唯一保证） | 0–10000 |
+
+两条写侧硬约束（违反即 400）：`batch >= 2` 必须同时给 `batch_wait`；
+`batch_wait + 执行时长 + 余量 ≤ SK_SESSION_TTL_SECONDS`——令牌只在 Redis 且
+绝不落库，等过头必然以 `token_missing` 100% 失败。
+
+### 放行延迟按「T + cron 相位」估算
+
+生产实测：**N 触发**从第 N 条入批到整批下发在 **2~7s**（取决于放行任务的消费
+相位）；**T 触发**的实际等待
+≈ `batch_wait` + **0~15s**（`tick` 每分钟 1 次、内部自旋 4 轮 × 15s 的相位差）
++ 约 3s 放行链路。即 `batch_wait=30` 的真实放行在 **40~50s** 量级，不是 30s。
+
+### 不改服务端配置的旁路
+
+客户端可用请求头**逐请求**开启/覆盖攒批，无需动策略表：
+`X-Batch-Size`（N，可单独开启攒批）、`X-Batch-Wait`（T，上限
+`MAX_BATCH_WAIT_SECONDS`）、`X-Batch-Key`（≤64，显式归组键，可跨模型混批）。
+完整语义见 [`docs/SPEC.md`](docs/SPEC.md) §10.1。
 
 ---
 
@@ -124,7 +215,8 @@ curl "https://api.example.com/async/v1/images/generations/dall_e_3_ab12...?wait=
 ## 设计红线
 
 1. **零资金动作**——不冻结、不结算、不对账；扣费成败是上游和用户之间的事。
-2. **令牌不落库不进日志**——只放 Redis 会话（TTL 2h），终态即清。
+2. **令牌不落库不进日志**——只放 Redis 会话（`SK_SESSION_TTL_SECONDS`，默认 7h），
+   终态即清。
    loguru 固定 `backtrace=False, diagnose=False`。
 3. **tasks 表时间列必须归一**——读侧 `as_unix_seconds`；SQL 侧写入恒为秒，
    时间谓词用裸列比较（不再包裹表达式，否则吃不到索引）。
@@ -141,7 +233,7 @@ curl "https://api.example.com/async/v1/images/generations/dall_e_3_ab12...?wait=
 
 | 决策 | 取值 | 依据 |
 |---|---|---|
-| 幂等 | **自动**：task_id = 请求指纹 | 客户端零心智负担；`Idempotency-Key` 降级为可选盐 |
+| 幂等 | **显式**：默认随机 `task_id`，带 `Idempotency-Key` 才去重 | 去重语义与 Stripe/OpenAI 一致；不带头的重试就是两次提交，不静默吞掉请求 |
 | 共存 | platform + 独立渠道 + quota=0 + 6h 生命期 | ADR-006：外部任务不影响 new-api 内部任务 |
 | 5xx 重试 | 默认关（`RETRY_MAX=0`） | ADR-002：上游调用可能有副作用 |
 | Redis | 独立实例 + `st:` 键前缀 | ADR-004：故障域隔离，前缀是误配时的第二道防线 |
@@ -168,7 +260,7 @@ app/
 ├── routers/          proxy（/async 通配）/ ops / admin（看板 + 配置）
 └── services/
     ├── admission.py    路径准入 + upstream 三防线 + 头清洗
-    ├── idem.py         自动幂等（请求指纹 task_id + 创建窗口占位）
+    ├── idem.py         显式幂等（Idempotency-Key → 确定 task_id + 创建窗口占位）
     ├── submit.py       提交链路（失败即回滚）
     ├── execute.py      worker 执行（派发锁 + 分流）
     ├── flow.py         查询 / 字节级回放 / 长轮询 / 取消
@@ -192,7 +284,7 @@ app/
 
 ## 测试
 
-254 个用例，不依赖真实 MySQL / Redis / 上游：
+440+ 个用例，不依赖真实 MySQL / Redis / 上游：
 Redis 用手写 FakeRedis（Lua 按 `app/redis.py` 常量做等价 Python 实现），
 tasks 表用 InMemoryTaskStore（保留 CAS 与 data 合并语义），
 出站 HTTP 用 respx 拦截（未声明的请求立即失败），
