@@ -102,6 +102,9 @@
          align-items: center; }
   .cfg .name { font-size: 13px; }
   .cfg .note { font-size: 12px; color: var(--faint); }
+  .cfg .full { grid-column: 1 / -1; }
+  .cfg .full .note { white-space: pre-line; line-height: 1.55; margin: 3px 0 7px; }
+  .cfg textarea { width: 100%; min-height: 130px; resize: vertical; }
   .cfg input { width: 150px; text-align: right; }
   .dot { width: 6px; height: 6px; border-radius: 50%; background: var(--amber);
          display: inline-block; }
@@ -248,6 +251,10 @@
         <div class="row">
           <button id="cfgReload">重新读取</button>
           <button id="cfgResetAll">全部回落 .env</button>
+          <select id="cfgMode" title="映射型配置（model_policies）的写入语义">
+            <option value="replace">覆盖：整表替换</option>
+            <option value="merge">合并：保留未写到的条目</option>
+          </select>
           <button class="primary" id="cfgSave">保存改动</button>
         </div>
       </div>
@@ -597,7 +604,16 @@ async function loadConfig() {
         <strong style="font-weight:500;font-size:13px">${esc(g.name)}</strong>
       </div>
       <div class="cfg">
-        ${g.items.map((it) => `
+        ${g.items.map((it) => it.kind === "json" ? `
+          <div class="full">
+            <div class="name">${esc(it.label)}
+              ${it.overridden ? '<span class="dot" title="已覆盖"></span>' : ""}
+            </div>
+            <div class="note">${esc(it.key)} · ${esc(it.note || "")}</div>
+            <textarea class="mono" data-key="${esc(it.key)}"
+                      spellcheck="false">${esc(it.value)}</textarea>
+          </div>`
+        : `
           <div>
             <div class="name">${esc(it.label)}
               ${it.overridden ? '<span class="dot" title="已覆盖"></span>' : ""}
@@ -668,10 +684,14 @@ $("fTaskIdMode").onchange = () => {
 $("cfgReload").onclick = () => loadConfig().catch((e) => banner(e.message));
 $("cfgSave").onclick = async () => {
   if (!Object.keys(cfgDirty).length) { banner("没有改动", "ok"); return; }
+  const mode = $("cfgMode").value;
   $("cfgErr").innerHTML = "";
   try {
-    await api("/config", { method: "PUT", body: JSON.stringify(cfgDirty) });
-    banner("配置已生效", "ok");
+    await api("/config?mode=" + mode,
+              { method: "PUT", body: JSON.stringify(cfgDirty) });
+    banner(mode === "merge"
+      ? "配置已生效（合并：未写到的条目保持原值）"
+      : "配置已生效（覆盖：未写到的条目已被清空）", "ok");
     await loadConfig();
   } catch (e) { $("cfgErr").innerHTML = `<div class="err">${esc(e.message)}</div>`; }
 };

@@ -149,3 +149,81 @@ async def test_model_policies_write_replaces_whole_table(
     # 顺手确认「batch 就是开关」：0 = 不攒批，>=2 = 攒批
     off = modelpolicy.resolve(model="model-c", policies=table)
     assert off.batch == 0 and off.queues is False, "未配置的模型默认不攒批"
+
+
+# ---------------------------------------------------------------------------
+# 写入语义：replace（默认，整表替换） vs merge（顶层键合并）
+# ---------------------------------------------------------------------------
+
+ADMIN = {"X-Admin-Key": "admin-secret"}
+
+
+@pytest.fixture
+def admin_client(client, monkeypatch, test_settings):
+    """启用管理面的客户端（与 test_admin.py 同款）。"""
+    monkeypatch.setattr(test_settings, "admin_key", "admin-secret")
+    return client
+
+
+async def test_model_policies_merge_keeps_untouched_entries(patch_redis):
+    """``mode="merge"``：只覆盖写到的模型条目，未写到的保持原值。
+
+    与上面那条整表替换用例互为对偶——那条把「漏抄即静默清空」的坑钉成断言，
+    这条把「不必再抄」的能力钉成断言。
+    """
+    await dynconf.set_many({"model_policies": {
+        "model-a": {"batch": 10, "batch_wait": 60}}})
+
+    await dynconf.set_many(
+        {"model_policies": {"model-b": {"batch": 5, "batch_wait": 30}}},
+        mode="merge",
+    )
+    table = await dynconf.get_model_policies()
+    assert set(table) == {"model-a", "model-b"}, "合并必须保留未写到的条目"
+    assert table["model-a"]["batch"] == 10
+    assert table["model-b"]["batch"] == 5
+
+    # 同名条目是**整条替换**，不做字段级深合并：字段级合并无法区分
+    # 「改一个字段」与「删一个字段」，排障时也说不清生效了哪套参数。
+    await dynconf.set_many(
+        {"model_policies": {"model-a": {"batch_wait": 15}}}, mode="merge")
+    table = await dynconf.get_model_policies()
+    assert table["model-a"] == {"batch_wait": 15}
+    assert table["model-b"] == {"batch": 5, "batch_wait": 30}
+
+
+async def test_config_api_merge_mode(admin_client):
+    """路由层真的把 ``?mode=merge`` 传下去（入口零覆盖会骗过 CI）。"""
+    resp = admin_client.put(
+        "/admin/api/config", headers=ADMIN,
+        json={"model_policies": {"model-a": {"batch": 10, "batch_wait": 60}}})
+    assert resp.status_code == 200
+
+    resp = admin_client.put(
+        "/admin/api/config?mode=merge", headers=ADMIN,
+        json={"model_policies": {"model-b": {"batch": 5, "batch_wait": 30}}})
+    assert resp.status_code == 200
+
+    table = await dynconf.get_model_policies()
+    assert set(table) == {"model-a", "model-b"}, "merge 不得清掉已有条目"
+
+    # 未知 mode 被 Query 的 pattern 拦下（422），不会静默退化成 replace
+    resp = admin_client.put(
+        "/admin/api/config?mode=whatever", headers=ADMIN, json={"max_slots": 5})
+    assert resp.status_code == 422
+
+
+async def test_config_api_default_is_still_replace(admin_client):
+    """不带 mode 时仍是整表替换——不能因为新增 merge 就把默认语义改掉。"""
+    resp = admin_client.put(
+        "/admin/api/config", headers=ADMIN,
+        json={"model_policies": {"model-a": {"batch": 10, "batch_wait": 60}}})
+    assert resp.status_code == 200
+
+    resp = admin_client.put(
+        "/admin/api/config", headers=ADMIN,
+        json={"model_policies": {"model-b": {"batch": 5, "batch_wait": 30}}})
+    assert resp.status_code == 200
+
+    table = await dynconf.get_model_policies()
+    assert set(table) == {"model-b"}, "默认必须保持整表替换（向后兼容）"

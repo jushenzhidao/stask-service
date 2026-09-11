@@ -251,11 +251,17 @@ async def read_config(_: None = Depends(require_admin)) -> dict:
 @router.put("/api/config")
 async def write_config(
     updates: dict[str, Any] = Body(...),
+    mode: str = Query("replace", pattern="^(replace|merge)$"),
     _: None = Depends(require_admin),
 ) -> dict:
-    """批量更新覆盖值。白名单外的键一律拒绝，校验失败整批回退。"""
+    """批量更新覆盖值。白名单外的键一律拒绝，校验失败整批回退。
+
+    ``?mode=merge`` 时，映射型配置项（``model_policies``）按**顶层键合并**：
+    只覆盖/新增本次写到的模型条目，未写到的保持原值——不必再「先读全表 →
+    整表写回」。默认 ``replace`` 保持既有整表替换语义。
+    """
     try:
-        return await dynconf.set_many(updates)
+        return await dynconf.set_many(updates, mode=mode)
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
 

@@ -193,11 +193,24 @@ MUTABLE: dict[str, Spec] = {
         # 校验失败整批拒绝，绝不半套生效。
         Spec("model_policies", "json", "模型策略表", "攒批",
              note=(
-                 "键 = 模型名（小写）或端点前缀（/v1/videos）或 __default__；"
-                 "字段 batch / batch_wait / limit_per_token / limit_model_token / "
-                 "limit_global。"
-                 "示例：{\"sora-video\": {\"batch\": 3, \"batch_wait\": 120, "
-                 "\"limit_global\": 3}}"
+                 "键：模型名（小写归一，精确）> 端点前缀（如 /v1/images，最长匹配）"
+                 "> __default__（兜底）。"
+                 "字段：batch 0-1000（>=2 才是攒批开关，0/1 = 收到即发）；"
+                 "batch_wait 1-3600（batch>=2 时必须显式给）；limit_per_token / "
+                 "limit_model_token / limit_global 均 0-10000（>0 即强制排队，"
+                 "limit_global 是「多 key 合计不超发」的唯一保证）。"
+                 "写入语义：默认「整表替换」（写入即覆盖整张表）；保存时选「合并」"
+                 "或加 ?mode=merge，则只覆盖写到的模型条目、未写到的保持原值。"
+                 "整表替换时必须先读出现值、把已有条目一起带上再写回，"
+                 "漏掉的模型会被静默清掉（不再攒批、也不受并发上限约束，"
+                 "而请求侧毫无异常）。"
+                 "两条硬约束（违反即 400）：batch>=2 必须同时给 batch_wait；"
+                 "batch_wait + 执行时长 + 余量 ≤ SK_SESSION_TTL_SECONDS。"
+                 "放行延迟 ≈ batch_wait + 0~15s（tick 每分钟 1 次、内部自旋 4 轮）"
+                 " + 约 3s；热改只影响新提交，在途任务按创建时那套走完。"
+                 "客户端可用 X-Batch-Size / X-Batch-Wait / X-Batch-Key 逐请求覆盖。"
+                 "示例：{\"doubao-seedream-5-0-pro-260628\": {\"batch\": 3, "
+                 "\"batch_wait\": 30}}"
              ),
              validator=_validate_policies),
 
@@ -341,26 +354,80 @@ async def get_bool(key: str) -> bool:
     return bool(await get(key))
 
 
-async def set_many(updates: dict[str, Any]) -> dict[str, Any]:
+async def _effective_value(key: str) -> Any:
+    """读某项的**当前生效值**（绕过本地缓存），供合并写入用。
+
+    合并必须基于 Redis 里的最新值：``_load()`` 的 5s 进程内缓存可能落后于
+    其他副本刚写入的条目，拿它做合并会把别人新加的模型条目覆盖掉。
+    读不到或值损坏时回落 ``settings``（env），与普通读取路径同口径。
+    """
+    spec = MUTABLE[key]
+    try:
+        raw = await r.hgetall(_KEY)
+    except Exception:
+        log.opt(exception=True).debug("dynconf merge read failed, use env value")
+        raw = None
+    value = (raw or {}).get(key)
+    if value is None:
+        return getattr(settings, key, None)
+    try:
+        return spec.coerce(json.loads(value))
+    except Exception:
+        log.warning("dynconf value invalid, ignoring: key={}", key)
+        return getattr(settings, key, None)
+
+
+async def _merge_mapping(key: str, new: Any) -> Any:
+    """顶层键合并，同名键**整条替换**。非映射型或类型不符时原样返回新值。"""
+    current = await _effective_value(key)
+    if not isinstance(current, dict) or not isinstance(new, dict):
+        return new
+    return {**current, **new}
+
+
+async def set_many(
+    updates: dict[str, Any], *, mode: str = "replace"
+) -> dict[str, Any]:
     """批量写覆盖值。返回生效后的全量视图。
 
     校验失败**整批拒绝**（不做部分成功）——半套配置比旧配置更危险。
+
+    ``mode`` 决定**映射型配置项**（``kind="json"``，目前只有 ``model_policies``）
+    的写入语义：
+
+    - ``replace``（默认，保持既有行为）：**整表替换**——没带上的模型条目会被
+      清掉。「给第二个模型加策略」时必须把已有条目一起抄上，漏抄即静默清空。
+    - ``merge``：以当前生效值为基础**只覆盖/新增本次写到的顶层键**，没写到的
+      条目保持原值——上面那个坑随之消失，不必再「先读全表 → 整表写回」。
+
+    合并只到**顶层键（模型名）**为止：同名条目整条替换，不做字段级深合并。
+    字段级合并无法区分「改一个字段」与「删一个字段」，排障时也说不清
+    「这条任务到底生效了哪套参数」。
+
+    读-改-写不是原子操作：管理面是低频人工操作，两处真并发写同一份映射的
+    概率极低；要严格串行请用 ``replace`` 并自行先读后写。
     """
     if not updates:
         return await snapshot()
+    if mode not in ("replace", "merge"):
+        raise ValueError(f"unknown mode: {mode!r} (valid: replace, merge)")
+
     payload: dict[str, str] = {}
     for key, raw in updates.items():
         spec = MUTABLE.get(key)
         if spec is None:
             reason = IMMUTABLE_REASONS.get(key, "not in mutable allowlist")
             raise ValueError(f"{key} cannot be changed at runtime ({reason})")
-        payload[key] = json.dumps(spec.coerce(raw))
+        value = spec.coerce(raw)
+        if mode == "merge" and spec.kind == "json":
+            value = await _merge_mapping(key, value)
+        payload[key] = json.dumps(value)
 
     # redis 8 的 hset 注解要求键类型是宽 union 且 Mapping 键 invariant，
     # dict[str, str] 无法直接匹配——语义没变，cast(Any) 过桥
     await r.hset(_KEY, mapping=cast(Any, payload))
     _invalidate()
-    log.info("dynconf updated: keys={}", sorted(payload))
+    log.info("dynconf updated: keys={} mode={}", sorted(payload), mode)
     return await snapshot()
 
 
