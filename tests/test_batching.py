@@ -356,6 +356,41 @@ async def test_due_keys_then_tick_releases_expired_batch(task_store, patch_redis
     assert sorted(queue_events.execute) == sorted([TASK_A, TASK_B])
 
 
+async def test_tick_aggregates_rounds_and_keys_match_tick_once(
+    task_store, patch_redis, queue_events, test_settings, monkeypatch
+):
+    """``tick`` 的自旋聚合键集必须与 ``tick_once`` 的返回键集**同源**。
+
+    回归守卫：早前 ``tick`` 按 ``"models"`` 求和，而 ``tick_once`` 返回的键是
+    ``"batches"``，于是 cron 每次执行（每分钟）必抛 ``KeyError: 'models'``，
+    并被 taskiq 记成一次失败任务。之所以能一路发到线上：全部测试只调
+    ``tick_once``，而 ``tick`` 恰恰是 cron 唯一真正调用的那个入口——零覆盖。
+
+    这里既跑通两轮聚合（计数不得恒零、不得重复计数），也把键集锁成契约。
+    """
+    monkeypatch.setattr(batching, "_TICK_ROUNDS", 2)
+    monkeypatch.setattr(batching, "_TICK_INTERVAL", 0)
+
+    # deadline 落在过去：第一轮 due_keys 命中，第二轮应扫到空批（release 幂等）
+    stale = taskstore.now() - 100
+    for tid in (TASK_A, TASK_B):
+        await _seed_waiting(task_store, tid)
+        await batching.join(tid, MODEL, batch_size=99, batch_wait=60, now=stale)
+
+    stat = await batching.tick()
+
+    assert stat["rounds"] == 2, "两轮都必须跑完（一轮炸掉不得带走后续轮次）"
+    # 两个方向都钉住：① 与 tick_once 的键集一致（不一致就按名取键炸，即本次
+    # 线上故障）；② 键名本身是 admin 看板的读取契约，改名必须是有意为之。
+    assert set(stat) == {"rounds", "batches", "released", "requeued",
+                         "skipped", "batched"} == {"rounds",
+                                                   *batching._TICK_STAT_KEYS}, (
+        "tick 的聚合键集必须与 tick_once 的返回键集一致，否则按名取键必炸"
+    )
+    assert stat["released"] == 2, "第一轮整批放行，第二轮不得重复计数"
+    assert sorted(queue_events.execute) == sorted([TASK_A, TASK_B])
+
+
 async def test_tick_drains_requeue_channel(task_store, patch_redis, queue_events,
                                            test_settings):
     """重排任务到期后由同一轮 ticker 放行（两条通道必须一起扫）。"""
@@ -401,6 +436,20 @@ async def test_rebuild_from_db_restores_overdue_batch_and_releases(
 
     assert stat == {"batches": 1, "members": 2, "overdue": 1}
     assert sorted(queue_events.execute) == sorted([TASK_A, TASK_B])
+
+
+async def test_rebuild_empty_stat_has_same_shape_as_success_path(task_store):
+    """空批提前返回的键集必须与成功路径一致（且键名钉死为 batches）。
+
+    回归守卫：空批路径曾写 ``models`` 而成功路径写 ``batches``，同一个函数
+    随「有没有等待成员」换键名；``sweeper`` 的异常兜底还复制了错的那一份。
+    这类缺陷只是 admin 上少显示一个字段，不会让任何用例变红。
+    """
+    stat = await batching.rebuild_from_db(now=1000)
+
+    assert set(stat) == set(batching._REBUILD_STAT_KEYS) == {
+        "batches", "members", "overdue"}
+    assert all(v == 0 for v in stat.values())
 
 
 async def test_rebuild_keeps_existing_deadline(patch_redis, task_store, queue_events):

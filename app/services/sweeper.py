@@ -210,7 +210,10 @@ async def _rebuild_batch_index() -> dict:
         stat = await batching.rebuild_from_db(now=now())
     except Exception:
         log.opt(exception=True).warning("batch index rebuild failed")
-        return {"models": 0, "members": 0, "overdue": 0}
+        # 兜底返回值必须与 ``rebuild_from_db`` 的真实返回**同形**（键名同源），
+        # 否则「重建失败」与「重建成功但没东西可补」在 admin 上是两种形状，
+        # 看板读不到字段只会静默显示空值。
+        return {key: 0 for key in batching._REBUILD_STAT_KEYS}
     return stat
 
 

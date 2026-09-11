@@ -415,6 +415,19 @@ async def admit_due(task_id: str, *, now: int) -> str:
     return "skipped"
 
 
+#: ``tick_once`` 的统计键集，也是 ``tick`` 自旋聚合求和的键集。
+#:
+#: **必须是同一份常量**：这两处曾各写一份字面量，``tick_once`` 累加
+#: ``batches`` 而 ``tick`` 按 ``models`` 求和，于是 cron 每次执行都抛
+#: ``KeyError: 'models'``。别误判成「全面停摆」：第 1 轮的放行已在抛错前执行完，
+#: 实际后果是 **4 轮自旋退化成 1 轮**（秒级 ``batch_wait`` 的精度从约 30s 劣化到
+#: 约 60-90s）外加每分钟一个失败任务——降级 + 噪声，但足以把看板刷满红色。
+#: 之所以没被测试拦住：全部用例只调 ``tick_once``，``tick`` 零覆盖，
+#: 而它恰恰是 cron 唯一真正调用的入口。写成常量让"两处一致"由结构保证，
+#: 而不是靠后来人记得同步改两行字面量。
+_TICK_STAT_KEYS = ("batches", "released", "requeued", "skipped", "batched")
+
+
 async def tick_once(*, now: int | None = None) -> dict[str, int]:
     """扫一轮：到期批次整批放行 + 到期任务（计划/重排）逐条准入。
 
@@ -426,7 +439,7 @@ async def tick_once(*, now: int | None = None) -> dict[str, int]:
     """
     ts = taskstore.now() if now is None else now
     cfg = await dynconf.get_runtime_config()
-    stat = {"batches": 0, "released": 0, "requeued": 0, "skipped": 0, "batched": 0}
+    stat = {key: 0 for key in _TICK_STAT_KEYS}
 
     # 批次放行（T 触发）受 ``batch_enabled`` 这个止血开关管辖……
     if cfg.batch_enabled:
@@ -476,7 +489,7 @@ async def tick() -> dict[str, int]:
     ``batch_wait`` 可以配到秒级，而 cron 最小粒度是 1 分钟——不自旋的话
     ``batch_wait=30`` 的实际放行延迟最坏会被放大到 90s。
     """
-    total = {"rounds": 0, "models": 0, "released": 0, "requeued": 0, "skipped": 0}
+    total = {"rounds": 0, **{key: 0 for key in _TICK_STAT_KEYS}}
     for index in range(_TICK_ROUNDS):
         if index:
             await asyncio.sleep(_TICK_INTERVAL)
@@ -487,9 +500,17 @@ async def tick() -> dict[str, int]:
             log.opt(exception=True).error("batch tick round failed")
             continue
         total["rounds"] += 1
-        for key in ("models", "released", "requeued", "skipped"):
+        for key in _TICK_STAT_KEYS:
             total[key] += stat[key]
     return total
+
+
+#: ``rebuild_from_db`` 的统计键集。**空批路径与成功路径必须同形**：早前
+#: 「无等待成员」的提前返回写的是 ``models``，而成功路径返回 ``batches``，
+#: 同一个函数随数据量给出不同键名——调用方（``sweeper._rebuild_batch_index``
+#: 的异常兜底）也跟着复制了错的那一份。admin 上看板只是显示错字段，
+#: 没有任何测试会失败，所以由常量把三处钉成一份。
+_REBUILD_STAT_KEYS = ("batches", "members", "overdue")
 
 
 async def rebuild_from_db(*, now: int | None = None) -> dict[str, int]:
@@ -503,7 +524,7 @@ async def rebuild_from_db(*, now: int | None = None) -> dict[str, int]:
     ts = taskstore.now() if now is None else now
     rows = await taskstore_batch_waiting()
     if not rows:
-        return {"models": 0, "members": 0, "overdue": 0}
+        return {key: 0 for key in _REBUILD_STAT_KEYS}
 
     grouped: dict[str, list[dict[str, Any]]] = {}
     for row in rows:
@@ -532,7 +553,11 @@ async def rebuild_from_db(*, now: int | None = None) -> dict[str, int]:
     for key in overdue:
         await release_model(key, source="rebuild")
 
-    stat = {"batches": len(grouped), "members": len(rows), "overdue": len(overdue)}
+    stat = {
+        "batches": len(grouped),
+        "members": len(rows),
+        "overdue": len(overdue),
+    }
     log.info("batch index rebuilt from db: {}", stat)
     return stat
 
