@@ -11,6 +11,8 @@
 
 from __future__ import annotations
 
+from typing import Any
+
 from fastapi import APIRouter, HTTPException, Query, Request
 from fastapi.responses import JSONResponse, Response
 
@@ -206,7 +208,7 @@ async def submit_task(path: str, request: Request) -> Response:
     # 于是「提交 → 等 → 轮询失败 → 再提交」永远转不出去。回放要报**真实状态**，
     # 让客户端一眼看出这是同一笔已结束的任务（要重来必须先换 key）。
     task_id, replayed = result.task_id, result.replayed
-    stored: dict = {}
+    stored: dict[str, Any] = {}
     status = QUEUED
     created_at = taskstore.now()
     if replayed:

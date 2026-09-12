@@ -286,9 +286,9 @@ def _parse(policies: dict[str, Any] | None) -> dict[str, dict[str, int]]:
         return {}
 
 
-def _match_path(policies: dict[str, dict[str, int]], path: str) -> tuple[str, dict] | None:
+def _match_path(policies: dict[str, dict[str, int]], path: str) -> tuple[str, dict[str, Any]] | None:
     """端点前缀最长匹配（与 ``async_allow_prefixes`` 同一套前缀语义）。"""
-    best: tuple[str, dict] | None = None
+    best: tuple[str, dict[str, Any]] | None = None
     for key, entry in policies.items():
         if not key.startswith("/"):
             continue

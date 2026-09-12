@@ -189,7 +189,9 @@ async def requeue(task_id: str, *, backoff_ceiling: int) -> int:
     """
     row = await taskstore.get_meta(task_id)
     attempts = int(((row or {}).get("data") or {}).get("requeue_attempts") or 0) + 1
-    delay = min(backoff_ceiling, 2 ** min(attempts, 12))
+    # 显式标注 `int`：`2 ** int` 命中的是 typeshed 里返回 `Any` 的那个 `__pow__`
+    # 重载，不标注会把 Any 一路带到返回值（mypy --strict 的 no-any-return）
+    delay: int = min(backoff_ceiling, 2 ** min(attempts, 12))
     delay = max(1, int(delay * (1.0 + random.uniform(-0.1, 0.1))))
     due_at = taskstore.now() + delay
     await taskstore.patch_data(task_id, {

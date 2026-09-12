@@ -372,6 +372,11 @@ def fake_redis() -> FakeRedis:
 
 #: 所有 ``from app.redis import r`` 的消费方（新增模块时必须同步这张表，
 #: 否则该模块会连真 Redis，测试在无 Redis 环境下静默挂起）
+#
+# 漏登记的后果**取决于消费方的异常策略**：抛错的话是响亮的连接失败；但若像
+# ``statuscache`` 那样 ``except Exception: pass``（缓存失败静默降级），漏登记就
+# 等于「该路径在测试里是彻底的空操作，而套件全绿」——2026-09-13 实测到的真实情形。
+# 完整性由 ``test_misc.test_redis_consumer_list_is_complete`` 机械守住。
 _REDIS_CONSUMERS = (
     "app.deps.ratelimit",
     "app.services.idem",
@@ -383,6 +388,7 @@ _REDIS_CONSUMERS = (
     "app.services.upstream",
     "app.services.batching",
     "app.services.dispatch",
+    "app.services.statuscache",
     "app.healthz",
 )
 
@@ -472,6 +478,19 @@ class InMemoryTaskStore:
             # 真实 SQL 是 JSON_MERGE_PATCH(COALESCE(private_data, '{}'), patch)
             row["private_data"] = {**(row.get("private_data") or {}), **private_patch}
         return True
+
+    # ------------------------------------------------------------------
+    # 本替身**故意不镜像** ``_write`` 的 statuscache write-through。
+    #
+    # 试过镜像（create/cas 后顺手 ``statuscache.set``），结果是 14 条用例变红：
+    # 大量用例的 fixture 直接写 ``rows[tid]["status"] = ...``（其中一条还在
+    # 守护线程里），绕过 cas 却不同步影子缓存 —— 生产里不存在这种写法
+    # （所有迁移都走 cas），于是「镜像」只是把测试的既有惯例判了违规。
+    #
+    # 写穿本身已由 ``test_statuscache.test_real_write_path_does_write_through``
+    # 以结构断言守住（真实实现连 MySQL，在测试里根本不执行，行为断言无从下手）。
+    # 需要模拟「worker 完成了任务」的用例，请像生产那样**同时**更新影子缓存。
+    # ------------------------------------------------------------------
 
     async def patch_data(self, task_id: str, patch: dict) -> None:
         row = self.rows.get(task_id)
@@ -822,7 +841,17 @@ class InMemoryTaskStore:
         return self._now()
 
 
-#: 需要被替换 taskstore 引用的模块
+#: 需要被替换 taskstore 引用的模块。
+#:
+#: **这一列表是「带余量的」，不是「非它不可」**——fixture 里那句
+#: ``setattr(real, name, ...)`` 打在 taskstore **模块的属性**上，而消费者一律是
+#: ``from app.services import taskstore`` + ``taskstore.xxx()`` 的模块限定访问，
+#: 所以逐名替换本身已经覆盖它们。本列表额外买到的只有一件事：万一哪天出现
+#: **未登记**的函数，在这些模块里会以 AttributeError 当场炸出来，而不是静默落到
+#: 真 MySQL。登记表的完整性已由
+#: ``test_misc.test_taskstore_test_double_covers_every_public_function`` 守住，
+#: 故本列表的价值主要在**声明意图/可读性**——删掉它不会让替身失效，加进模块也不会
+#: 让未登记的函数变得可用。
 _TASKSTORE_CONSUMERS = (
     "app.services.submit",
     "app.services.execute",
@@ -846,15 +875,43 @@ _TASKSTORE_FUNCS = (
     "scheduled_overview",
 )
 
+#: taskstore 上的**纯函数**（不碰 session / DB，故不需要测试替身）。
+#: 它们不出现在 ``_TASKSTORE_FUNCS`` 里是**有意的**——但「有意」必须被机械守住，
+#: 否则下一个人要么以为漏登记了、要么把真有状态的函数也塞进来（后者会让测试里
+#: 那条调用静默打到真 MySQL）。由
+#: ``test_misc.test_taskstore_test_double_covers_every_public_function`` 校验。
+_TASKSTORE_PURE_FUNCS = ("as_unix_seconds",)
+
+
+def _taskstore_patch_targets() -> list[str]:
+    """``taskstore`` 包**以及它的每个子模块**。
+
+    包化（2026-09-13）之后必须逐个 patch 子模块，否则会出现最坏的一类静默失败：
+    模块内部的跨模块调用（如 ``_write`` 里的 ``unclaim_for_release`` 调 ``patch_data``、
+    ``_sweeper`` 调 ``now``）在**导入期**就把函数对象绑进了那个子模块的命名空间，
+    只 patch 包命名空间够不着它——那条路径会绕过替身、**直接打到真 MySQL**。
+
+    子模块清单**由包自动枚举**（不写死第二张手维护表，否则又是新的漂移点）。
+    """
+    import pkgutil
+
+    import app.services.taskstore as package
+
+    return [package.__name__] + [
+        m.name for m in pkgutil.iter_modules(package.__path__, package.__name__ + ".")
+    ]
+
 
 @pytest.fixture
 def task_store(monkeypatch: pytest.MonkeyPatch) -> InMemoryTaskStore:
     import importlib
 
     store = InMemoryTaskStore()
-    real = importlib.import_module("app.services.taskstore")
-    for name in _TASKSTORE_FUNCS:
-        monkeypatch.setattr(real, name, getattr(store, name))
+    for mod_name in _taskstore_patch_targets():
+        module = importlib.import_module(mod_name)
+        for name in _TASKSTORE_FUNCS:
+            if name in vars(module):      # 只替换真正定义/绑定在该模块里的名字
+                monkeypatch.setattr(module, name, getattr(store, name))
     for mod_name in _TASKSTORE_CONSUMERS:
         module = importlib.import_module(mod_name)
         if hasattr(module, "taskstore"):

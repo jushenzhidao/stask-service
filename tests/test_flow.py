@@ -6,12 +6,13 @@
 
 from __future__ import annotations
 
+import asyncio
 import threading
 import time
 
 import pytest
 
-from app.services import slots, tokensession
+from app.services import slots, statuscache, tokensession
 from tests.conftest import stored_body
 
 BASE = "/async/v1/images/generations"
@@ -210,6 +211,11 @@ async def test_long_poll_returns_on_terminal(client, task_store, test_settings):
             "upstream_content_type": "application/json",
             "upstream_status": 200,
         })
+        # 必须**同时**刷影子缓存：真实链路的终态迁移走 cas，而 cas 会
+        # write-through 到 statuscache（长轮询正是靠它秒级看见终态）。
+        # 只改行不刷缓存的话，长轮询会一直命中曾经回填的「进行中」，
+        # 直到 TTL 到期都看不到终态——生产里不可能出现这种状态。
+        asyncio.run(statuscache.set(TASK, "SUCCESS"))
 
     threading.Thread(target=flip_after_delay, daemon=True).start()
     resp = client.get(f"{BASE}/{TASK}?wait=3")

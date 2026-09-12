@@ -34,6 +34,8 @@ FAILURE，无资金风险。
 
 from __future__ import annotations
 
+from typing import Any
+
 import json
 import time
 from dataclasses import dataclass
@@ -144,7 +146,7 @@ _ENABLED = 1
 _EXHAUSTED = 4
 
 
-async def _fetch_credential(raw_token: str) -> dict | None:
+async def _fetch_credential(raw_token: str) -> dict[str, Any] | None:
     """按 key 查 tokens ⋈ users（共享库只读）。异常向上抛（→ 502）。"""
     from app.db import get_session_factory
 
@@ -155,7 +157,7 @@ async def _fetch_credential(raw_token: str) -> dict | None:
     return dict(row) if row else None
 
 
-def _validate(row: dict) -> AuthInfo:
+def _validate(row: dict[str, Any]) -> AuthInfo:
     """按 new-api ValidateUserToken 语义判定。失败抛 UpstreamAuthError。"""
     token_status = int(row.get("status") or 0)
     if token_status == _EXHAUSTED:

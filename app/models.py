@@ -1,6 +1,6 @@
 """new-api 现有 ``tasks`` 表的映射说明（**仅供参考，运行时不使用**）。
 
-本服务不建任何表。实际读写全部走 ``app/services/taskstore.py`` 的原生 SQL
+本服务不建任何表。实际读写全部走 ``app/services/taskstore/`` 包里的原生 SQL
 （``JSON_MERGE_PATCH`` 等 MySQL 特有能力，ORM 表达不出来）。
 
 与 new-api 的共存契约（ADR-006）：

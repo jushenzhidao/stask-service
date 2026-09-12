@@ -51,7 +51,7 @@ async def dashboard() -> HTMLResponse:
 async def overview(
     window: int = Query(3600, ge=60, le=7 * 86400),
     _: None = Depends(require_admin),
-) -> dict:
+) -> dict[str, Any]:
     """概览：窗口内指标 + 运行时信息。"""
     try:
         data = await taskstore.metrics(window)
@@ -73,7 +73,7 @@ async def overview(
 async def slot_watermark(
     limit: int = Query(50, ge=1, le=500),
     _: None = Depends(require_admin),
-) -> dict:
+) -> dict[str, Any]:
     """按 (模型, token) 的在途占用与上限 Top N（PRD R-22 / AC-62）。
 
     回答的是运维最常问的那个问题：「闸门到底是满的还是坏的」。
@@ -116,7 +116,7 @@ async def slot_watermark(
 
 
 @router.get("/api/schedule")
-async def schedule_overview(_: None = Depends(require_admin)) -> dict:
+async def schedule_overview(_: None = Depends(require_admin)) -> dict[str, Any]:
     """调度视图（PRD R-21）：计划中任务（按小时分桶）+ 等待中批次 + 重排积压。
 
     **必须挂在管理面，不能挂用户面的 ``/ops``**：批次归组键在
@@ -148,7 +148,7 @@ async def list_tasks(
     limit: int = Query(50, ge=1, le=200),
     offset: int = Query(0, ge=0, le=10_000),
     _: None = Depends(require_admin),
-) -> dict:
+) -> dict[str, Any]:
     """任务列表（分页 + 筛选）。不含请求体与结果原文。
 
     ``task_id`` 是精确匹配；前缀检索使用 ``task_id_prefix``，避免前导通配符
@@ -167,7 +167,7 @@ async def list_tasks(
 
 
 @router.get("/api/tasks/{task_id}")
-async def task_detail(task_id: str, _: None = Depends(require_admin)) -> dict:
+async def task_detail(task_id: str, _: None = Depends(require_admin)) -> dict[str, Any]:
     """单任务详情（脱敏，走 ``get_meta`` 元数据投影，不拉结果体大字段）。
 
     ``fail_reason`` 现在带上游的具体错误消息（``upstream 400: <message>``），
@@ -180,8 +180,8 @@ async def task_detail(task_id: str, _: None = Depends(require_admin)) -> dict:
     task = await taskstore.get_meta(task_id)
     if task is None:
         raise HTTPException(404, "task not found")
-    data: dict = task.get("data") or {}
-    private: dict = task.get("private_data") or {}
+    data: dict[str, Any] = task.get("data") or {}
+    private: dict[str, Any] = task.get("private_data") or {}
     return {
         "task_id": task["task_id"],
         "status": task["status"],
@@ -220,7 +220,7 @@ async def task_detail(task_id: str, _: None = Depends(require_admin)) -> dict:
 
 
 @router.post("/api/tasks/{task_id}/requeue")
-async def requeue(task_id: str, _: None = Depends(require_admin)) -> dict:
+async def requeue(task_id: str, _: None = Depends(require_admin)) -> dict[str, Any]:
     """重投一个卡住的任务（排障用）。
 
     **只对非终态任务开放**，且**绝不清派发锁**——锁在就意味着一次调用
@@ -243,7 +243,7 @@ async def requeue(task_id: str, _: None = Depends(require_admin)) -> dict:
 
 
 @router.get("/api/config")
-async def read_config(_: None = Depends(require_admin)) -> dict:
+async def read_config(_: None = Depends(require_admin)) -> dict[str, Any]:
     """可热改配置的全量视图 + 只读项及其原因。"""
     return await dynconf.snapshot()
 
@@ -253,7 +253,7 @@ async def write_config(
     updates: dict[str, Any] = Body(...),
     mode: str = Query("replace", pattern="^(replace|merge)$"),
     _: None = Depends(require_admin),
-) -> dict:
+) -> dict[str, Any]:
     """批量更新覆盖值。白名单外的键一律拒绝，校验失败整批回退。
 
     ``?mode=merge`` 时，映射型配置项（``model_policies``）按**顶层键合并**：
@@ -270,7 +270,7 @@ async def write_config(
 async def reset_config(
     keys: list[str] | None = Body(None),
     _: None = Depends(require_admin),
-) -> dict:
+) -> dict[str, Any]:
     """删除覆盖值回落 env。``keys`` 为空/省略则清空全部覆盖。
 
     用 POST 而不是 DELETE：DELETE 带请求体在很多 HTTP 客户端与代理上
@@ -283,7 +283,7 @@ async def reset_config(
 
 
 @router.post("/api/jobs/{job}")
-async def run_job(job: str, _: None = Depends(require_admin)) -> dict:
+async def run_job(job: str, _: None = Depends(require_admin)) -> dict[str, Any]:
     """手工触发定时任务（卡死收敛 / 超龄判死 / 槽位校准 / 结果清理）。"""
     jobs = {
         "stale": sweeper.sweep_stale,

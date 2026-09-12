@@ -10,6 +10,8 @@ TCP + TLS 握手，握手开销会成为提交链路 P99 的主要来源。
 
 from __future__ import annotations
 
+from typing import Any
+
 import httpx
 
 from app.logging import log
@@ -18,7 +20,7 @@ from app.logging import log
 _shared: dict[str, httpx.AsyncClient] = {}
 
 
-def shared_client(name: str, **kwargs) -> httpx.AsyncClient:
+def shared_client(name: str, **kwargs: Any) -> httpx.AsyncClient:
     """按用途名取共享客户端；不存在或已关闭时按 ``kwargs`` 新建。
 
     key **只用 name**：可变的 timeout 之类参数绝不能进 key，否则运行时改

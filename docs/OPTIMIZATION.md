@@ -1,6 +1,24 @@
-# 性能与代码质量优化记录
+# 性能与代码质量优化记录（2026-09-03 快照）
 
-本文档记录 2026-09-03 针对 stask-service 的优化内容。
+> **本文是一次特定时间点的优化记录，不是当前事实源。**
+> 当前行为以 `docs/SPEC.md`（契约）与 `docs/decisions/ADR-*.md`（裁决）为准。
+>
+> 2026-09-13 逐项复核后的状态见下表。复核发现 **1 项的标的代码在本仓并不存在**
+> （`submit_v2.py`）——已就地标注：留着一份描述不存在文件的文档，比没有文档更糟，
+> 因为读者会照着它去找那个文件。
+
+## 复核状态（2026-09-13）
+
+| # | 项目 | 位置 | 当时声称的改进 | 复核结论 |
+|---|---|---|---|---|
+| 1 | 并发查询 | `taskstore.metrics()` | 5 个串行 SELECT → `asyncio.gather` | 仍成立 |
+| 2 | 并发分页 | `taskstore.search()` | COUNT + SELECT 并发 | 仍成立 |
+| 3 | 指数退避轮询 | `flow._long_poll()` | 固定 0.5s → 指数增长（封顶 5s 或预算 1/4） | 仍成立 |
+| 4 | Redis 连接池 | `app/redis.py` | 50 → 100 连接 + keepalive + retry | 仍成立 |
+| 5 | JSON 解析 | `taskstore._row_to_dict()` | 已是 dict 时跳过 `json.loads` | 仍成立 |
+| 6 | 提交链路重构 | ~~`submit_v2.py`~~ | 用 `_RollbackStack` 封装回滚 | **未落地**（标的文件不存在） |
+
+---
 
 ## 优化概览
 
@@ -14,11 +32,11 @@
 | 4. Redis 连接池 | `redis.py` | 默认 50 → 100 连接 + keepalive | 高并发下 Redis 操作延迟降低 |
 | 5. JSON 解析优化 | `taskstore._row_to_dict()` | 跳过已解码的 dict | 查询端点响应时间降低 ~5% |
 
-### 代码质量（1 项）
+### 代码质量（1 项 — 未落地，见 §6）
 
 | 优化项 | 位置 | 改进 | 价值 |
 |--------|------|------|------|
-| 6. 提交链路重构 | `submit_v2.py` | 用 `_RollbackStack` 封装回滚逻辑 | 可读性提升，消除 3 层嵌套 |
+| 6. 提交链路重构 | ~~`submit_v2.py`~~ | 用 `_RollbackStack` 封装回滚逻辑 | 提出但未落地；当前为内联回滚（见 §6） |
 
 ---
 
@@ -86,8 +104,8 @@ while time.monotonic() < deadline:
     await asyncio.sleep(0.5)
     status = await taskstore.get_status(task_id)
 
-# 后：指数退避 0.5s → 1s → 2s → 4s（上限 5s）
-interval = 0.5
+# 后：指数退避 0.5s → 1s → 2s → 4s（上限 = min(5.0, 预算/4)）
+interval = settings.poll_interval_seconds
 while time.monotonic() < deadline:
     await asyncio.sleep(interval)
     status = await taskstore.get_status(task_id)
@@ -100,6 +118,8 @@ while time.monotonic() < deadline:
 - 高并发场景下 DB 压力显著降低
 
 **权衡**：长尾任务（55-60s 完成）的最后感知延迟增加 2-3s，可接受。
+
+**后续**：长轮询读侧另有 `app/services/statuscache.py` 做写穿缓存，把「每个等待客户端 × 每 1~5s 一条查询」再压一层。
 
 ---
 
@@ -155,52 +175,29 @@ def _row_to_dict(row: Any) -> dict:
 
 ---
 
-### 6. 提交链路重构（submit_v2.py）
+### 6. 提交链路重构（**未落地**）
 
-**问题**：原 `submit.py` 的回滚逻辑散落在 try/except 中，嵌套 3 层，新增步骤容易遗漏回滚路径。
-
-**方案**：封装 `_RollbackStack` 类统一管理资源：
+**当时提出的方案**：抽出 `submit_v2.py`，用 `_RollbackStack` 类统一管理资源获取与回滚，替代散落在 try/except 中的回滚逻辑（3 层嵌套）：
 
 ```python
 class _RollbackStack:
     """回滚栈：资源获取成功时记录，失败时按 LIFO 顺序释放。"""
-    
-    def __init__(self, token_hash: str):
-        self.token_hash = token_hash
-        self.slot_taken = False
-        self.idem_backfilled = False
-        self.task_id = ""
-    
-    async def rollback(self):
-        """按获取的反序释放：槽 → 幂等占位 → 任务判死。"""
-        if self.slot_taken:
-            await slots.release(self.token_hash)
-        # ... 其余回滚逻辑
+    ...
 ```
 
-**使用方式**：
+**复核结论（2026-09-13）：** 该抽取**在本仓不存在**——
+
+- `app/services/submit_v2.py` 不存在（也没有任何地方引用它）；
+- `app/services/submit.py` 里没有 `_RollbackStack`；
+- 当前做法是**单个 try/except 里内联回滚**，并用注释把纪律写死：
+
 ```python
-rb = _RollbackStack(th)
-try:
-    # ... 提交步骤
-    rb.slot_taken = True
-    # ...
-    rb.task_id = task_id
-except Exception:
-    await rb.rollback()
-    raise
+# 回滚顺序与获取顺序相反：先还槽/退批，再处理占位。
 ```
 
-**收益**：
-- 可读性显著提升（扁平结构）
-- 回滚逻辑集中，易于维护
-- 保持原语义不变，可无缝替换
+**为什么不建议现在补做**：内联形式的回滚**顺序契约**由注释 + `submit.py` 的回滚路径用例共同钉住；改成回滚栈会让「哪一步失败要还哪些资源」从**一眼读得到的代码**变成需要跟着类实现跳转的间接层。在没有真实缺陷驱动的情况下，这是纯风险。
 
-**切换方法**：
-```python
-# app/routers/proxy.py 中改为
-from app.services.submit_v2 import submit
-```
+**若将来要做**：判据应是「同一条回滚路径被写了两遍」或「新增步骤漏回滚导致用例变红」，而不是「代码看起来不够整齐」。
 
 ---
 
@@ -231,33 +228,42 @@ wrk -t 10 -c 200 -d 30s --script submit.lua http://127.0.0.1:8000/async/v1/image
 ```
 **预期**：Redis 连接等待时间 < 5ms（原 > 20ms）。
 
+> 注：以上均为**当时的预期值**，未留下可复核的实测记录。真实的延迟/容量结论请以
+> `docs/perf-regression.md` 与压测脚本 `scripts/bench_architecture.py` 的实际输出为准。
+
 ---
 
 ## 其他发现（未修改项）
 
-### 待讨论
+### 1. Redis 降级策略不一致 — 仍未修，但口径是清楚的
 
-1. **Redis 降级策略不一致**
-   - 限流失败 → 放行（ratelimit.py）
-   - 派发锁失败 → 拒绝（execute.py）
-   
-   **建议**：在 `docs/decisions/` 中增加 ADR 说明两者差异的原因（前者是软措施，后者是防双扣的硬保证）。
+- 限流失败 → 放行（`app/deps/ratelimit.py`）
+- 派发锁失败 → 拒绝（`app/services/execute.py`）
 
-2. ~~**时间归一逻辑散落**：`_secs()` 在每个 SQL 中手工拼接，容易遗漏。~~
-   **已解决（ADR-008）**：`_secs()` 整体删除。写侧恒写 unix 秒 + 查询恒带
-   `platform='stask'`，SQL 时间谓词改裸列比较，既消除了拼接遗漏，也让
-   sweeper 的 range 条件恢复走索引。读侧保留 `as_unix_seconds` 兜底。
+两者差异是**有意的**：前者是软措施（放行只意味着这一轮不计数），后者是防重复调用上游的硬保证。
+当时建议「在 `docs/decisions/` 中增加 ADR 说明差异」——**至今没有该 ADR**，
+口径散落在两个模块的注释里。要固化就补 ADR，不要改代码。
 
-3. **类型标注可加强**
-   `taskstore.get()` 返回 `dict | None`，字段结构依赖文档。
-   
-   **建议**：定义 `TypedDict` 或 Pydantic Model 提升类型安全。
+### 2. ~~时间归一逻辑散落~~ — 已解决（ADR-008）
+
+`_secs()` 整体删除。写侧恒写 unix 秒 + 查询恒带 `platform='stask'`，SQL 时间谓词改裸列比较。
+读侧保留 `as_unix_seconds` 兜底。
+
+### 3. 类型标注可加强 — 未做，且不建议现在做
+
+`taskstore.get()` 返回 `dict | None`，字段结构依赖文档。当时建议定义 `TypedDict` 或
+Pydantic Model。
+
+**复核后不建议**：`data` 列的字段契约已经是**文档 + 守卫**两层锁定（`docs/SPEC.md` §6 的字段表
++ `taskstore._META_*` 常量组，且有用例钉住「释放/判死所需键必须在投影里」）。再加一层
+TypedDict 会引入**第三份**字段清单——而「一个契约只能有一份实现」是本项目的硬不变式，
+多一份清单就多一个漂移点。
 
 ---
 
 ## 回滚方案
 
-若优化引入问题，可按以下步骤回滚：
+若某项优化引入问题，按以下步骤回滚：
 
 ```bash
 # 1. 恢复代码（Git）
@@ -267,19 +273,23 @@ git revert <commit-hash>
 # - 并发查询：删除 asyncio.gather，恢复串行
 # - 指数退避：改回固定 settings.poll_interval_seconds
 # - Redis 连接池：删除 max_connections 等参数
-# - submit_v2：改回 from app.services.submit import submit
 ```
 
----
-
-## 后续优化方向
-
-1. **缓存层** — 为 `taskstore.get()` 增加短期 LRU 缓存（TTL 5s），减少重复查询
-2. **批量接口** — 提供批量查询接口（`/admin/api/tasks?ids=x,y,z`），减少往返
-3. **索引审查** — 确认 `tasks` 表在 `(platform, status, created_at)` 上有复合索引
-4. **异步回调** — 回调改用独立队列，不阻塞终态落库链路
-5. **监控埋点** — 为关键路径（提交/执行/对账）增加 Prometheus metrics
+> 原第 6 项的回滚说明（「改回 `from app.services.submit import submit`」）**已删除**：
+> 它所针对的 `submit_v2.py` 不存在，照它操作只会得到一个 ImportError。
 
 ---
 
-*最后更新：2026-09-03*
+## 后续优化方向（含 2026-09-13 复核状态）
+
+| 方向 | 状态 |
+|---|---|
+| 缓存层 — 为 `taskstore.get()` 加短期 LRU | **部分落地**：`app/services/statuscache.py` 已对长轮询读侧做写穿缓存；`get()` 本身仍直查（它只给回放与执行前取体两条路径用，都是单次读，没有缓存价值） |
+| 批量接口 — `/admin/api/tasks?ids=x,y,z` | 未做。看板已有分页 + `task_id_prefix` 前缀检索，实际未出现需要批量取体的场景 |
+| 索引审查 — 确认 `tasks` 表复合索引 | 未做。`tasks` 表与 new-api 共用（ADR-001），加索引会同时影响上游，属运维决策；SQL 已刻意只用可走索引的裸列比较（AC-31） |
+| 异步回调 — 回调改用独立队列 | **已落地**：回调走独立 taskiq 任务 `queue.notify_task`，不阻塞终态落库链路 |
+| 监控埋点 — Prometheus metrics | **有意不做**：管理看板的数字全走 DB 聚合查询，metrics 无消费方，故 `LOGFIRE_METRICS_ENABLED` 默认关（见 SPEC §4） |
+
+---
+
+*本文为 2026-09-03 快照，2026-09-13 复核并就地订正。*

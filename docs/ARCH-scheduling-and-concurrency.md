@@ -23,7 +23,7 @@
 |---|---|---|---|
 | **B1** | 用户令牌会话 TTL 固定 2h（`sk_session_ttl_seconds=7200`，`config.py:213`），而 PRD 的延迟上限默认 6h、硬上限 12h | 任何延迟 > 2h 的任务，到点时令牌已过期 → `execute.py:240` 走 `token_missing` → **100% FAILURE**。这是功能性彻底失效，不是性能问题 | 令牌会话 TTL 改为**按任务计算**，并把延迟上限**从 TTL 上限反推**（§2.1）——不可反过来独立选一个延迟上限 |
 | **B2** | `sweep_stale` 的重投路径直接 `publish_execute`（`sweeper.py:140-142`），**绕过占槽** | 放行必须占槽（AC-43），但兜底重投不占——同一个任务两条入队路径两套账，槽计数必然漂移；且等待期任务被提前执行 | 放行动作收敛为**唯一策略点** `release()`，兜底扫描必须调它而非 `publish_execute`（§3.4） |
-| **B3** | PRD Q3 提出把 `sweep_overdue` 计时起点改为 `max(created_at, scheduled_at)` | `overdue_active()` 现在靠 `created_at < :cutoff` 命中索引（`taskstore.py:561`），改成 JSON 表达式取 max 会退化为全表扫 | 无需改起点：用**索引友好的双谓词**改写，粗筛仍走 `created_at` 索引，精筛做残差过滤（§5.1）——原谓词恰好是新语义的超集，可证 |
+| **B3** | PRD Q3 提出把 `sweep_overdue` 计时起点改为 `max(created_at, scheduled_at)` | `overdue_active()` 现在靠 `created_at < :cutoff` 命中索引（`taskstore/_sweeper.py`），改成 JSON 表达式取 max 会退化为全表扫 | 无需改起点：用**索引友好的双谓词**改写，粗筛仍走 `created_at` 索引，精筛做残差过滤（§5.1）——原谓词恰好是新语义的超集，可证 |
 
 ---
 
@@ -123,7 +123,7 @@ release(task_id):
 
 ### 2.3 B3 — 超龄扫描不改计时起点，改谓词（PRD Q3 的性能风险可消除）
 
-PRD 担心的是对的：`overdue_active()` 现在是 `created_at < :cutoff`（`taskstore.py:561`），
+PRD 担心的是对的：`overdue_active()` 现在是 `created_at < :cutoff`（`taskstore/_sweeper.py`），
 `created_at` 有索引；若改成 `max(created_at, JSON_EXTRACT(data,'$.scheduled_at')) < :cutoff`，
 JSON 表达式不可索引，MySQL 必然全表扫 `tasks`（与 new-api 共表，行数量级是全平台任务）。
 

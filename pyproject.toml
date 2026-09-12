@@ -4,7 +4,10 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "stask-service"
-version = "0.1.0"
+# 版本号唯一事实源 = app/__init__.py 的 __version__（不在这里写死）。
+# 三处曾经各写一个数字（pyproject 0.1.0 / config 0.2.0 / 镜像 tag 又不同），
+# 于是 /healthz、OpenAPI version、logfire service_version 报的是哪个纯属运气。
+dynamic = ["version"]
 description = "同步转异步任务网关：给 new-api 同步生成 API 加 /async 前缀即任务化"
 requires-python = ">=3.12"
 dependencies = [
@@ -43,6 +46,10 @@ dev = [
 [tool.setuptools.packages.find]
 include = ["app*"]
 
+[tool.setuptools.dynamic]
+# 从 app/__init__.py 的模块级字面量静态读取（setuptools 用 AST，不 import 模块）
+version = {attr = "app.__version__"}
+
 [tool.ruff]
 target-version = "py312"
 line-length = 100
@@ -66,5 +73,11 @@ testpaths = ["tests"]
 
 [tool.mypy]
 python_version = "3.12"
-strict = false
+# 2026-09-13 起开启严格模式。此前 `strict = false` 让「裸泛型注解 / 未标注签名 /
+# 返回 Any」悄悄累积——实测历史遗留 87 处（其中 81 处只是 `dict` → `dict[str, Any]`），
+# 一次性修完。事实是团队本来就在按严格标准写（全仓 305 个函数只差 1 个返回标注），
+# 那就让工具来保证它不退化，而不是靠纪律。
+# `test_misc.test_mypy_clean` 把它带进了默认门禁（`make check`）。
+strict = true
+# 第三方没有 stub 的依赖（如 taskiq / taskiq-admin 相关）仍放行
 ignore_missing_imports = true

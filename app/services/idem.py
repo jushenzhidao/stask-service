@@ -19,6 +19,7 @@ import asyncio
 import hashlib
 import time
 import uuid
+from collections.abc import Awaitable, Callable
 
 from app.redis import K_IDEM, LUA_CAS_DELETE, r
 
@@ -65,7 +66,7 @@ async def settle(task_id: str) -> None:
         pass  # 占位有 TTL，删失败也会自行过期
 
 
-async def wait_row(task_id: str, exists) -> bool:
+async def wait_row(task_id: str, exists: Callable[[str], Awaitable[bool]]) -> bool:
     """短轮询等占位者把行写进 DB。
 
     ``exists``：``async (task_id) -> bool`` 回调（查 tasks 表）。

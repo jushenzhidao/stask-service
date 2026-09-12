@@ -20,7 +20,7 @@ from loguru import logger
 
 from app.config import settings
 from app.logging import _effective_level, setup_logging
-from app.services.execute import _digest, _log_headers
+from app.services.logdigest import _digest, _log_headers
 
 ROOT = Path(__file__).resolve().parents[1]
 

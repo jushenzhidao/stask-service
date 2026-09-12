@@ -2,7 +2,7 @@
 
 > 版本：v0.1（设计评审稿）
 > 作者：许清楚（产品）
-> 基线：`docs/SPEC.md` v1.0 + 当前 main 代码事实
+> 基线：`docs/SPEC.md` v1.1（2026-09-13 重对齐）+ 当前 main 代码事实
 > 本轮交付止于设计文档，不含生产代码。
 
 ---
@@ -22,7 +22,7 @@
 | `flow.cancel` 取消时**无条件** `slots.release(token_hash)` | `flow.py:188-190` | 若计划任务不占槽，取消它会还掉同 token 其他在途任务的槽 → 并发超卖 |
 | 提交限流默认 60 次 / 60 秒，按 `token_hash` | `config.py:188` | 「突发 500 条」在提交阶段就会被 429 挡下，批量聚合功能有前置条件 |
 | `schedule_by_time` + `ListRedisScheduleSource` 已投产（回调重试在用） | `queue.py:77`、`publish_notify` | 延迟下发有现成机制，`with_labels(delay=)` 对 redis broker 无效（SPEC §11 已记录） |
-| `data->>'$.model'` 已被 admin 检索与指标聚合使用 | `taskstore.py:557,667` | 模型维度在数据层已可查，扩并发维度不需要新表 |
+| `data->>'$.model'` 已被 admin 检索与指标聚合使用 | `taskstore/_admin_query.py` | 模型维度在数据层已可查，扩并发维度不需要新表 |
 
 ---
 

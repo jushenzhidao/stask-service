@@ -36,6 +36,8 @@ broker = **RedisStreamBroker**（Redis Stream + consumer group，at-least-once�
 
 from __future__ import annotations
 
+from typing import Any
+
 import dataclasses
 import datetime as dt
 
@@ -103,7 +105,7 @@ class ObservabilityMiddleware(TaskiqMiddleware):
         flush_observability()
 
     async def on_error(
-        self, message: TaskiqMessage, result: TaskiqResult, exception: BaseException
+        self, message: TaskiqMessage, result: TaskiqResult[Any], exception: BaseException
     ) -> None:
         log.opt(exception=exception).error(
             "task failed: name={} args={}", message.task_name, message.args
@@ -131,7 +133,7 @@ class OutcomeMiddleware(TaskiqMiddleware):
     ``on_error`` 不会因此被触发：它只在任务真抛异常时由 receiver 调用。
     """
 
-    async def post_execute(self, message: TaskiqMessage, result: TaskiqResult) -> None:
+    async def post_execute(self, message: TaskiqMessage, result: TaskiqResult[Any]) -> None:
         if result.error is not None:
             return  # 真异常已有错误对象，别覆盖真实堆栈
         value = result.return_value
@@ -175,7 +177,7 @@ broker.add_middlewares(*_build_middlewares())
 
 
 @broker.task
-async def execute_task(task_id: str, _context: Context = TaskiqDepends()) -> dict:
+async def execute_task(task_id: str, _context: Context = TaskiqDepends()) -> dict[str, Any]:
     """执行一个任务（设计 §5）。
 
     队列是 at-least-once：本函数可能被同一个 task_id 调用多次（崩溃后
@@ -194,7 +196,7 @@ async def execute_task(task_id: str, _context: Context = TaskiqDepends()) -> dic
 
 @broker.task
 async def notify_task(task_id: str, attempt: int = 1,
-                      _context: Context = TaskiqDepends()) -> dict:
+                      _context: Context = TaskiqDepends()) -> dict[str, Any]:
     """终态回调推送（失败按指数退避重投，上限 ``CALLBACK_MAX_ATTEMPTS``）。
 
     返回投递摘要（delivered / rejected+HTTP 码 / transport_error / exhausted），
@@ -207,7 +209,7 @@ async def notify_task(task_id: str, attempt: int = 1,
 
 @broker.task
 async def release_batch(model: str, source: str = "batch",
-                        _context: Context = TaskiqDepends()) -> dict:
+                        _context: Context = TaskiqDepends()) -> dict[str, Any]:
     """放行一个模型的整批任务（N 触发 / T 触发 / 人工放行共用）。
 
     N 触发时 web 侧只 ``kiq`` 这个任务就返回 202——**绝不在提交响应里同步
@@ -223,7 +225,7 @@ async def release_batch(model: str, source: str = "batch",
 
 
 @broker.task(schedule=[{"cron": "* * * * *"}])
-async def tick_batches(_context: Context = TaskiqDepends()) -> dict:
+async def tick_batches(_context: Context = TaskiqDepends()) -> dict[str, Any]:
     """每分钟：T 触发 + 占槽失败重排的到期扫描。
 
     cron 的最小粒度是 1 分钟，而 ``batch_wait`` 允许配到秒级——所以本任务
@@ -244,7 +246,7 @@ async def tick_batches(_context: Context = TaskiqDepends()) -> dict:
 
 
 @broker.task(schedule=[{"cron": "*/2 * * * *"}])
-async def sweep_stale(_context: Context = TaskiqDepends()) -> dict:
+async def sweep_stale(_context: Context = TaskiqDepends()) -> dict[str, Any]:
     """每 2 分钟：卡死任务收敛（消息丢失重投 / 派发后失联判死）。
 
     Stream broker 下队列层已不丢消息，本任务退化为**第二道保险**：
@@ -261,7 +263,7 @@ async def sweep_stale(_context: Context = TaskiqDepends()) -> dict:
 
 
 @broker.task(schedule=[{"cron": "*/5 * * * *"}])
-async def sweep_overdue(_context: Context = TaskiqDepends()) -> dict:
+async def sweep_overdue(_context: Context = TaskiqDepends()) -> dict[str, Any]:
     """每 5 分钟：超龄任务判死（必须先于 new-api 的 24h 清理线收敛）。"""
     if not settings.sweep_enabled:
         return {"skipped": "sweep_disabled"}
@@ -271,7 +273,7 @@ async def sweep_overdue(_context: Context = TaskiqDepends()) -> dict:
 
 
 @broker.task(schedule=[{"cron": "*/5 * * * *"}])
-async def sweep_slots(_context: Context = TaskiqDepends()) -> dict:
+async def sweep_slots(_context: Context = TaskiqDepends()) -> dict[str, Any]:
     """每 5 分钟：并发槽计数按 tasks 表事实校准。"""
     if not settings.sweep_enabled:
         return {"skipped": "sweep_disabled"}
@@ -281,7 +283,7 @@ async def sweep_slots(_context: Context = TaskiqDepends()) -> dict:
 
 
 @broker.task(schedule=[{"cron": "17 * * * *"}])
-async def sweep_results(_context: Context = TaskiqDepends()) -> dict:
+async def sweep_results(_context: Context = TaskiqDepends()) -> dict[str, Any]:
     """每小时第 17 分：清理超期结果体（设计 §9）。
 
     错开整点：整点是各类定时任务的高峰，DB 上再叠一个批量 UPDATE 不划算。

@@ -110,7 +110,7 @@ class Spec:
             raise ValueError(f"{self.key}: above maximum {self.maximum}")
         return number
 
-    def to_dict(self, current: Any, overridden: bool) -> dict:
+    def to_dict(self, current: Any, overridden: bool) -> dict[str, Any]:
         value = current
         if self.kind == "json":
             # 看板表单是纯文本输入框：给一份缩进 JSON，人可直接编辑
@@ -456,7 +456,7 @@ async def reset(keys: list[str] | None = None) -> dict[str, Any]:
 async def snapshot() -> dict[str, Any]:
     """看板用的全量视图：可改项（含当前值与是否被覆盖）+ 只读项说明。"""
     overrides = await _load()
-    groups: dict[str, list[dict]] = {}
+    groups: dict[str, list[dict[str, Any]]] = {}
     for key, spec in MUTABLE.items():
         current = overrides.get(key, getattr(settings, key))
         groups.setdefault(spec.group, []).append(

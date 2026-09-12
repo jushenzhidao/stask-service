@@ -15,6 +15,8 @@
 
 from __future__ import annotations
 
+from typing import Any
+
 import hashlib
 import hmac
 import json
@@ -64,7 +66,7 @@ def _url_allowed(url: str) -> bool:
     )
 
 
-async def deliver(task_id: str, attempt: int = 1) -> dict:
+async def deliver(task_id: str, attempt: int = 1) -> dict[str, Any]:
     """推送一次；失败按退避重投（taskiq 任务体调用）。
 
     返回本次投递摘要，供 taskiq-admin 的 ``Return Value`` 直接排障：
@@ -78,7 +80,7 @@ async def deliver(task_id: str, attempt: int = 1) -> dict:
     if task is None:
         return {"ok": False, "task_id": task_id, "attempt": attempt,
                 "result": "skipped", "reason": "task_row_missing"}
-    data: dict = task.get("data") or {}
+    data: dict[str, Any] = task.get("data") or {}
     url = str(data.get("callback_url") or "")
     if not url:
         return {"ok": True, "task_id": task_id, "attempt": attempt,
@@ -106,7 +108,7 @@ async def deliver(task_id: str, attempt: int = 1) -> dict:
 
     # callback_timeout 是只读 env（不进 dynconf）→ 可安全作为构造参数
     client = httpc.shared_client("callback", timeout=settings.callback_timeout)
-    summary: dict = {"task_id": task_id, "attempt": attempt,
+    summary: dict[str, Any] = {"task_id": task_id, "attempt": attempt,
                      "task_status": task["status"],
                      "callback_host": urlsplit(url).netloc}
     try:

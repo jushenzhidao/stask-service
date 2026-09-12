@@ -35,6 +35,8 @@
 
 from __future__ import annotations
 
+from typing import Any
+
 from app.logging import log
 from app.redis import (
     K_GSLOT,
@@ -135,7 +137,7 @@ async def release_layered(token_hash: str, model: str, mask: int) -> None:
         )
 
 
-async def release_for_task(data: dict) -> None:
+async def release_for_task(data: dict[str, Any]) -> None:
     """按任务 ``data`` 归还它**实际占过**的层——终态处理的唯一释放入口。
 
     终态路径（execute 落终态 / flow 取消 / sweeper 判死）**必须**走这里，

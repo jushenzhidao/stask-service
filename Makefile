@@ -3,7 +3,7 @@ PY := .venv/bin/python
 SHELL := /bin/bash
 
 .PHONY: help setup check test lint type run worker scheduler standalone \
-        up down logs build clean bench admin-key
+        up down logs build clean bench admin-key mutate entries
 
 help:  ## 显示可用命令
 	@grep -hE '^[a-z-]+:.*?## ' $(MAKEFILE_LIST) \
@@ -16,6 +16,12 @@ setup:  ## 建虚拟环境并安装依赖（含开发依赖）
 	@test -f .env || { cp .env.example .env && echo "已生成 .env，请检查 SQL_DSN 与 REDIS_URL"; }
 
 check: lint type test  ## 三项门禁全跑（提交前必须绿）
+
+mutate:  ## 变异自证：逐条破坏被测契约，确认守卫真的会红（防假绿灯，会临时改动文件后还原）
+	$(PY) scripts/mutate_spec_contract.py
+
+entries:  ## 入口覆盖门禁：每个被路由/被调度的入口都必须真的被执行过（必须跑全量套件）
+	ENTRY_COVERAGE_STRICT=1 $(PY) -m pytest tests/ -q -p tests.entry_coverage_plugin
 
 lint:  ## ruff 静态检查
 	$(PY) -m ruff check app tests scripts gunicorn.conf.py

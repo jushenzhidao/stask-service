@@ -13,6 +13,8 @@
 
 from __future__ import annotations
 
+from typing import Any
+
 import asyncio
 import time
 
@@ -34,7 +36,7 @@ from app.services.batching import public_batch_state
 from app.services.dynconf import RuntimeConfig
 
 
-def _view(task: dict) -> dict:
+def _view(task: dict[str, Any]) -> dict[str, Any]:
     data = task.get("data") or {}
     return {
         "task_id": task["task_id"],
@@ -50,13 +52,13 @@ def _view(task: dict) -> dict:
     }
 
 
-def _replay(task: dict, config: RuntimeConfig) -> Response:
+def _replay(task: dict[str, Any], config: RuntimeConfig) -> Response:
     """终态回放。结果已被 TTL 清理 → 410。
 
     410 而非 404 是有意的：404 意味着「没有这个任务」，客户端会以为
     task_id 写错了；410 明确表达「任务存在过、结果已过期」。
     """
-    data: dict = task.get("data") or {}
+    data: dict[str, Any] = task.get("data") or {}
     stored = str(data.get("upstream_response") or "")
     encoding = str(data.get("upstream_response_encoding") or "")
     upstream_status = int(data.get("upstream_status") or 0)
@@ -145,7 +147,7 @@ async def _probe_status(task_id: str) -> str | None:
 
 
 async def _long_poll(task_id: str, wait_seconds: int,
-                     config: RuntimeConfig) -> dict | None:
+                     config: RuntimeConfig) -> dict[str, Any] | None:
     """轮询到终态或超时。
 
     等待期查询走 ``_probe_status``（Redis 优先）：终态由 ``taskstore.cas``
@@ -195,7 +197,7 @@ async def cancel(task_id: str) -> JSONResponse:
             409, f"task advanced before cancel: {latest['status'] if latest else 'unknown'}"
         )
 
-    data: dict = task.get("data") or {}
+    data: dict[str, Any] = task.get("data") or {}
     # 等待期任务从未占过槽（掩码 0），release_for_task 什么都不做——
     # 这正是 R-07 要求的「取消不得释放未占用的槽」。若这里无条件还第一层，
     # 就会还掉同 token 其他在途任务的槽。

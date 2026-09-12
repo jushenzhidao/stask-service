@@ -22,6 +22,8 @@
 
 from __future__ import annotations
 
+from typing import Any
+
 import dataclasses
 import re
 from collections.abc import Awaitable, Callable
@@ -64,7 +66,7 @@ def model_slug(model: str) -> str:
     return (slug[:16].rstrip("_") or "task")
 
 
-def build_task_data(plan: SubmitPlan) -> dict:
+def build_task_data(plan: SubmitPlan) -> dict[str, Any]:
     """tasks.data 的初始 JSON（契约见 SPEC §6）。
 
     ``request_body`` / ``upstream_response`` 默认是**明文**（小体且合法
@@ -100,7 +102,7 @@ def build_task_data(plan: SubmitPlan) -> dict:
 def batch_fields(
     policy: modelpolicy.ResolvedPolicy, *, queued: bool, model: str,
     slot_flags: int = 0, delayed: bool = False, key: str = "",
-) -> dict:
+) -> dict[str, Any]:
     """排队/延迟相关的 ``data`` 字段。
 
     **生效参数必须落库**（不只是 ``batch_state``）：策略是热改的，在途任务

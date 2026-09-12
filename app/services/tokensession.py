@@ -13,6 +13,8 @@
 
 from __future__ import annotations
 
+from typing import Any
+
 from app.config import settings
 from app.logging import log
 from app.redis import K_SK, r
@@ -41,7 +43,7 @@ async def clear(task_id: str) -> None:
         log.opt(exception=True).warning("token session clear failed: task_id={}", task_id)
 
 
-async def session_info(task_id: str) -> dict:
+async def session_info(task_id: str) -> dict[str, Any]:
     """诊断视图（ops 端点）：只暴露存在性与剩余 TTL，绝不返回令牌本体。"""
     key = K_SK.format(task_id=task_id)
     exists = await r.get(key) is not None

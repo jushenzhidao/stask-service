@@ -9,6 +9,8 @@
 
 from __future__ import annotations
 
+from typing import Any
+
 from fastapi import APIRouter, Depends, HTTPException
 
 from app.deps.auth import Caller, require_caller
@@ -18,7 +20,7 @@ router = APIRouter(prefix="/ops")
 
 
 @router.get("/stats")
-async def stats(caller: Caller = Depends(require_caller)) -> dict:
+async def stats(caller: Caller = Depends(require_caller)) -> dict[str, Any]:
     """状态分布 + 调用者自己的槽位占用。"""
     return {
         "status_counts": await taskstore.counts_by_status(),
@@ -27,12 +29,12 @@ async def stats(caller: Caller = Depends(require_caller)) -> dict:
 
 
 @router.get("/tasks/{task_id}")
-async def task_detail(task_id: str, _: Caller = Depends(require_caller)) -> dict:
+async def task_detail(task_id: str, _: Caller = Depends(require_caller)) -> dict[str, Any]:
     """单任务诊断视图（脱敏）。"""
     task = await taskstore.get_meta(task_id)
     if task is None:
         raise HTTPException(404, "task not found")
-    data: dict = task.get("data") or {}
+    data: dict[str, Any] = task.get("data") or {}
     return {
         "task_id": task["task_id"],
         "status": task["status"],
@@ -59,12 +61,12 @@ async def task_detail(task_id: str, _: Caller = Depends(require_caller)) -> dict
 
 
 @router.post("/sweep/stale")
-async def run_sweep_stale(_: Caller = Depends(require_caller)) -> dict:
+async def run_sweep_stale(_: Caller = Depends(require_caller)) -> dict[str, Any]:
     """手工触发一轮卡死收敛（排障用；定时任务每 2 分钟自动跑）。"""
     return await sweeper.sweep_stale()
 
 
 @router.post("/slots/recalibrate")
-async def recalibrate(_: Caller = Depends(require_caller)) -> dict:
+async def recalibrate(_: Caller = Depends(require_caller)) -> dict[str, Any]:
     """手工触发槽位校准。"""
     return await sweeper.recalibrate_slots()

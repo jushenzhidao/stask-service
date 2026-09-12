@@ -23,6 +23,14 @@ x-app-base: &app-base
     - path: .env
       required: true
   environment:
+    # ---- 运行环境（**必填**，`.env` 里缺这一项 compose 直接解析失败）----
+    # 为什么必须显式：`app/main.py` 的致命启动校验（CHANNEL_ID / CALLBACK_SECRET /
+    # taskiq-admin token）只在**严格环境**生效，而 APP_ENV 的配置默认值是 dev
+    # ——「忘了声明」就等于「全部校验静默跳过」，正是这些校验要防的场景。
+    # `:?` 沿用上面 TASKIQ_ADMIN_API_TOKEN 的同一惯用法：缺失即报错并说明原因。
+    # 生产镜像另外自带 `ENV APP_ENV=prod`（非 compose 的编排如 k8s/docker run
+    # 直接吃那个默认值），这里显式声明是为了让 compose 部署不可能「悄悄不是 prod」。
+    APP_ENV: ${APP_ENV:?必须显式声明 APP_ENV：prod = 启用致命启动校验；dev/local/test = 只告警}
     # ---- 容器网络寻址（覆盖 .env 里的宿主视角同名项）----
     # 这里的地址只在容器里有效，改动就改这一处。
     REDIS_URL: redis://redis:6379/0

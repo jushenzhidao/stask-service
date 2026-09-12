@@ -29,6 +29,8 @@ from functools import lru_cache
 from typing import Annotated, Literal
 from urllib.parse import quote, urlencode
 
+from app import __version__
+
 from pydantic import AliasChoices, Field, field_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
@@ -121,7 +123,12 @@ class Settings(BaseSettings):
 
     # ---- 应用 ----
     app_env: str = "dev"
-    app_version: str = "0.2.0"
+    #: 服务版本。**默认值直接引用 `app/__init__.py` 的 `__version__`（唯一事实源）**，
+    #: 不在此处写字面量——曾经 pyproject / 本文件 / 镜像 tag 各写一个数字，
+    #: 于是 `/healthz`、OpenAPI `version`、logfire `service_version` 报的是哪个
+    #: 全凭运气。仍可用 `APP_VERSION` env 覆盖（生产通常由镜像 tag 注入）。
+    #: 约束由 `tests/test_spec_contract.py::test_service_version_has_single_source` 守护。
+    app_version: str = __version__
     #: 日志级别（本地终端与 logfire **共用**）。默认 DEBUG = 全量，
     #: 内部审计口径下排查优先；WARNING 是硬地板——调到 ERROR 应急降噪时，
     #: WARN 及以上仍必然落两侧（见 ``app.logging._effective_level``）。
@@ -282,7 +289,10 @@ class Settings(BaseSettings):
     result_purge_batch_limit: int = 200
 
     # ---- 回调 ----
-    callback_secret: str = ""            # HMAC-SHA256 签名密钥（空 = 不签名）
+    #: HMAC-SHA256 签名密钥。空 = 回调不带 ``X-Stask-Signature`` 头发出，
+    #: 而 SPEC AC-29 要求「必须推送签名」——所以**严格环境下空值会阻断启动**
+    #: （见 `main._check_callback_secret`），宽松环境只告警。生成：openssl rand -base64 32
+    callback_secret: str = ""
     callback_timeout: float = 10.0
     callback_max_attempts: int = 5
     #: 回调 URL 的 host 白名单（空 = 不限制；生产强烈建议配置）

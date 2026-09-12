@@ -302,7 +302,7 @@ app/
     ├── execute.py      worker 执行（派发锁 + 分流）
     ├── flow.py         查询 / 字节级回放 / 长轮询 / 取消
     ├── sweeper.py      卡死收敛 / 超龄判死 / 槽位校准 / 结果清理
-    ├── taskstore.py    tasks 表原生 SQL（数据访问单点）
+    ├── taskstore/      tasks 表原生 SQL（数据访问单点；按读/写/投影切成子模块）
     ├── dynconf.py      运行时配置白名单（Redis > env > 默认）
     ├── slots.py        并发槽（固定上限）
     ├── tokensession.py 用户令牌会话（唯一查询处）

@@ -13,6 +13,8 @@
 
 from __future__ import annotations
 
+from typing import Any
+
 import asyncio
 from collections.abc import Awaitable, Callable, Sequence
 from typing import TypeVar
@@ -66,7 +68,7 @@ async def _gather_bounded(
     return sum(1 for ok in results if ok)
 
 
-async def _kill(task: dict, reason: str) -> bool:
+async def _kill(task: dict[str, Any], reason: str) -> bool:
     """判死一个非终态任务：CAS → 释放槽 → 清会话 → 可选回调。
 
     入参是**已查好的元数据行**（不是 task_id）：调用方扫描时已经拿到了
@@ -75,7 +77,7 @@ async def _kill(task: dict, reason: str) -> bool:
     task_id = str(task["task_id"])
     if task["status"] not in ACTIVE:
         return False
-    data: dict = task.get("data") or {}
+    data: dict[str, Any] = task.get("data") or {}
     won = await taskstore.cas(
         task_id, ACTIVE, FAILURE, fail_reason=reason,
     )
@@ -94,7 +96,7 @@ async def _kill(task: dict, reason: str) -> bool:
     return True
 
 
-async def sweep_stale() -> dict:
+async def sweep_stale() -> dict[str, Any]:
     """卡死任务收敛——补上「入队消息丢失」这条路径。
 
     问题：提交链路落库 QUEUED 之后才入队。如果 broker 抖动/Redis 重启
@@ -123,7 +125,7 @@ async def sweep_stale() -> dict:
     killed = 0
     rescheduled = 0
 
-    async def handle(task: dict) -> bool:
+    async def handle(task: dict[str, Any]) -> bool:
         nonlocal killed, rescheduled
         task_id = str(task["task_id"])
         if task["status"] not in ACTIVE:
@@ -190,7 +192,7 @@ async def sweep_stale() -> dict:
             "batch_members_rebuilt": rebuilt["members"]}
 
 
-async def _rebuild_batch_index() -> dict:
+async def _rebuild_batch_index() -> dict[str, Any]:
     """按 DB 事实重建攒批索引（``st:batch:{model}`` / ``st:batch:due``）。
 
     与 :func:`_rearm_due_index` 对称：那条补的是**延迟侧**的索引丢失，
@@ -253,7 +255,7 @@ async def _rearm_due_index() -> int:
     return rearmed
 
 
-async def sweep_overdue() -> dict:
+async def sweep_overdue() -> dict[str, Any]:
     """超龄判死：超过最大生命期仍非终态 → FAILURE。
 
     生命期（默认 6h）必须**远小于** new-api 的 24h 超时清理线——上游的
@@ -275,7 +277,7 @@ async def sweep_overdue() -> dict:
     return {"scanned": len(tasks), "killed": killed}
 
 
-async def recalibrate_slots() -> dict:
+async def recalibrate_slots() -> dict[str, Any]:
     """并发槽计数按 tasks 表事实回写——**三层都要校准**。
 
     两个方向都要修：释放失败让计数虚高（用户被永久限流），崩溃丢计数
@@ -335,7 +337,7 @@ async def recalibrate_slots() -> dict:
             "models": len(model_truth), "fixed_global": fixed_g}
 
 
-async def purge_results() -> dict:
+async def purge_results() -> dict[str, Any]:
     """清理超期结果体（§9）：只置空 ``upstream_response``，状态行保留。"""
     if not await _lock("purge", 3500):
         return {"skipped": "locked"}
