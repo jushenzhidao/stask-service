@@ -113,6 +113,12 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
     finally:
         await httpc.close_all()
         await close_db()
+        # 收尾最后一步：把 logfire 队列里滞留的 span/log 立刻导出。批次处理器
+        # 最多滞留数秒（span 2s / log 5s），不 flush 的话「停机前最后几秒」在
+        # 看板上是空的——而本地终端明明打过，排障时极易误判成「日志丢了」。
+        from app.observability import flush as flush_observability
+
+        flush_observability()
 
 
 def create_app() -> FastAPI:

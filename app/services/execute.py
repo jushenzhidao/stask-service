@@ -3,7 +3,12 @@
     出队 → CAS QUEUED→IN_PROGRESS
     → 派发锁 SET NX（TTL=超时+余量）；锁被占 → 不重发，跳过
     → 取令牌 → 调上游同步接口（原样 method/path/query/body + X-Task-Id）
-    → 分流 → 终态落库（gzip）→ 释放槽 + 清会话 → 可选回调
+    → 分流 → 终态落库（明文优先，超限 gzip+b64）→ 释放槽 + 清会话 → 可选回调
+
+请求与响应**两头都落日志**（``upstream call`` / ``task success`` / ``task
+failure``，经 ``_digest`` 截断、不脱敏）：一条 trace 里即可回答「发了什么、
+回来什么」，不必先去 DB 解 ``tasks.data``。凭证头是唯一例外（AC-30，见
+``_log_headers``）。
 
 **派发锁是这个模块的心脏**。队列是 at-least-once，崩溃/重启会重投同一个
 task_id。上游调用可能有副作用（生成、扣费由上游自理）——重投一次就多调
@@ -30,6 +35,7 @@ task_id。上游调用可能有副作用（生成、扣费由上游自理）—�
 from __future__ import annotations
 
 import asyncio
+import json
 from typing import Any
 
 import httpx
@@ -86,10 +92,91 @@ def _blog(task_id: str, **fields: object):
     return log.bind(task_id=task_id, **fields)
 
 
-#: 非 2xx 响应体的日志预览。完整原文已落库（``upstream_response``），这里只
-#: 截前缀供 logfire / taskiq-admin 排障。用户令牌走 Authorization header，绝不
-#: 经过响应体，无泄露面；``diagnose=False`` 保证回溯不带变量。
-_error_preview = preview
+# ---- 请求/响应体日志摘要（2026-09-12）--------------------------------------
+# 事实源仍是 ``tasks.data``（原文落库）；日志只承担「一条 trace 里看懂发了
+# 什么、回来什么」。**不脱敏**（内部审计口径，含带签名的 URL），只按长度
+# 截断——内联 b64（i2v 的图、内联音频）是这里唯一的规模问题。
+#
+# 唯一豁免脱敏的是**凭证头名**（见 ``_CREDENTIAL_HEADERS``）：AC-30 是红线
+# （用户 sk 不进日志），与「日志内容不脱敏」不冲突。
+
+#: 一条日志里 body 摘要的总字符上限
+_LOG_BODY_LIMIT = 4000
+#: 结构化字段里单个字符串的上限（超过按「前缀 + 实际长度」截断）
+_LOG_STR_LIMIT = 500
+#: 单个数组最多保留几项
+_LOG_LIST_LIMIT = 20
+#: 超过此字节数就不再 JSON 解析：大体内联 b64，解析纯属给日志白花 CPU 与
+#: 峰值内存（请求体本就在内存里，再 parse 一遍等于翻倍）
+_LOG_PARSE_LIMIT = 256 * 1024
+#: 不解析的大体只留头部这么多字节（JSON 的 model / prompt 一般在前部）
+_LOG_HEAD_BYTES = 800
+
+#: 携带凭证的请求头名（小写）。落库的 ``request_headers`` 已由
+#: ``admission.clean_headers`` 摘掉这些，这里再兜一道：AC-30 是红线，
+#: 不能依赖调用链上某个环节永远不出错。除这些之外一律原样进日志。
+_CREDENTIAL_HEADERS = frozenset({
+    "authorization", "cookie", "set-cookie", "proxy-authorization",
+    "x-api-key", "api-key",
+})
+
+
+def _clip(text: str, limit: int) -> str:
+    """超长即截断，并标注**原始长度**（不脱敏，只控体量）。"""
+    if len(text) <= limit:
+        return text
+    return f"{text[:limit]}…<truncated, {len(text)} chars total>"
+
+
+def _log_headers(headers: dict) -> dict:
+    """日志用请求头：只剔除携带凭证的头名，其余（含自定义头）原样保留。"""
+    return {k: v for k, v in headers.items() if k.lower() not in _CREDENTIAL_HEADERS}
+
+
+def _shrink(node: Any, depth: int = 0) -> Any:
+    """JSON 结构瘦身：长字符串/长数组截断，``data:…;base64`` 只留 MIME 与长度。
+
+    内联 b64 保留 500 字符前缀毫无信息量（同一字符表重复），换成
+    ``<inline data:image/png;base64 ~1.8M chars>`` 才能一眼看出「发了张图」。
+    """
+    if depth >= 4:
+        return "…"
+    if isinstance(node, dict):
+        return {str(k): _shrink(v, depth + 1) for k, v in node.items()}
+    if isinstance(node, list):
+        head = [_shrink(v, depth + 1) for v in node[:_LOG_LIST_LIMIT]]
+        rest = len(node) - _LOG_LIST_LIMIT
+        return [*head, f"…<{rest} more>"] if rest > 0 else head
+    if isinstance(node, str):
+        marker = node.find(";base64,")
+        if node.startswith("data:") and 0 < marker < 64:
+            return f"<inline {node[:marker]};base64 ~{len(node)} chars>"
+        return _clip(node, _LOG_STR_LIMIT)
+    return node
+
+
+def _digest(raw: bytes) -> str:
+    """请求/响应体 → 日志摘要（**截断但不脱敏**，恒不抛）。
+
+    - 空体 → 空串；
+    - 超 ``_LOG_PARSE_LIMIT`` → 不解析，只留头部 + 总字节数；
+    - JSON dict/list → 逐层瘦身后序列化，再按 ``_LOG_BODY_LIMIT`` 裁一刀；
+    - 其余（HTML 错误页、二进制、非法 UTF-8）→ 容错解码后截断。
+
+    恒不抛的理由与执行链路一致：摘要只服务观测，构造失败绝不能影响任务。
+    """
+    if not raw:
+        return ""
+    if len(raw) > _LOG_PARSE_LIMIT:
+        head = raw[:_LOG_HEAD_BYTES].decode("utf-8", errors="replace")
+        return f"{head}…<not parsed, {len(raw)} bytes total>"
+    try:
+        parsed = json.loads(raw)
+    except (ValueError, UnicodeDecodeError):
+        return _clip(raw.decode("utf-8", errors="replace"), _LOG_BODY_LIMIT)
+    if not isinstance(parsed, dict | list):
+        return _clip(raw.decode("utf-8", errors="replace"), _LOG_BODY_LIMIT)
+    return _clip(json.dumps(_shrink(parsed), ensure_ascii=False), _LOG_BODY_LIMIT)
 
 
 async def _finalize(
@@ -301,6 +388,17 @@ async def _dispatch(
     attempts_left = await dynconf.get_int("retry_max")
     connect_attempts_left = await dynconf.get_int("retry_max_connect")
     attempt = 0
+
+    # 发请求前落一条完整请求摘要：排障最先要回答的是「我们到底发了什么」。
+    # 只在重试循环**外**记一次——重试发的是同一份内容，逐次重复是纯噪音。
+    # ``_log_headers`` 会把上面刚注入的 Authorization 摘掉（AC-30 红线）。
+    _blog(
+        task_id, phase="upstream_call", method=method, model=model,
+        request_path=path, request_bytes=len(body),
+    ).info(
+        "upstream call: task_id={} method={} url={} model={} bytes={} headers={} body={}",
+        task_id, method, url, model, len(body), _log_headers(headers), _digest(body),
+    )
 
     while True:
         attempt += 1
@@ -515,6 +613,9 @@ async def _settle_response(
             callback_url=callback_url,
             private_patch=private_patch or None,
         )
+        # 签名 URL 原样进日志（内部审计口径）：制品地址多是短期签名，
+        # 回 DB 还得解 gzip+b64，日志里直接可点更省事。
+        artifact_urls = [str(a.get("url") or "") for a in found[:_OUTCOME_URL_LIMIT]]
         _blog(
             task_id,
             upstream_status=status,
@@ -525,8 +626,10 @@ async def _settle_response(
             artifact_types=",".join(sorted({str(a.get("type")) for a in found})),
             artifact_parser=parsed["artifact_parser"],
             response_encoding=encoding,
+            result_url=primary,
         ).info(
-            "task success: task_id={} status={} bytes={} model={} path={} artifacts={} parser={}",
+            "task success: task_id={} status={} bytes={} model={} path={} artifacts={} "
+            "parser={} result_url={} artifact_urls={} response={}",
             task_id,
             status,
             len(raw),
@@ -534,6 +637,9 @@ async def _settle_response(
             path,
             len(found),
             parsed["artifact_parser"],
+            primary,
+            artifact_urls,
+            _digest(raw),
         )
         return Outcome(
             task_id=task_id,
@@ -553,8 +659,7 @@ async def _settle_response(
             # ``to_dict`` 只在字段非空时才写键（``url`` / ``mime_type`` 都可能缺），
             # 直接下标会在「内联制品无 URL」时 KeyError。
             artifact_types=sorted({str(a.get("type")) for a in found}),
-            artifact_urls=[str(a.get("url") or "")
-                           for a in found[:_OUTCOME_URL_LIMIT]],
+            artifact_urls=artifact_urls,
             result_url=primary,
             detail=(
                 f"upstream {status}, {len(raw)} bytes, {len(found)} artifact(s) "
@@ -575,6 +680,10 @@ async def _settle_response(
         fail_reason=fail_reason,
         callback_url=callback_url,
     )
+    # 日志预览走 ``_digest``（保留 JSON 结构，上限 4KB，终端直接可读）；
+    # ``Outcome.upstream_preview`` 仍是 ``preview`` 的 300 字符——那份要进
+    # taskiq result backend，与日志是**体积预算不同的两个用途**，别合并。
+    response_preview = _digest(raw)
     _blog(
         task_id,
         upstream_status=status,
@@ -583,7 +692,8 @@ async def _settle_response(
         request_path=path,
         content_type=content_type,
         response_bytes=len(raw),
-        upstream_preview=_error_preview(raw),
+        response_encoding=encoding,
+        response_preview=response_preview,
     ).warning(
         "task failure: task_id={} status={} reason={} model={} path={} ct={} bytes={} preview={}",
         task_id,
@@ -593,7 +703,7 @@ async def _settle_response(
         path,
         content_type,
         len(raw),
-        _error_preview(raw),
+        response_preview,
     )
     return Outcome(
         task_id=task_id,
@@ -608,7 +718,7 @@ async def _settle_response(
         content_type=content_type,
         response_bytes=len(raw),
         response_encoding=encoding,
-        upstream_preview=_error_preview(raw),
+        upstream_preview=preview(raw),
         detail=(
             f"upstream returned {status}: {detail}" if detail
             else f"upstream returned {status}; full body stored for replay"

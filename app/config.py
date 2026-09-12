@@ -122,7 +122,10 @@ class Settings(BaseSettings):
     # ---- 应用 ----
     app_env: str = "dev"
     app_version: str = "0.2.0"
-    log_level: str = "INFO"
+    #: 日志级别（本地终端与 logfire **共用**）。默认 DEBUG = 全量，
+    #: 内部审计口径下排查优先；WARNING 是硬地板——调到 ERROR 应急降噪时，
+    #: WARN 及以上仍必然落两侧（见 ``app.logging._effective_level``）。
+    log_level: str = "DEBUG"
 
     #: 管理面密钥（看板 + 动态配置写入）。**空 = 整个管理面 404**，
     #: 默认不开启，忘配密钥不等于裸奔。与终端用户 sk 完全分离——
@@ -292,11 +295,47 @@ class Settings(BaseSettings):
     queue_stream_maxlen: int = 100_000
 
     # ---- 可观测性（logfire，可选）----
-    #: 1 = 启用 logfire（trace + metrics + loguru 桥接）。
+    #: 1 = 启用 logfire（trace + loguru 日志汇入；metrics 默认关，见下）。
     #: 凭证走 logfire 自己的 LOGFIRE_TOKEN 环境变量；
     #: 未配 token 时 send_to_logfire="if-token-present" 会静默降级为不发送。
     #: service_name 固定 ``stask-web`` / ``stask-worker``，不做配置项。
     logfire_enabled: bool = False
+
+    # ---- logfire 上报调优 ----
+    # 下面这些**不是**给业务代码读的，而是由 ``observability._apply_sdk_env``
+    # 映射成 OTel SDK 的环境变量（SDK 只在构造导出器时读 env，故必须在
+    # ``logfire.configure`` 之前写好）。做成配置项而不是直接写死 env，是为了
+    # 单一事实源 + 可被测试断言 —— 直接写 `os.environ` 的常量没法测。
+    #
+    #: 1 = 上报 OpenTelemetry metrics（FastAPI/httpx 请求直方图 + SDK 自省指标）。
+    #: 默认 0：本服务**没有任何 metrics 消费方**（管理看板的数字全走 DB 聚合
+    #: 查询，见 admin.py），开着等于白养一条 PeriodicExportingMetricReader
+    #: 导出管线（常驻线程 + 每 60s 一个请求）。
+    logfire_metrics_enabled: bool = False
+    #: 单个属性值的字符上限（span / metric 共用的全局值）。超出由 SDK 原地
+    #: 截断，**不是**丢弃整条记录。SDK 默认 None = 无限制，一个几 MB 的属性
+    #: 能把整批撑到后端 413（logfire 的 5MB 检查只覆盖 span，见下）。
+    logfire_attribute_value_limit: int = 8_000
+    #: 单条**日志记录**属性值的字符上限（比 span 那档更宽松但仍是硬顶）。
+    #: 日志的实际内容 ``logfire.msg`` 与位置参数 ``logfire.logging_args``
+    #: 都是属性，所以这条是「大文件不上报」的声明式闸门。
+    #: 取 16K 是因为正常最坏情形（请求体摘要 4K + 响应体摘要 4K + 签名 URL）
+    #: 约 5~10K，留一倍余量以免**正常日志被静默截掉尾巴**。
+    logfire_log_attribute_value_limit: int = 16_000
+    #: 单条日志送入 logfire 的 message 字符硬闸（出口兜底，超出截断不丢弃）。
+    #: 为什么 SDK 的属性上限不够：无位置参数的日志其**模板就是整条消息**，
+    #: 而模板进的是 OTel 的 body（不受属性上限约束）。业务侧
+    #: ``execute._digest`` 已把体摘要压在 4KB 内，这条防的是将来新增日志点
+    #: 漏了截断，把整段响应体当消息发出去。
+    logfire_log_char_limit: int = 16_000
+    #: 日志批次队列条数上限。满时 OTel 丢**最老**的并打一行
+    #: "Queue full, dropping logs."（那行会经 stdlib→loguru 在本地可见）。
+    #: SDK 默认 2048；调试口径下每任务约 3 行，4096 给批次突发放行留一倍余量。
+    logfire_log_queue_size: int = 4_096
+    #: span 批次的最长滞留毫秒数。logfire 的动态批处理器默认 500ms，调大到
+    #: 2000ms 让每个请求装更多 span —— trace 是上报体积的大头，请求数约降
+    #: 四倍；前 10 个 span 仍走 100ms 快通道，首屏可见性不受影响。
+    logfire_span_schedule_delay_ms: int = 2_000
 
     # ---- taskiq-admin 任务看板（必选）----
     #: taskiq-admin 实例地址（compose 里写死 http://taskiq-admin:3000）。
@@ -337,6 +376,26 @@ class Settings(BaseSettings):
             if not raw:
                 return {}
             return json.loads(raw)
+        return value
+
+    @field_validator(
+        "logfire_attribute_value_limit",
+        "logfire_log_attribute_value_limit",
+        "logfire_log_char_limit",
+        "logfire_log_queue_size",
+        "logfire_span_schedule_delay_ms",
+    )
+    @classmethod
+    def _positive_limit(cls, value: int) -> int:
+        """上限类字段拒绝 ``<= 0``。
+
+        ``0`` 的后果是**静默退化而非报错**：属性上限 0 会把每条属性截成空串
+        （logfire 上只剩时间戳），批次队列 0 会让 SDK 直接把每条日志丢掉。
+        两者都表现为「配了 logfire 却什么都看不到」，属于最难查的那类故障，
+        故在启动时就拒绝（与 ``_parse_model_policies`` 的「写坏即报错」同哲学）。
+        """
+        if value < 1:
+            raise ValueError("必须 >= 1：0 会让 SDK 静默退化为不上报")
         return value
 
 

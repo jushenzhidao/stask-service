@@ -66,7 +66,7 @@
 | Redis | redis (asyncio) | 5.2.1 | `decode_responses=True`，Lua 原子操作 |
 | HTTP | httpx[http2] | 0.28.1 | 共享 AsyncClient 连接池 |
 | 队列 | taskiq / taskiq-redis | 0.11.18 / 1.0.2 | ListQueueBroker + RedisScheduleSource |
-| 日志 | loguru | 0.7.3 | stdlib 桥接，`backtrace/diagnose=False` |
+| 日志 | loguru | 0.7.3 | stdlib 桥接，`backtrace/diagnose=False`；级别 `LOG_LEVEL`（默认 DEBUG，**WARNING 为硬地板**），本地终端与 logfire 同源取级；请求/响应体进日志但按长度截断（唯一屏蔽项是凭证头名，AC-30）；logfire 上报**不脱敏但不上报大文件**——三层体量闸门（业务摘要 4KB / `OTEL_*_ATTRIBUTE_VALUE_LENGTH_LIMIT` / 管道内 `LogRecordProcessor` 裁 body），metrics 默认关（无消费方），停机 flush |
 | 测试 | pytest / pytest-asyncio / respx | 8.3.5 / 0.26.0 / 0.22.0 | `asyncio_mode=auto`，手写 FakeRedis |
 | Lint/Type | ruff / mypy | 0.11.13 / 1.15.0 | mypy 做成一个 pytest 用例 |
 | 部署 | Docker Compose（web + worker + 独立 Redis） | - | Redis 独立实例（ADR-004） |

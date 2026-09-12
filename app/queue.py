@@ -89,6 +89,19 @@ class ObservabilityMiddleware(TaskiqMiddleware):
         log.info("stask worker started: queue={} concurrency={}",
                  QUEUE_NAME, settings.queue_concurrency)
 
+    async def shutdown(self) -> None:
+        """worker 退出前把 logfire 队列刷出去。
+
+        taskiq 的 SIGTERM 处理器会置位 shutdown_event 并走完
+        ``broker.shutdown()``，而后者会回调每个**覆写了** ``shutdown`` 的
+        middleware（见 ``taskiq.abc.broker.AsyncBroker.shutdown``）——这是
+        worker 进程唯一可靠的收尾点。不做的话队列里未导出的批次会随进程一起
+        消失，表现为「停机前最后几秒的日志在 logfire 上缺席」。
+        """
+        from app.observability import flush as flush_observability
+
+        flush_observability()
+
     async def on_error(
         self, message: TaskiqMessage, result: TaskiqResult, exception: BaseException
     ) -> None:
