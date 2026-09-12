@@ -24,10 +24,24 @@ jobs:
       - name: Test
         run: python -m pytest tests/ -q
 
+  # 多架构：每个平台跑在**原生** runner 上，不用 QEMU。
+  #
+  # 为什么必须原生：`asyncmy` 在 linux/aarch64 上没有 wheel（见 Dockerfile 注释），
+  # arm64 要就地编译 Cython 扩展。本机原生编译约 2 分钟，QEMU 仿真下会放大若干倍
+  # ——每次 push 都付这个代价不可接受。本仓库是 public，ARM runner 免费。
+  # 要加平台改这个矩阵；新增平台记得选对应的原生 runner。
   build-and-push:
     needs: test
     if: github.event_name == 'push'
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            runner: ubuntu-latest
+          - platform: linux/arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
     permissions:
       contents: read
       packages: write
@@ -48,11 +62,66 @@ jobs:
             type=semver,pattern={{version}}
             type=sha,format=short
             type=raw,value=latest,enable={{is_default_branch}}
-      - uses: docker/build-push-action@v6
+      - id: build
+        uses: docker/build-push-action@v6
         with:
           context: .
-          push: true
-          tags: ${{ steps.meta.outputs.tags }}
+          platforms: ${{ matrix.platform }}
           labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          # 只按 digest 推、**不占 tag**：tag 由下面的 merge 一次性指向多架构 index。
+          # 否则两个平台会互相覆盖同一个 tag，pull 到哪个全看谁后完成。
+          outputs: type=image,name=ghcr.io/${{ github.repository }},push-by-digest=true,name-canonical=true,push=true
+          # 每个平台独立缓存 scope，避免互相污染
+          cache-from: type=gha,scope=${{ matrix.platform }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.platform }}
+      - name: Export digest
+        run: |
+          mkdir -p /tmp/digests
+          digest="${{ steps.build.outputs.digest }}"
+          touch "/tmp/digests/${digest#sha256:}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: digests-${{ strategy.job-index }}
+          path: /tmp/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  # 把两个平台的 digest 合成一个 manifest list，再把 tag 指过去。
+  merge:
+    needs: build-and-push
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: /tmp/digests
+          pattern: digests-*
+          merge-multiple: true
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository }}
+          tags: |
+            type=ref,event=branch
+            type=semver,pattern={{version}}
+            type=sha,format=short
+            type=raw,value=latest,enable={{is_default_branch}}
+      - name: Create manifest list and push
+        working-directory: /tmp/digests
+        run: |
+          docker buildx imagetools create \
+            $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
+            $(printf 'ghcr.io/${{ github.repository }}@sha256:%s ' *)
+      - name: Inspect result
+        run: |
+          docker buildx imagetools inspect \
+            ghcr.io/${{ github.repository }}:${{ steps.meta.outputs.version }}
