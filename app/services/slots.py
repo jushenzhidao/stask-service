@@ -198,6 +198,50 @@ async def _current(key: str) -> int:
         return 0
 
 
+#: 三层名字（顺序即层顺序，与 ``keys_for`` / 位掩码一致）
+LAYER_NAMES = ("token", "model_token", "global")
+
+
+async def binding_layer(
+    token_hash: str,
+    model: str,
+    *,
+    limit_per_token: int,
+    limit_model_token: int,
+    limit_global: int,
+) -> str:
+    """占槽失败后判定**是哪一层满的**——只给 429 的响应体用。
+
+    三层满起来客户端看到的都是同一个 429，但处置完全不同：第一层满该换 key、
+    第二层满该等这条跑完或换模型、第三层满是**跨 token 的**饱和（换 key 没用，
+    只能等上游容量）。不报层名，排障就只能靠猜。
+
+    只在**错误路径**调用：它要多读 3 个键，而这条路径本身已经是「决定返回
+    429」的冷路径，不值得为它给正常提交加热路径的一次 RTT。
+
+    按层顺序返回第一个「已达上限」的层名。Redis 抖动或三层都没到限时回落
+    第一层——宁可给一个可能不准的层名，也不能让 429 变成 500。
+    """
+    try:
+        counters = (
+            await current(token_hash),
+            await current_model_token(token_hash, model),
+            await current_global(model),
+        )
+    except Exception:
+        log.opt(exception=True).debug(
+            "binding layer probe failed: token_hash={} model={}", token_hash, model
+        )
+        return LAYER_NAMES[0]
+    for name, limit, used in zip(
+        LAYER_NAMES, (limit_per_token, limit_model_token, limit_global), counters,
+        strict=True,
+    ):
+        if limit > 0 and used >= limit:
+            return name
+    return LAYER_NAMES[0]
+
+
 async def reset(token_hash: str, value: int, *,
                 ttl_seconds: int | None = None) -> None:
     """第一层校准回写（定时任务用；value ≤ 0 时直接删键）。"""

@@ -293,8 +293,9 @@ curl -X PUT "$BASE/admin/api/config" \
 | `batch` | 攒够多少条放行（N） | 0–1000（`0`/`1` = 不攒批） |
 | `batch_wait` | 最长等待秒数（T） | 1–3600，且须满足下方 TTL 约束 |
 | `limit_per_token` | 该 token 总在途上限 | 0–10000（`0` = 回落 `MAX_SLOTS`） |
-| `limit_model_token` | (模型, token) 上限。**`>0` 即强制排队** | 0–10000 |
+| `limit_model_token` | (模型, token) 上限。`>0` 即启用该层（满额行为见 `reject_when_full`） | 0–10000 |
 | `limit_global` | 模型全局上限（多 key 合计不超发的唯一保证） | 0–10000 |
+| `reject_when_full` | 分层上限**满额时怎么办**：`0`=排队（默认，提交即 202、永不 429）；`1`=提交时原子占三层，满则 429 + `Retry-After`（不再排队、不依赖 tick） | 0–1，须与 `batch<2` 且至少一个分层上限 `>0` 同用 |
 
 两条硬约束（写侧会拦，报 400）：
 
@@ -362,7 +363,7 @@ curl -X PUT "$BASE/admin/api/config" \
 | 层 | 谁控制 | 怎么算作「要攒批」 |
 |---|---|---|
 | 总开关 | 运维（配置中心热改，或 env） | `batch_enabled = true`（默认） |
-| 逐模型/逐请求 | 配置中心策略 **或** 客户端请求头 | 策略 `batch >= 2`（或 `limit_model_token/limit_global > 0`）；客户端 `X-Batch-Size >= 2` |
+| 逐模型/逐请求 | 配置中心策略 **或** 客户端请求头 | 策略 `batch >= 2`；或 `limit_model_token/limit_global > 0` **且未开 `reject_when_full`**（这两层默认只能由放行通道 `dispatch.release` 判定，故必须排队）；客户端 `X-Batch-Size >= 2` |
 
 所以：**总开关保持开着**，是否攒批交给「配置中心的模型策略」或「客户端参数」。
 只有线上需要全局止血时才把 `batch_enabled` 关掉（此时客户端头也开不起来）。

@@ -69,19 +69,3 @@ class SubmitPlan(BaseModel):
     batch_size: int | None = None
     batch_wait: int | None = None
     batch_key: str | None = None
-
-
-class TaskView(BaseModel):
-    """对外的非终态任务视图（202 响应体）。
-
-    ``scheduled_at`` / ``batch_key`` / ``batch_state`` 是增量字段：未使用
-    延迟或攒批时分别为 ``0`` / 空串 / 空串，老客户端的既有字段语义不变
-    （客户端能据此区分「排队中」与「计划中」）。
-    """
-
-    task_id: str
-    status: str
-    created_at: int = 0
-    scheduled_at: int = 0
-    batch_key: str = ""
-    batch_state: str = ""

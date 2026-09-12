@@ -564,3 +564,76 @@ def test_no_orphan_service_functions():
         "确实要保留（如为未实现需求预留）请加进 _ORPHAN_ALLOWLIST 并写明理由：\n  "
         + "\n  ".join(offenders)
     )
+
+
+#: 允许「生产代码无调用方」的公开类，**每条都必须写明理由**。
+#: 2026-09-12 清理后为空，留空是常态：往里加一条，等于承认一份没人用的契约。
+_ORPHAN_CLASS_ALLOWLIST: set[str] = set()
+
+
+def test_no_orphan_public_classes():
+    """``app`` 里不得存在「没人调用」的公开类。
+
+    上一个测试只扫模块顶层的**函数**，扫不到类。2026-09-12 实测：全仓有且
+    仅有两个零引用的公开类，都是完整契约——
+
+    - ``modelpolicy.ModelPolicy``：字段集与 ``ResolvedPolicy`` 完全重复，
+      即「同一份策略契约的第二份实现」；
+    - ``schemas.TaskView``：202 响应体的第二份实现，且已漂移（``docs/SPEC.md``
+      与 ``flow._view`` 都有 ``replayed``，它没有）。
+
+    危害与孤儿函数同源（见上一个测试），但类更隐蔽：它自带 docstring 与字段
+    声明，**长得就像「对外契约」**，后来者照着它改，而真正生效的是别处
+    （``flow._view`` 里的 dict 字面量），改一份漂一份。
+
+    判据与函数版同构，只有一处刻意差异：**类自身源码区间内的引用不算数**。
+    ``def from_declared(cls, node) -> ModelPolicy`` 这种「在自己的方法签名里
+    写自己的名字」不是使用证据；而函数版的 ``-1``（减去定义行）对跨多行的类
+    不成立——按 ``-1`` 算，``ModelPolicy`` 会因这行注解被判成「模块内有引用」
+    而漏报。故这里改成「把整个类体抠掉，再看模块剩余部分还有没有它」。
+
+    类方法/类属性同理被覆盖：类整体无人引用时一并报出，不单列。
+    """
+    import ast
+    import re
+    from collections import defaultdict
+
+    app_src = {p: p.read_text(encoding="utf-8")
+               for p in (ROOT / "app").rglob("*.py")}
+
+    def top_level_classes(source: str) -> list:
+        try:
+            tree = ast.parse(source)
+        except SyntaxError:
+            return []
+        return [n for n in tree.body
+                if isinstance(n, ast.ClassDef) and not n.name.startswith("_")]
+
+    # 名字 → 定义了它的模块集合（用于判断名字是否有歧义）
+    owners: dict[str, set] = defaultdict(set)
+    for path, source in app_src.items():
+        for node in top_level_classes(source):
+            owners[node.name].add(path)
+
+    offenders = []
+    for path, source in sorted(app_src.items()):
+        own = re.escape(path.stem)
+        for node in top_level_classes(source):
+            if node.name in _ORPHAN_CLASS_ALLOWLIST:
+                continue
+            bare = r"\b" + re.escape(node.name) + r"\b"
+            # 有歧义（同名类存在于多个模块）时只认 "<模块名>.<类名>" 限定引用
+            pattern = (rf"\b{own}\.{bare}"
+                       if len(owners[node.name]) > 1 else bare)
+            outside = sum(len(re.findall(pattern, s))
+                          for q, s in app_src.items() if q != path)
+            lines = source.splitlines()
+            end = node.end_lineno or node.lineno
+            rest = "\n".join(lines[:node.lineno - 1] + lines[end:])
+            if outside == 0 and not re.findall(pattern, rest):
+                offenders.append(f"{node.name} ({path.relative_to(ROOT)})")
+    assert not offenders, (
+        "以下公开类没有任何调用方。要么接上调用点、要么删除；"
+        "确实要保留（如为未实现需求预留）请加进 _ORPHAN_CLASS_ALLOWLIST "
+        "并写明理由：\n  " + "\n  ".join(offenders)
+    )

@@ -187,8 +187,14 @@ async def submit_task(path: str, request: Request) -> Response:
     except submit.SubmitConflict as exc:
         raise HTTPException(409, str(exc)) from exc
     except submit.SlotExhausted as exc:
+        # 层名进 ``code``（``token`` / ``model_token`` / ``global`` + ``_slot_exhausted``）：
+        # 三层满起来都是同一个 429，但处置完全不同（换 key / 等这条跑完或换模型 /
+        # 跨 token 的容量饱和，换 key 没用）。只把层名写进人类可读的 message 里，
+        # 客户端没法据此分支，排障也只能靠正则抠字。
         raise HTTPException(
-            429, str(exc),
+            429,
+            error_body(str(exc), "rate_limit_error",
+                       code=f"{exc.layer}_slot_exhausted"),
             headers={"Retry-After": str(await submit.retry_after_seconds(config))},
         ) from exc
 

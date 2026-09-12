@@ -173,8 +173,16 @@ curl -X POST "$BASE/admin/api/config/reset" \
 | `batch` | 攒够多少条放行（N） | 0–1000，`>= 2` 才攒批 |
 | `batch_wait` | 最长等待秒数（T）。**`batch >= 2` 时必须显式给** | 1–3600 |
 | `limit_per_token` | 该 token 总在途上限 | 0–10000，`0` = 回落 `MAX_SLOTS` |
-| `limit_model_token` | (模型, token) 上限，**`> 0` 即强制排队** | 0–10000 |
+| `limit_model_token` | (模型, token) 上限，`> 0` 即启用该层（满额行为见 `reject_when_full`） | 0–10000 |
 | `limit_global` | 模型全局上限（多 key 合计不超发的唯一保证） | 0–10000 |
+| `reject_when_full` | 分层上限满额时：`0` = 排队（默认，202 + `waiting`、永不 429）；`1` = 提交时占槽、满则 **429 + `Retry-After`** | 0–1，须 `batch < 2` 且至少一个分层上限 `> 0` |
+
+> **`limit_model_token` / `limit_global` 满了之后会怎样？** `> 0` 只声明「在途上限」，
+> **满了之后怎么办是 `reject_when_full` 决定的**。默认（`0`）满额任务会挂进
+> `st:due` 排队等槽，因此提交侧**永不 429**、也不占队列上限——客户端收不到
+> 任何背压信号。要「满则拒」必须显式写 `reject_when_full: 1`，此时客户端
+> **必须自带重试**（否则任务直接丢失）。单条串行场景：
+> `{"<模型>": {"limit_model_token": 1, "reject_when_full": 1}}`。
 
 两条写侧硬约束（违反即 400）：`batch >= 2` 必须同时给 `batch_wait`；
 `batch_wait + 执行时长 + 余量 ≤ SK_SESSION_TTL_SECONDS`——令牌只在 Redis 且

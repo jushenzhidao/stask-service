@@ -308,6 +308,27 @@ def test_slot_exhausted_429_with_retry_after(client, monkeypatch, test_settings)
     assert resp.json()["error"]["type"] == "rate_limit_error"
 
 
+def test_reject_when_full_429_with_layer_code(client, monkeypatch, test_settings,
+                                              task_store):
+    """满则拒经端点冒泡：第 2 条 429 + Retry-After，且 error.code 指出层名。
+
+    层名进 ``code`` 而不是只进 message：三层满起来都是 429，客户端要据此分支
+    （第一层换 key、第二层等这条跑完、第三层换 key 没用）。
+    """
+    monkeypatch.setattr(test_settings, "model_policies", {
+        "dall-e-3": {"limit_model_token": 1, "reject_when_full": 1}})
+
+    assert client.post(PATH, json=BODY, headers=AUTH).status_code == 202
+
+    resp = client.post(PATH, json={**BODY, "prompt": "another"}, headers=AUTH)
+    assert resp.status_code == 429
+    assert int(resp.headers["retry-after"]) >= 1, "必须带 Retry-After 供客户端退避"
+    body = resp.json()["error"]
+    assert body["type"] == "rate_limit_error"
+    assert body["code"] == "model_token_slot_exhausted"
+    assert len(task_store.rows) == 1, "被拒的提交不得留下任何行"
+
+
 def test_rate_limit_429(client, monkeypatch, test_settings):
     monkeypatch.setattr(test_settings, "rate_limit", 2)
     codes = [

@@ -41,11 +41,17 @@ class SubmitConflict(Exception):
 
 
 class SlotExhausted(Exception):
-    """并发槽已满 → 429 + Retry-After。"""
+    """并发槽已满 → 429 + Retry-After。
 
-    def __init__(self, limit: int) -> None:
-        super().__init__(f"concurrent task limit reached: {limit}")
+    ``layer`` 标明是**哪一层**满的（``token`` / ``model_token`` / ``global``）。
+    三层满起来客户端看到的都是同一个 429，但处置完全不同（换 key / 换模型 /
+    等上游容量），所以它必须进 429 的响应体——否则排障只能靠猜。
+    """
+
+    def __init__(self, limit: int, *, layer: str = "token") -> None:
+        super().__init__(f"concurrent task limit reached: {layer} limit {limit}")
         self.limit = limit
+        self.layer = layer
 
 
 def model_slug(model: str) -> str:
@@ -308,13 +314,49 @@ async def submit(
         # 延迟路径同理，而且更极端：等待期可长达数小时，占槽等于把用户的
         # 并发配额锁死整个等待窗口，正常请求全部 429。
         if not queued and not delayed:
-            if not await slots.acquire(th, policy.limit_per_token,
-                                       ttl_seconds=config.slot_ttl_seconds):
-                raise SlotExhausted(policy.limit_per_token)
-            slot_taken = True
-            # 单层入口只占第一层，掩码就是 FLAG_TOKEN。它必须随行落库，
-            # 否则终态释放读到 0 会一层都不还（见 batch_fields 注释）。
-            slot_mask = slots.FLAG_TOKEN
+            if policy.layered_at_submit:
+                # 「满则拒」路径：提交时就用三层原子占槽，第二/三层在这里
+                # 就判定，满则 429 让客户端退避重试——背压交回客户端。
+                #
+                # 与排队路径的区别不是「快一点」：它**不挂 st:due**，所以不依赖
+                # tick 进程，也没有「等 tick 的 0~15s」；代价是队列不再兜底，
+                # 客户端必须自己重试。
+                #
+                # 掩码是 release_for_task 的唯一依据，必须随行落库（同下）。
+                limits = {
+                    "token": policy.limit_per_token or config.max_slots,
+                    "model_token": policy.limit_model_token,
+                    "global": policy.limit_global,
+                }
+                # acquire_layered 返回 0 有两个含义（「某层超限」与「三层都没启
+                # 用」）。这里三层里至少有第一层为正（max_slots ≥ 1）+ 一个分层
+                # 上限为正（layered_at_submit 的成立条件），所以 0 只能是超限。
+                slot_mask = await slots.acquire_layered(
+                    th, model,
+                    limit_per_token=limits["token"],
+                    limit_model_token=limits["model_token"],
+                    limit_global=limits["global"],
+                    ttl_seconds=config.slot_ttl_seconds,
+                )
+                if not slot_mask:
+                    # 哪个层满的要报出来：三层都是 429，但处置完全不同
+                    # （换 key / 换模型 / 等上游）。只在错误路径读计数。
+                    layer = await slots.binding_layer(
+                        th, model,
+                        limit_per_token=limits["token"],
+                        limit_model_token=limits["model_token"],
+                        limit_global=limits["global"],
+                    )
+                    raise SlotExhausted(limits[layer] or limits["token"], layer=layer)
+                slot_taken = True
+            else:
+                if not await slots.acquire(th, policy.limit_per_token,
+                                           ttl_seconds=config.slot_ttl_seconds):
+                    raise SlotExhausted(policy.limit_per_token)
+                slot_taken = True
+                # 单层入口只占第一层，掩码就是 FLAG_TOKEN。它必须随行落库，
+                # 否则终态释放读到 0 会一层都不还（见 batch_fields 注释）。
+                slot_mask = slots.FLAG_TOKEN
 
         # ---- 5. 落库 QUEUED ----
         data = build_task_data(plan)
@@ -353,8 +395,16 @@ async def submit(
             task_id, plan.model, plan.path, type(exc).__name__,
         )
         # 回滚顺序与获取顺序相反：先还槽/退批，再处理占位。
+        #
+        # 归还与获取必须**成对同源**：分层路径占了三层，只还第一层会让
+        # st:mslot / st:gslot 单调累积（校准能修计数，修不了「谁的槽被还掉
+        # 了」）。这里按 policy.layered_at_submit 分派而不是按掩码猜，
+        # 与上面占槽时的分派条件是同一个表达式，不会漂移。
         if slot_taken:
-            await slots.release(th)
+            if policy.layered_at_submit:
+                await slots.release_layered(th, model, slot_mask)
+            else:
+                await slots.release(th)
         if joined:
             # 入批成功但后续步骤炸了：必须退批，否则这条已判死的任务
             # 会占着批次计数，让整批凑不满 N 只能干等 T。

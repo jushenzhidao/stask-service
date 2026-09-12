@@ -19,6 +19,31 @@
 排障时「这条任务到底生效了哪套参数」必须一眼可答，深合并会让这个问题
 需要拿三份配置对着推。
 
+## 分层上限满额时的两种行为（`reject_when_full`）
+
+`limit_model_token` / `limit_global` 声明的是「在途上限」，但**满了之后怎么办**
+是另一个独立决策，默认不写死其中一种：
+
+| `reject_when_full` | 满额行为 | 客户端看到的 |
+|---|---|---|
+| `0`（默认） | **排队**：提交即 202，任务挂进 `st:due`，由 tick 逐条等槽 | 202 + `batch_state=waiting`，**永不 429** |
+| `1` | **拒绝**：提交时就用 `acquire_layered` 原子占三层，满则 429 | 429 + `Retry-After`，客户端自行退避重试 |
+
+两者不是「严格程度」的差别，而是**背压信号放在哪一侧**：
+
+- 默认的排队语义把背压交给服务端（任务不会丢，但队列长度无上限，客户端看不到
+  任何「该停一停」的信号，必须自己读 `/admin/api/slots`）；
+- `reject_when_full=1` 把背压交回客户端（队列不积压，429 就是信号），代价是
+  客户端**必须有重试逻辑**，否则任务直接丢失。
+
+`reject_when_full=1` 时提交即占槽，因此**不再依赖 tick 进程**、也没有
+「等 tick 的 0~15s」额外延迟；这是它对单条串行场景（`limit_model_token=1`）更
+合适的原因。它也**不受 `batch_enabled` 连坐**——分层并发限制不是攒批的一部分，
+拿攒批止血开关去关它是错的。
+
+与 `batch >= 2` 互斥（写侧拒绝该组合）：攒批必须有等待窗口，而攒批期间占着
+并发槽会把用户的配额锁死整个窗口。攒批优先，要拒绝就别攒批。
+
 ## 存储
 
 整份策略是 **dynconf 的一个 json 类型配置项**（`model_policies`），
@@ -54,7 +79,7 @@ MAX_ENTRIES = 256
 
 #: 策略条目的合法字段（多一个都拒绝：防止把拼错的键静默忽略）
 _FIELDS = ("batch", "batch_wait", "limit_per_token", "limit_model_token",
-           "limit_global")
+           "limit_global", "reject_when_full")
 
 #: 攒批等待之外必须留出的余量：单条任务的执行时长（`worker_timeout` 上界）
 #: 加一点收尾空间。等待 + 执行 + 余量 必须 ≤ 令牌会话 TTL。
@@ -82,28 +107,6 @@ def normalize_model(model: str) -> str:
 
 
 @dataclass(frozen=True, slots=True)
-class ModelPolicy:
-    """一个模型（或端点/缺省）声明的策略。``0`` = 未声明，交下一层决定。"""
-
-    batch: int = 0
-    batch_wait: int = 0
-    limit_per_token: int = 0
-    limit_model_token: int = 0
-    limit_global: int = 0
-
-    @classmethod
-    def from_declared(cls, node: dict[str, Any]) -> ModelPolicy:
-        """从已校验的 dict 构造。缺省字段保持 0（= 未声明）。"""
-        return cls(
-            batch=int(node.get("batch", 0)),
-            batch_wait=int(node.get("batch_wait", 0)),
-            limit_per_token=int(node.get("limit_per_token", 0)),
-            limit_model_token=int(node.get("limit_model_token", 0)),
-            limit_global=int(node.get("limit_global", 0)),
-        )
-
-
-@dataclass(frozen=True, slots=True)
 class ResolvedPolicy:
     """解析后的**生效**参数（每个字段都是确定的数值，无「未声明」态）。
 
@@ -118,6 +121,32 @@ class ResolvedPolicy:
     limit_model_token: int
     limit_global: int
     source: str
+    #: 满额行为开关（见模块 docstring「分层上限满额时的两种行为」）。
+    #: 放在 ``source`` 之后并带默认值：既有构造点（含测试）用关键字传参，
+    #: 不给默认值会让所有 ResolvedPolicy(...) 直接 TypeError。
+    reject_when_full: int = 0
+
+    @property
+    def layered_at_submit(self) -> bool:
+        """提交时就**用三层原子占槽**（占不到即 429），而不是排队等槽。
+
+        三个条件同时成立才开启：
+
+        - ``reject_when_full > 0``：运营显式选择了「满则拒」；
+        - ``batch < 2``：攒批必须有等待窗口，提交时占槽会把用户配额锁死整个
+          窗口（写侧已拒绝「攒批 + 满则拒」的组合，这里是最后一道防御）；
+        - 至少声明了一层分层上限（第二/三层）：没有上限就没有「满」可言，
+          写侧同样已拒绝这种无效配置。
+
+        与 ``queues`` 互斥：本属性为真时 ``queues`` 必为假。这样提交链路
+        走「立即路径 + 分层占槽」，也就不再依赖 ``batch_enabled`` 这个攒批
+        止血开关——分层并发限制不是攒批的一部分。
+        """
+        return (
+            self.reject_when_full > 0
+            and self.batch < 2
+            and (self.limit_model_token > 0 or self.limit_global > 0)
+        )
 
     @property
     def queues(self) -> bool:
@@ -133,12 +162,16 @@ class ResolvedPolicy:
 
         三者都不成立时（``batch<=1`` 且两个分层上限均为 0）走提交时立即占槽
         的旧路径——那条路径的行为与改造前逐字节一致。
+
+        **例外**：``layered_at_submit`` 为真（``reject_when_full=1`` 且不攒批）
+        时**不排队**——那条路径在提交侧就已经用 ``acquire_layered`` 占了
+        第二/三层，判定点只是从放行前移到了提交，不需要放行通道。
         """
-        return (
-            self.batch >= 2
-            or self.limit_model_token > 0
-            or self.limit_global > 0
-        )
+        if self.batch >= 2:
+            return True
+        if self.layered_at_submit:
+            return False
+        return self.limit_model_token > 0 or self.limit_global > 0
 
 
 def validate(raw: Any) -> dict[str, dict[str, int]]:
@@ -194,6 +227,7 @@ def validate(raw: Any) -> dict[str, dict[str, int]]:
                 "limit_per_token": (0, MAX_LIMIT, "limit_per_token"),
                 "limit_model_token": (0, MAX_LIMIT, "limit_model_token"),
                 "limit_global": (0, MAX_LIMIT, "limit_global"),
+                "reject_when_full": (0, 1, "reject_when_full"),
             }[field]
             low, high, label = limit
             if not low <= number <= high:
@@ -207,6 +241,22 @@ def validate(raw: Any) -> dict[str, dict[str, int]]:
                 f"model_policies[{name}]: batch >= 2 requires an explicit batch_wait "
                 "(otherwise the batch may wait forever)"
             )
+        if entry.get("reject_when_full"):
+            # 「满则拒」与攒批互斥：攒批要先凑够 N 或等够 T，那段时间必须不占槽
+            # （否则一批还没放行就先把自己的并发额度耗光）。两者同时声明时
+            # 语义无解，宁可拒写也不静默选一个丢一个。
+            if entry.get("batch", 0) >= 2:
+                raise ValueError(
+                    f"model_policies[{name}]: reject_when_full is incompatible with "
+                    "batch >= 2 (a batch must not hold concurrent slots while waiting)"
+                )
+            # 开了开关却一层分层上限都没声明 = 没有任何东西会「满」，这个配置
+            # 只会让人以为自己在背压而实际没有任何效果（静默无效配置）。
+            if not (entry.get("limit_model_token") or entry.get("limit_global")):
+                raise ValueError(
+                    f"model_policies[{name}]: reject_when_full requires "
+                    "limit_model_token or limit_global to be > 0"
+                )
         wait = entry.get("batch_wait", 0)
         if wait and wait + _tokenceiling_margin() > settings.sk_session_ttl_seconds:
             # 令牌会话 TTL 是等待时长的真天花板：令牌只在 Redis 且绝不落库，
@@ -282,4 +332,7 @@ def resolve(
         limit_model_token=int(chosen.get("limit_model_token", 0)),
         limit_global=int(chosen.get("limit_global", 0)),
         source=source,
+        # 未声明回落 0 = 「排队」旧语义。这个回落方向是刻意的：热改一张表时
+        # 漏写该字段不该把已有模型的满额行为从排队静默翻成拒绝。
+        reject_when_full=int(chosen.get("reject_when_full", 0)),
     )

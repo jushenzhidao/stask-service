@@ -36,14 +36,15 @@ TASK_B = "doubao_" + "b" * 32
 TASK_C = "doubao_" + "c" * 32
 
 
-def _plan(task_id: str, model: str = MODEL, token_hash: str = TH) -> SubmitPlan:
+def _plan(task_id: str, model: str = MODEL, token_hash: str = TH,
+          *, scheduled_at: int = 0) -> SubmitPlan:
     return SubmitPlan(
         task_id=task_id, token_hash=token_hash, model=model,
         method="POST", path="/v1/images/generations", query="",
         headers={"Content-Type": "application/json"},
         body='{"model":"' + model + '"}', body_encoding="plain",
         body_truncated=False, upstream_base_url="http://newapi:3000",
-        user_id=42,
+        user_id=42, scheduled_at=scheduled_at,
     )
 
 
@@ -767,3 +768,219 @@ async def test_slot_exhausted_on_immediate_path(task_store, patch_redis,
 
     assert TASK_B not in task_store.rows, "占槽失败不得留下僵尸行"
     assert await slots.current(TH) == 1
+
+
+# ---------------------------------------------------------------------------
+# reject_when_full：分层上限「满则拒」（提交时占槽 → 429）
+# ---------------------------------------------------------------------------
+#
+# 与上面那组的分界：默认（reject_when_full=0）把满额任务挂进 st:due 排队，
+# 提交侧永不 429；开了开关则把判定点前移到提交，满即 429——背压从服务端
+# 交回客户端。两种语义都是合法的，但**不能靠猜**：它们对客户端的要求相反
+# （一个要求轮询、一个要求重试），所以下面同时钉住两侧。
+
+
+async def _record_enqueue(queue_events):
+    async def _enqueue(task_id: str) -> None:
+        queue_events.execute.append(task_id)
+    return _enqueue
+
+
+async def test_reject_when_full_rejects_second_submit(
+    task_store, patch_redis, queue_events, test_settings, monkeypatch
+):
+    """第 1 条 202 并占住第二层；第 2 条 429，且不落库、不留下任何层。"""
+    await _set_policies(monkeypatch, {
+        MODEL: {"limit_model_token": 1, "reject_when_full": 1}})
+    _enqueue = await _record_enqueue(queue_events)
+    config = await dynconf.get_runtime_config()
+
+    await submit.submit("sk-test-token", _plan(TASK_A), enqueue=_enqueue,
+                        config=config)
+
+    data = task_store.rows[TASK_A]["data"]
+    assert data["batch_state"] == "immediate", "满则拒不排队，走立即路径"
+    assert data["slot_flags"] == slots.FLAG_TOKEN | slots.FLAG_MODEL_TOKEN
+    assert await slots.current_model_token(TH, MODEL) == 1
+    assert await patch_redis.zcard(K_DUE) == 0, "不挂到期索引 ⇒ 不依赖 tick"
+    assert queue_events.execute == [TASK_A], "接受的这条直接入队执行"
+
+    with pytest.raises(submit.SlotExhausted) as excinfo:
+        await submit.submit("sk-test-token", _plan(TASK_B), enqueue=_enqueue,
+                            config=config)
+
+    # 哪一层满的必须报出来：三层都是 429，处置完全不同
+    assert excinfo.value.layer == "model_token"
+    assert excinfo.value.limit == 1
+    assert TASK_B not in task_store.rows, "占槽失败不得留下僵尸行"
+    assert queue_events.execute == [TASK_A], "被拒的那条不得入队"
+    assert await slots.current(TH) == 1
+    assert await slots.current_model_token(TH, MODEL) == 1, \
+        "占槽失败必须三层整体回滚，不得留下半个掩码"
+
+
+async def test_reject_when_full_recovers_after_terminal(
+    task_store, patch_redis, queue_events, test_settings, monkeypatch
+):
+    """终态释放后必须能再提交——否则这是「一条之后永久 429」。
+
+    这条盯的是**释放侧**：分层掩码必须随行落库（slot_flags），终态才能按
+    掩码把第二层还回去。写死 0 或只还第一层都会让第二层单调累积。
+    """
+    await _set_policies(monkeypatch, {
+        MODEL: {"limit_model_token": 1, "reject_when_full": 1}})
+    _enqueue = await _record_enqueue(queue_events)
+    config = await dynconf.get_runtime_config()
+
+    await submit.submit("sk-test-token", _plan(TASK_A), enqueue=_enqueue,
+                        config=config)
+    await slots.release_for_task(task_store.rows[TASK_A]["data"])
+
+    assert await slots.current(TH) == 0
+    assert await slots.current_model_token(TH, MODEL) == 0
+
+    await submit.submit("sk-test-token", _plan(TASK_B), enqueue=_enqueue,
+                        config=config)
+    assert task_store.rows[TASK_B]["data"]["slot_flags"] == (
+        slots.FLAG_TOKEN | slots.FLAG_MODEL_TOKEN)
+
+
+async def test_default_still_queues_and_never_429(
+    task_store, patch_redis, queue_events, test_settings, monkeypatch
+):
+    """不写 reject_when_full ⇒ 行为不变：两条都 202，都挂 st:due 等槽。"""
+    await _set_policies(monkeypatch, {MODEL: {"limit_model_token": 1}})
+    _enqueue = await _record_enqueue(queue_events)
+    config = await dynconf.get_runtime_config()
+
+    for task_id in (TASK_A, TASK_B):
+        await submit.submit("sk-test-token", _plan(task_id), enqueue=_enqueue,
+                            config=config)
+
+    assert {tid: task_store.rows[tid]["data"]["batch_state"]
+            for tid in (TASK_A, TASK_B)} == {TASK_A: "waiting", TASK_B: "waiting"}
+    assert queue_events.execute == [], "排队路径不得直接入队"
+    assert await patch_redis.zcard(K_DUE) == 2, "两条都排进到期索引"
+    assert await slots.current_model_token(TH, MODEL) == 0, "等待期不占槽"
+
+
+async def test_reject_when_full_not_collateral_to_batch_switch(
+    task_store, patch_redis, queue_events, test_settings, monkeypatch
+):
+    """batch_enabled=False（攒批止血）不得把分层限制一起关掉。
+
+    分层并发限制不是攒批的一部分：止血开关只能停掉它要停的那件事。这里同时
+    钉住「满则拒路径不读 batch_enabled」这个性质。
+    """
+    await _set_policies(monkeypatch, {
+        MODEL: {"limit_model_token": 1, "reject_when_full": 1}})
+    monkeypatch.setattr(test_settings, "batch_enabled", False)
+    _enqueue = await _record_enqueue(queue_events)
+    config = await dynconf.get_runtime_config()
+
+    await submit.submit("sk-test-token", _plan(TASK_A), enqueue=_enqueue,
+                        config=config)
+    with pytest.raises(submit.SlotExhausted):
+        await submit.submit("sk-test-token", _plan(TASK_B), enqueue=_enqueue,
+                            config=config)
+
+
+async def test_reject_when_full_does_not_gate_delayed_submits(
+    task_store, patch_redis, queue_events, test_settings, monkeypatch
+):
+    """带调度头的提交仍走排队——提交时它本来就不该占槽。
+
+    对延迟任务报 429 没有意义：那一刻没有任何东西在途。它的准入发生在到点
+    放行时，占不到槽照样退避重排而不是拒绝。这条把「开关的适用范围」钉死，
+    免得后来人以为它可以替代对 scheduled 的准入判定。
+    """
+    await _set_policies(monkeypatch, {
+        MODEL: {"limit_model_token": 1, "reject_when_full": 1}})
+    _enqueue = await _record_enqueue(queue_events)
+    config = await dynconf.get_runtime_config()
+
+    await submit.submit(
+        "sk-test-token",
+        _plan(TASK_A, scheduled_at=taskstore.now() + 3600),
+        enqueue=_enqueue, config=config,
+    )
+
+    data = task_store.rows[TASK_A]["data"]
+    assert data["batch_state"] == "scheduled"
+    assert data["slot_flags"] == 0
+    assert await patch_redis.zcard(K_DUE) == 1, "只挂到期索引，不入队不占槽"
+    assert queue_events.execute == []
+    assert await slots.current_model_token(TH, MODEL) == 0
+
+
+async def test_binding_layer_names_the_saturated_layer(patch_redis):
+    """三层满起来都是 429，判定函数必须说出是哪一层。"""
+    limits = {"limit_per_token": 5, "limit_model_token": 1, "limit_global": 2}
+
+    await slots.reset(TH, 5, ttl_seconds=60)
+    assert await slots.binding_layer(TH, MODEL, **limits) == "token"
+
+    await slots.reset(TH, 0, ttl_seconds=60)
+    await slots.reset_model_token(TH, MODEL, 1, ttl_seconds=60)
+    assert await slots.binding_layer(TH, MODEL, **limits) == "model_token"
+
+    await slots.reset_model_token(TH, MODEL, 0, ttl_seconds=60)
+    await slots.reset_global(MODEL, 2, ttl_seconds=60)
+    assert await slots.binding_layer(TH, MODEL, **limits) == "global"
+
+    # 都没到限（例如计数被释放掉的瞬间）→ 回落第一层，绝不上抛
+    await slots.reset_global(MODEL, 0, ttl_seconds=60)
+    assert await slots.binding_layer(TH, MODEL, **limits) == "token"
+
+
+# ---------------------------------------------------------------------------
+# 策略解析：reject_when_full 的两个派生判据与写侧校验
+# ---------------------------------------------------------------------------
+
+
+def test_reject_when_full_flips_queues_to_submit_time_gate():
+    """开关打开 = 「提交时占槽」，因此不排队；关闭 = 回到排队语义。"""
+    on = modelpolicy.resolve(
+        model=MODEL,
+        policies={MODEL: {"limit_model_token": 1, "reject_when_full": 1}},
+        default_limit_per_token=10,
+    )
+    assert on.reject_when_full == 1
+    assert on.layered_at_submit is True
+    assert on.queues is False, "满则拒不得再进排队通道（否则永远排队、永不 429）"
+
+    off = modelpolicy.resolve(
+        model=MODEL, policies={MODEL: {"limit_model_token": 1}},
+        default_limit_per_token=10,
+    )
+    assert off.reject_when_full == 0, "未声明回落 0 = 旧语义，不静默翻转行为"
+    assert off.layered_at_submit is False
+    assert off.queues is True
+
+
+def test_reject_when_full_does_not_break_batching():
+    """攒批模型的 queues 判定不受影响（开关与 batch 互斥，写侧已拦）。"""
+    p = modelpolicy.resolve(
+        model=MODEL, policies={MODEL: {"batch": 5, "batch_wait": 30}},
+        default_limit_per_token=10,
+    )
+    assert p.layered_at_submit is False
+    assert p.queues is True
+
+
+def test_reject_when_full_validation():
+    ok = modelpolicy.validate(
+        {MODEL: {"limit_model_token": 1, "reject_when_full": 1}})
+    assert ok[MODEL]["reject_when_full"] == 1
+
+    with pytest.raises(ValueError):          # 与攒批互斥
+        modelpolicy.validate(
+            {MODEL: {"batch": 5, "batch_wait": 30, "reject_when_full": 1}})
+    with pytest.raises(ValueError):          # 开了开关却没有分层上限 = 静默无效
+        modelpolicy.validate({MODEL: {"reject_when_full": 1}})
+    with pytest.raises(ValueError):          # 值域 0/1
+        modelpolicy.validate(
+            {MODEL: {"limit_model_token": 1, "reject_when_full": 2}})
+    with pytest.raises(ValueError):          # 只声明 limit_per_token 也不算分层上限
+        modelpolicy.validate(
+            {MODEL: {"limit_per_token": 1, "reject_when_full": 1}})
