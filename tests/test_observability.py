@@ -313,3 +313,64 @@ def test_signed_url_survives_the_real_pipeline_when_scrubbing_is_off():
     assert urls, "探针 span 没进导出器，用例本身失效"
     assert all(u == _SIGNED_URL for u in urls), f"签名 URL 被改写：{urls}"
     assert all("logfire.scrubbed" not in attrs for attrs in exported), "仍带脱敏记录"
+
+
+def test_structured_body_reaches_logfire_as_an_expandable_attribute():
+    """``*_json`` 字段经真实桥接后是「可展开」的：序列化值 + ``logfire.json_schema``。
+
+    2026-09-16 用户反馈的直接验收：响应体此前只是 ``logfire.logging_args`` 数组里的
+    **一整段字符串**，看板既不能按字段过滤也不能展开。dict 属性在 ``Logfire.log``
+    里被 ``prepare_otlp_attributes`` 序列化、并由 ``attributes_json_schema_properties``
+    记下结构（SDK 5.0.0 ``main.py:788``/``:796``），看板据此渲染可展开的树、支持
+    ``response_json.x.y`` 形式的嵌套过滤。
+
+    走真实 configure + TestExporter：logfire 把日志作为 ``span_type='log'`` 的
+    **span** 走 span 管道（``self._logs_tracer.start_span``），日志记录管道截不到
+    它——这一点实测踩过，别再用 log record 导出器验日志。
+    """
+    import json
+
+    import logfire
+    from logfire.testing import TestExporter
+    from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+
+    exporter = TestExporter()
+    logfire.configure(
+        service_name="stask-structured-probe",
+        send_to_logfire=False,
+        console=False,
+        metrics=False,
+        inspect_arguments=False,
+        scrubbing=False,
+        additional_span_processors=[SimpleSpanProcessor(exporter)],
+    )
+
+    from app.logging import log as app_log
+
+    payload = {
+        "choices": [{"message": {"content": "hi", "role": "assistant"}, "finish_reason": "stop"}],
+        "usage": {"total_tokens": 115, "completion_tokens": 110},
+        "model": "deepseek-v4-flash",
+    }
+    sink_id = None
+    try:
+        sink_id = app_log.add(**logfire.loguru_handler())
+        app_log.bind(response_json=payload).info("task success: structured probe")
+        logfire.force_flush()
+    finally:
+        if sink_id is not None:
+            app_log.remove(sink_id)
+
+    exported = [dict(span.attributes or {}) for span in exporter.exported_spans]
+    mine = [a for a in exported if a.get("logfire.msg") == "task success: structured probe"]
+    assert mine, "探针日志没进导出器，用例本身失效"
+
+    attrs = mine[-1]
+    # dict 被序列化成 JSON 字符串（OTel 属性只收标量/数组），但结构完整保留
+    serialized = attrs["response_json"]
+    assert isinstance(serialized, str), "dict 被整个丢掉/转成了别的形态"
+    assert json.loads(serialized) == payload
+    # 结构清单单独成属性——看板「可展开/可过滤」依赖的就是它。
+    # 实际形状：{"type": "object", "properties": {"response_json": {"type": "object"}, ...}}
+    schema = json.loads(attrs["logfire.json_schema"])
+    assert schema["properties"]["response_json"] == {"type": "object"}

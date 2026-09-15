@@ -111,6 +111,10 @@ worker 崩溃时在飞消息直接蒸发；Stream + consumer group 是 at-least-
 见 `app/observability.py`：SDK 默认按**值子串**命中 `credential`，会把预签名 URL 整条抹成
 `[Scrubbed due to 'Credential']`，与「不脱敏」口径相反）——三层体量闸门
 （业务摘要 4KB / `OTEL_*_ATTRIBUTE_VALUE_LENGTH_LIMIT` / 管道内 `_BodyCapProcessor` 裁 body）；
+请求/响应体另有**结构化展开**：`request_json` / `response_json` 属性是解析后的 JSON 对象
+（走 logfire 的 `logfire.json_schema` 机制，看板可逐层展开、可按嵌套字段过滤；瘦身约束
+深度 4 / 字符串 500 / 数组 20），与 `_digest` 字符串摘要并存、各司其职，不可结构化时
+该属性不出现；
 metrics 默认**关**（无消费方）；停机 flush 在 `web lifespan` 与 `worker shutdown`。
 
 **依赖钉版唯一处 = `pyproject.toml`**，不写 requirements.txt。
@@ -626,7 +630,9 @@ curl -s "http://127.0.0.1:8000/admin/api/schedule" -H "X-Admin-Key: $ADMIN_KEY" 
 
 | **2026-09-13** | **P3：文档守卫推广 + `OPTIMIZATION.md` 订正** | `docs/OPTIMIZATION.md` 是孤儿文档，且**让读者去找一个本仓不存在的文件**（`submit_v2.py`，无实现也无引用）；死引用守卫此前只覆盖 SPEC，同类问题在其他文档无人管 | 第 3 条守卫由「SPEC 正文路径」**推广为「全部 `docs/*.md` + README 的路径与 `.py` 引用」**（含裸文件名形态——`submit_v2.py` 正是这种没有目录前缀的形态，只查带前缀路径会整类漏掉），带 `_HISTORICAL_DOCS` / `_EXTERNAL_PY_REFS` 两张**写明理由**的豁免表；`OPTIMIZATION.md` 按逐项复核结果订正（6 项中 5 项仍成立、第 6 项标注**未落地**），加「历史快照、非事实源」抬头；`scripts/mutate_spec_contract.py` 加固：pytest 退出码 4/5（节点失效）判为**变异无效**而非「如期变红」——旧版会把节点改名读成一次假绿 |
 
-| **2026-09-13** | **logfire 默认脱敏关停（`scrubbing=False`）** | §4 早已写明「内容不脱敏（签名 URL 原样上报）」，但从未关闭 SDK 自带的脱敏默认值：它按**值子串**匹配 `credential`，而制品地址是预签名 URL（必含 `X-Amz-Credential=`），于是 `attributes.result_url` 与 `logfire.logging_args.*.url` 在看板上全部只剩 `[Scrubbed due to 'Credential']`。**契约与实现相反，且没有任何功能性症状**（日志照打、trace 照出、套件全绿），只影响看板可读性 | `app/observability.py` 增 `scrubbing=False`；`tests/test_observability.py` 增 2 条（默认模式会误伤的机制证明 + 真实管道下值原样导出）并把接线断言并入既有装配用例 |
+| **2026-09-16** | **日志体结构化展开（`request_json` / `response_json`）** | 响应体只作为 `logfire.logging_args` 数组里的**一个字符串**上报：看板既不能按字段过滤、也不能展开，「上游到底回了什么结构」只能人肉读文本；`scrubbing=False` 修完后这个短板立刻显形 | `logdigest` 增 `_parsed_json` / `_json_field`（解析 + `_shrink` 瘦身，不可结构化返回空 dict、字段就不出现）；`execute` 三个调用点（请求 / 成功 / 失败）挂上 `**_json_field(...)`，dict 属性经 logfire 的 `logfire.json_schema` 机制可展开、可按嵌套字段过滤；与既有字符串摘要**并存**：摘要管全文（4KB 单串），结构化管检索（深度 4 / 字符串 500 / 数组 20）。`tests/test_logging.py` 加 5 条单元；`tests/test_observability.py` 加 1 条真实管道验收（dict → 序列化值 + `logfire.json_schema`；顺带钉死「logfire 的日志走 span 管道，日志记录导出器截不到」这个坑） |
+
+| **2026-09-13** | **logfire 默认脱敏关停（`scrubbing=False`）** | §4 早已写明「内容不脱敏（签名 URL 原样上报）」，但从未关闭 SDK 自带的脱敏默认值：它按**值子串**匹配 `credential`，而制品地址是预签名 URL（必含 `X-Amz-Credential=`），于是 `attributes.result_url` 与 `logfire.logging_args.*.url` 在看板上全部只剩 `[Scrubbed due to 'Credential']`。**契约与实现相反，且没有任何功能性症状**（日志照打、trace 照出、套件全绿），只影响看板可读性 | `app/observability.py` 增 `scrubbing=False`；`tests/test_observability.py` 增 2 条（默认模式会误伤的机制证明 + 真实管道下值原样导出）并把接线断言并入既有装配用例。**09-16 补记：该行当日写完却未提交，生产照旧脱敏**，09-16 才随 `246e671` 真正落库发布——契约类改动改完必须核对已提交且发布链路走完 |
 
 | **2026-09-13** | **`taskstore.py` 拆成包（纯结构变更）** | 单文件 1163 行，远超可读区间；文件内原有的「写 / 读」两处分节注释已经暗示了真实的关注点边界 | `app/services/taskstore.py` → `app/services/taskstore/`：`__init__.py`（**全量再导出**原命名空间，契约不变）+ `_base` / `_projection` / `_write` / `_batch` / `_read` / `_sweeper` / `_admin_query`，**最大单文件 255 行**。每个函数体经 AST 比对**逐字未变**、54 个顶层名字零丢失。配套：`conftest` 的测试替身改为 patch「包 + `pkgutil` 自动枚举的子模块」（包内跨模块调用的绑定在子模块命名空间里，只 patch 包够不着 → 会静默打真库）；注册表守卫补「再导出完整性」与「再导出但包外无调用方」两条；孤儿守卫的限定前缀改为「消费者实际会写的包名」；同步 README 文件树、`models.py` docstring、PRD / ARCH 的路径引用 |
 

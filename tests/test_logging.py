@@ -20,7 +20,7 @@ from loguru import logger
 
 from app.config import settings
 from app.logging import _effective_level, setup_logging
-from app.services.logdigest import _digest, _log_headers
+from app.services.logdigest import _digest, _json_field, _log_headers, _parsed_json
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -127,6 +127,57 @@ def test_digest_never_raises_on_non_json():
     assert "502 Bad Gateway" in _digest(b"<html><body>502 Bad Gateway</body></html>")
     assert _digest(b"\xff\xfe\x00\x01")
     assert _digest(b"") == ""
+
+
+# ---------------------------------------------------------------------------
+# 结构化展开（``request_json`` / ``response_json``，2026-09-16）
+# ---------------------------------------------------------------------------
+
+
+def test_parsed_json_returns_shrunk_object():
+    """解析结果是**缩身后的 dict**：结构可过滤，超长文本仍归 ``_digest`` 管。"""
+    raw = json.dumps({
+        "model": "deepseek-v4-flash",
+        "usage": {"total_tokens": 115},
+        "content": "x" * 5000,
+    }).encode()
+    out = _parsed_json(raw)
+    assert out is not None
+    assert out["model"] == "deepseek-v4-flash"
+    assert out["usage"] == {"total_tokens": 115}
+    assert "<truncated" in out["content"] and "5000 chars total" in out["content"]
+
+
+def test_parsed_json_rejects_unstructurable_bodies():
+    """不可结构化的体返回 None（字段不出现），而不是塞空对象/错误对象。"""
+    assert _parsed_json(b"") is None                     # 空体
+    assert _parsed_json(b"[1, 2, 3]") is None            # 顶层数组：没有可命名字段
+    assert _parsed_json(b'"plain"') is None              # 顶层标量
+    assert _parsed_json(b"null") is None                 # 顶层 null
+    assert _parsed_json(b"<html><body>502</body></html>") is None  # 非 JSON
+    assert _parsed_json(b"\xff\xfe\x00\x01") is None     # 非法 UTF-8
+
+
+def test_parsed_json_skips_oversized_bodies():
+    """超限大体不解析（与 ``_digest`` 同一成本线），返回 None。"""
+    raw = b'{"huge":"' + b"A" * (300 * 1024) + b'"}'
+    assert _parsed_json(raw) is None
+
+
+def test_parsed_json_marks_inline_base64():
+    """内联 b64 只留标记：结构化是为了看结构，不是为了搬运体积。"""
+    uri = "data:image/png;base64," + "A" * 40000
+    out = _parsed_json(json.dumps({"image": uri}).encode())
+    assert out is not None
+    assert f"<inline data:image/png;base64 ~{len(uri)} chars>" in out["image"]
+    assert "AAAA" not in out["image"]
+
+
+def test_json_field_omits_the_key_when_not_structured():
+    """调用侧封装：可结构化才带键——OTel 属性里 ``key: null`` 是纯噪音。"""
+    assert _json_field("response_json", b"") == {}
+    assert _json_field("response_json", b"[1,2]") == {}
+    assert _json_field("response_json", b'{"ok":1}') == {"response_json": {"ok": 1}}
 
 
 # ---------------------------------------------------------------------------

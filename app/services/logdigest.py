@@ -77,6 +77,46 @@ def _shrink(node: Any, depth: int = 0) -> Any:
     return node
 
 
+def _parsed_json(raw: bytes) -> dict[str, Any] | None:
+    """Body → 解析后的 JSON 对象（供 logfire **结构化**上报），不可结构化时 None。
+
+    与 ``_digest`` 是分工不是重复：``_digest`` 是单字符串，给终端与全文检索；
+    本函数产出 **dict**，经 loguru extra 进 logfire 后走 ``logfire.json_schema``
+    机制（SDK 把 dict 值序列化、同时记下结构清单），看板里可逐层展开、可按
+    嵌套字段过滤（如 ``response_json.usage.total_tokens``）。位置参数里的
+    JSON 文本整体只是一个字符串，做不到这件事，故两份并存、各司其职。
+
+    体量与 ``_digest`` 同一套约束：超 ``_LOG_PARSE_LIMIT`` 不解析；先过
+    ``_shrink``（深度 4 / 字符串 500 / 数组 20）——结构化字段的价值在
+    「字段名与层级可过滤」，全文阅读仍由 ``_digest`` 那份承担。
+
+    返回 None 的三种情形（**字段就不带上**，而不是带空对象污染看板）：
+    空体、超限、顶层非 dict（数组/标量没有可命名的字段，展开无从谈起）。
+    恒不抛，理由与 ``_digest`` 一致：观测构造失败绝不能影响任务。
+    """
+    if not raw or len(raw) > _LOG_PARSE_LIMIT:
+        return None
+    try:
+        node = json.loads(raw)
+    except (ValueError, UnicodeDecodeError):
+        return None
+    if not isinstance(node, dict):
+        return None
+    shrunk = _shrink(node)
+    return shrunk if isinstance(shrunk, dict) else None
+
+
+def _json_field(key: str, raw: bytes) -> dict[str, Any]:
+    """``_parsed_json`` 的调用侧形态：``{key: 解析结果}`` 或空 dict。
+
+    有则带上、无则不带——OTel 属性里出现 ``key: null`` 是纯噪音。请求 /
+    成功 / 失败三个调用点共用的「有没有」分支收在这一个函数里，调用侧
+    保持一行 ``**_json_field(...)``。
+    """
+    parsed = _parsed_json(raw)
+    return {key: parsed} if parsed is not None else {}
+
+
 def _digest(raw: bytes) -> str:
     """请求/响应体 → 日志摘要（**截断但不脱敏**，恒不抛）。
 

@@ -53,7 +53,7 @@ from app.services import (
     tokensession,
 )
 from app.services.outcome import Outcome, preview, upstream_error_detail
-from app.services.logdigest import _digest, _log_headers
+from app.services.logdigest import _digest, _json_field, _log_headers
 
 #: 摘要里最多带几条制品 URL（预签名地址很长，多了会撑爆 result backend）
 _OUTCOME_URL_LIMIT = 5
@@ -309,9 +309,12 @@ async def _dispatch(
     # 发请求前落一条完整请求摘要：排障最先要回答的是「我们到底发了什么」。
     # 只在重试循环**外**记一次——重试发的是同一份内容，逐次重复是纯噪音。
     # ``_log_headers`` 会把上面刚注入的 Authorization 摘掉（AC-30 红线）。
+    # ``request_json`` 是解析后的 dict（logfire 看板可按嵌套字段过滤），
+    # 与位置参数里 ``_digest(body)`` 的字符串摘要并存、各司其职。
     _blog(
         task_id, phase="upstream_call", method=method, model=model,
         request_path=path, request_bytes=len(body),
+        **_json_field("request_json", body),
     ).info(
         "upstream call: task_id={} method={} url={} model={} bytes={} headers={} body={}",
         task_id, method, url, model, len(body), _log_headers(headers), _digest(body),
@@ -544,6 +547,7 @@ async def _settle_response(
             artifact_parser=parsed["artifact_parser"],
             response_encoding=encoding,
             result_url=primary,
+            **_json_field("response_json", raw),
         ).info(
             "task success: task_id={} status={} bytes={} model={} path={} artifacts={} "
             "parser={} result_url={} artifact_urls={} response={}",
@@ -611,6 +615,7 @@ async def _settle_response(
         response_bytes=len(raw),
         response_encoding=encoding,
         response_preview=response_preview,
+        **_json_field("response_json", raw),
     ).warning(
         "task failure: task_id={} status={} reason={} model={} path={} ct={} bytes={} preview={}",
         task_id,
