@@ -29,8 +29,13 @@
 - taskiq-admin middleware 的上报走 httpx——instrument_httpx 会给它产
   span，但上报是低频 fire-and-forget，噪音可接受，不做排除。
 
-上报体量（2026-09-12 定：**不脱敏，但不上报大文件**）：
-内部审计口径下日志内容原样上报（含签名 URL，见 ``execute._digest``），
+上报内容（2026-09-12 定：**不脱敏，但不上报大文件**；09-13 补 `scrubbing=False`）：
+内部审计口径下日志内容原样上报（含签名 URL，见 ``execute._digest``）。
+**SDK 自带的脱敏必须显式关掉**（见 ``setup()`` 内注释）：其默认模式按**值子串**匹配
+``credential``，而制品地址是 S3/MinIO 预签名 URL（必含 ``X-Amz-Credential=``），
+于是 ``attributes.result_url`` 全被换成 ``[Scrubbed due to 'credential']``——
+「口径写了不脱敏、实际看到的是占位符」。不关只影响可读性、不影响功能，
+属最难自查的一类偏差（日志照打、trace 照出、测试全绿）。
 代价由「体量闸门」独立承担，分三层：
 
 1. **业务侧**：``execute._digest`` 把请求/响应体摘要压在 4KB 内，且超
@@ -145,6 +150,16 @@ def setup(component: str) -> None:
         send_to_logfire="if-token-present",
         environment=settings.app_env,
         console=False,          # 控制台输出仍由 loguru 负责，不重复打
+        # 脱敏：**必须显式关**。SDK 不传该参数时默认套用 ``ScrubbingOptions()``，
+        # 即 ``scrubbing.ScrubbingOptions`` 的 ``DEFAULT_PATTERNS``（含 'credential'
+        # / 'auth' / 'token' / 'session' / 'cookie' 等按**值子串**匹配），命中即把
+        # 整个值换成 ``[Scrubbed due to 'credential']``。对本服务是纯误伤：制品地址
+        # 是 S3/MinIO 预签名 URL，必含 ``X-Amz-Credential=``，于是
+        # ``attributes.result_url`` 与 ``logfire.logging_args.*.url`` 在看板上全部
+        # 变成一行占位符——与 SPEC §4「内容不脱敏（签名 URL 原样上报）」直接矛盾。
+        # 唯一的凭证屏蔽在代码里做（``logdigest._CREDENTIAL_HEADERS`` / AC-30），
+        # 不依赖 SDK 兜底，故这里关掉不会放松 AC-30 红线。
+        scrubbing=False,
         # metrics 只接受 MetricsOptions 或 False：None = 用 SDK 默认（开），
         # False = 整条管线不建（连 PeriodicExportingMetricReader 线程都不起）。
         metrics=None if settings.logfire_metrics_enabled else False,

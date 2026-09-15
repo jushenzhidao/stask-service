@@ -107,7 +107,9 @@ worker 崩溃时在飞消息直接蒸发；Stream + consumer group 是 at-least-
 **日志口径**（内部审计口径，勿按「脱敏」预期使用）：内容**不脱敏**（签名 URL 原样上报），
 唯一屏蔽项是**凭证头名**（AC-30）；`LOG_LEVEL` 默认 DEBUG，**WARNING 为硬地板**
 （调到 ERROR 应急降噪时 WARN 及以上仍必然落两侧）；stderr 侧只打 `{message}`，
-`extra` 仅在 logfire 可见。logfire 上报**不脱敏但不上报大文件**——三层体量闸门
+`extra` 仅在 logfire 可见。logfire 上报**不脱敏但不上报大文件**（`scrubbing=False` **必须显式传**，
+见 `app/observability.py`：SDK 默认按**值子串**命中 `credential`，会把预签名 URL 整条抹成
+`[Scrubbed due to 'Credential']`，与「不脱敏」口径相反）——三层体量闸门
 （业务摘要 4KB / `OTEL_*_ATTRIBUTE_VALUE_LENGTH_LIMIT` / 管道内 `_BodyCapProcessor` 裁 body）；
 metrics 默认**关**（无消费方）；停机 flush 在 `web lifespan` 与 `worker shutdown`。
 
@@ -623,6 +625,8 @@ curl -s "http://127.0.0.1:8000/admin/api/schedule" -H "X-Admin-Key: $ADMIN_KEY" 
 | **2026-09-13** | **注册表与入口覆盖门禁（P2）** | 不变式「新增 taskstore 函数须同步测试替身登记表」与「被调度/被路由的入口必须有真的调用一遍的用例」此前**只有纪律、没有门禁** | `tests/test_misc.py` 新增 2 条：`test_taskstore_test_double_covers_every_public_function`（公开函数须进 `_TASKSTORE_FUNCS` 或新增的 `_TASKSTORE_PURE_FUNCS`；登记项须与真实实现和替身**双向**存在）、`test_no_direct_name_import_of_stateful_taskstore_functions`（直接名字导入会让猴子补丁失效）；新增 `tests/test_entrypoints.py`（11 条入口冒烟）与 `tests/entry_coverage_plugin.py` + `make entries`（判据是 **code object 真的被执行过**，不是名字出现过）；`Makefile` 增 `entries` 目标 |
 
 | **2026-09-13** | **P3：文档守卫推广 + `OPTIMIZATION.md` 订正** | `docs/OPTIMIZATION.md` 是孤儿文档，且**让读者去找一个本仓不存在的文件**（`submit_v2.py`，无实现也无引用）；死引用守卫此前只覆盖 SPEC，同类问题在其他文档无人管 | 第 3 条守卫由「SPEC 正文路径」**推广为「全部 `docs/*.md` + README 的路径与 `.py` 引用」**（含裸文件名形态——`submit_v2.py` 正是这种没有目录前缀的形态，只查带前缀路径会整类漏掉），带 `_HISTORICAL_DOCS` / `_EXTERNAL_PY_REFS` 两张**写明理由**的豁免表；`OPTIMIZATION.md` 按逐项复核结果订正（6 项中 5 项仍成立、第 6 项标注**未落地**），加「历史快照、非事实源」抬头；`scripts/mutate_spec_contract.py` 加固：pytest 退出码 4/5（节点失效）判为**变异无效**而非「如期变红」——旧版会把节点改名读成一次假绿 |
+
+| **2026-09-13** | **logfire 默认脱敏关停（`scrubbing=False`）** | §4 早已写明「内容不脱敏（签名 URL 原样上报）」，但从未关闭 SDK 自带的脱敏默认值：它按**值子串**匹配 `credential`，而制品地址是预签名 URL（必含 `X-Amz-Credential=`），于是 `attributes.result_url` 与 `logfire.logging_args.*.url` 在看板上全部只剩 `[Scrubbed due to 'Credential']`。**契约与实现相反，且没有任何功能性症状**（日志照打、trace 照出、套件全绿），只影响看板可读性 | `app/observability.py` 增 `scrubbing=False`；`tests/test_observability.py` 增 2 条（默认模式会误伤的机制证明 + 真实管道下值原样导出）并把接线断言并入既有装配用例 |
 
 | **2026-09-13** | **`taskstore.py` 拆成包（纯结构变更）** | 单文件 1163 行，远超可读区间；文件内原有的「写 / 读」两处分节注释已经暗示了真实的关注点边界 | `app/services/taskstore.py` → `app/services/taskstore/`：`__init__.py`（**全量再导出**原命名空间，契约不变）+ `_base` / `_projection` / `_write` / `_batch` / `_read` / `_sweeper` / `_admin_query`，**最大单文件 255 行**。每个函数体经 AST 比对**逐字未变**、54 个顶层名字零丢失。配套：`conftest` 的测试替身改为 patch「包 + `pkgutil` 自动枚举的子模块」（包内跨模块调用的绑定在子模块命名空间里，只 patch 包够不着 → 会静默打真库）；注册表守卫补「再导出完整性」与「再导出但包外无调用方」两条；孤儿守卫的限定前缀改为「消费者实际会写的包名」；同步 README 文件树、`models.py` docstring、PRD / ARCH 的路径引用 |
 

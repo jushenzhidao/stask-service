@@ -165,7 +165,9 @@ def test_setup_wires_the_caps_and_keeps_optional_pipelines_off(monkeypatch):
       一旦有人用 ``@logfire.instrument`` 装饰带 token 的函数，参数快照
       就会连着 raw_token 一起上报；
     - ``advanced.log_record_processors`` 必须含 body 闸门，且上限取自配置
-      （漏了就是「大文件照样上报」，而日志一切正常）。
+      （漏了就是「大文件照样上报」，而日志一切正常）；
+    - ``scrubbing=False``：**必须显式关**，否则 SDK 默认值会把签名 URL 整条
+      抹掉（见本文件末尾两条用例），而 SPEC §4 写明「内容不脱敏」。
     """
     import logfire
     import taskiq.instrumentation as taskiq_inst
@@ -191,6 +193,7 @@ def test_setup_wires_the_caps_and_keeps_optional_pipelines_off(monkeypatch):
 
     assert captured["metrics"] is False
     assert captured["inspect_arguments"] is False
+    assert captured["scrubbing"] is False
     assert captured["console"] is False
     assert captured["service_name"] == "stask-test"
 
@@ -242,3 +245,71 @@ def test_shutdown_paths_call_flush():
     assert "flush_observability()" in lifespan_src
     assert "async def shutdown" in queue_src
     assert "flush_observability()" in queue_src
+
+
+# ---------------------------------------------------------------------------
+# 五、脱敏口径：SDK 默认脱敏必须关（SPEC §4「内容不脱敏」）
+# ---------------------------------------------------------------------------
+
+
+#: 制品地址的真实形态：S3/MinIO 预签名 URL，必含 ``X-Amz-Credential=``。
+_SIGNED_URL = (
+    "https://oss.example.com/bucket/out.mp4?X-Amz-Algorithm=AWS4-HMAC-SHA256"
+    "&X-Amz-Credential=AKIAEXAMPLE%2F20260913%2Fus-east-1%2Fs3%2Faws4_request"
+    "&X-Amz-Signature=deadbeef"
+)
+
+
+def test_sdk_default_scrubbing_would_redact_our_signed_urls():
+    """解释「为什么必须显式传 ``scrubbing=False``」——不是洁癖，是误伤。
+
+    取自 SDK 实装（logfire 5.0.0，``_internal/scrubbing.py``）：脱敏模式含
+    ``credential``，且按**值子串**匹配（不只看键名），命中即把**整个值**换成
+    ``[Scrubbed due to 'Credential']``。于是 ``attributes.result_url`` 与
+    ``logfire.logging_args.*.url`` 在看板上全部只剩一行占位符——与 SPEC §4
+    「内容不脱敏（签名 URL 原样上报）」直接矛盾。
+
+    这里直接构造 ``Scrubber``（``logfire.configure`` 在 ``scrubbing`` 缺省时
+    构造的就是它）而不拉起全局管道：只证明「默认值会误伤」。私有路径导入是
+    **有意**的——它锚定被钉死的 5.0.0；SDK 若改结构这条会红，而允许它静默
+    漂移的代价就是看板再次只剩占位符、且没有任何功能性用例会因此变红。
+    """
+    from logfire._internal.scrubbing import Scrubber
+
+    value, notes = Scrubber(None).scrub_value(("attributes", "result_url"), _SIGNED_URL)
+
+    assert value == "[Scrubbed due to 'Credential']"
+    assert [n["matched_substring"] for n in notes] == ["Credential"], "命中记录不能为空"
+
+
+def test_signed_url_survives_the_real_pipeline_when_scrubbing_is_off():
+    """端到端：``scrubbing=False`` 下签名 URL 原样进导出器。
+
+    走真实 ``logfire.configure`` + 内存导出器，断言落在**导出的属性值**上：
+    这条接线被删掉后功能完全正常（日志照打、trace 照出、其余用例全绿），
+    只有人在看板上才会发现 URL 变成了占位符。
+    """
+    import logfire
+    from logfire.testing import TestExporter
+    from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+
+    exporter = TestExporter()
+    logfire.configure(
+        service_name="stask-scrub-probe",
+        send_to_logfire=False,
+        console=False,
+        metrics=False,
+        inspect_arguments=False,
+        scrubbing=False,
+        additional_span_processors=[SimpleSpanProcessor(exporter)],
+    )
+    with logfire.span("task success", result_url=_SIGNED_URL):
+        pass
+    logfire.force_flush()
+
+    exported = [dict(span.attributes or {}) for span in exporter.exported_spans]
+    urls = [attrs["result_url"] for attrs in exported if "result_url" in attrs]
+
+    assert urls, "探针 span 没进导出器，用例本身失效"
+    assert all(u == _SIGNED_URL for u in urls), f"签名 URL 被改写：{urls}"
+    assert all("logfire.scrubbed" not in attrs for attrs in exported), "仍带脱敏记录"
