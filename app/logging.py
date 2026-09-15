@@ -128,6 +128,20 @@ def setup_logging() -> None:
         # 这里**不**做体量截断：body 的长度闸门在导出管道里
         # （``observability._BodyCapProcessor``）——包 sink 只能裁
         # ``LogRecord.msg``，而 logfire 取的是 loguru 栈帧里的消息模板，裁不到。
+        #
+        # **不要加 ``enqueue=True``**（2026-09-16 实测，loguru 0.7 / logfire 5.0.0）：
+        # ① 更慢：调用线程净增 114us/call，比同步的 79us 还多 34us —— loguru 的
+        #    enqueue 走 ``multiprocessing.SimpleQueue``，**每条消息在调用线程
+        #    pickle 一次**（``loguru/_handler.py`` 的 ``self._enqueue`` 分支）；
+        # ② 更要命：sink 挪到别的线程后，logfire 的 loguru 桥接回溯不到调用方栈帧
+        #    （``LoguruInspectionFailed``），**``logfire.logging_args`` 直接丢失**
+        #    —— 位置参数里的字段在看板上会静默消失。
+        # 调用线程的成本是真实存在的（同步桥接净增 ~79us/call，真实 success 行长
+        # ~99us，再多一个 dict 字段 +23us），但上限由**日志条数**决定而不是由上游
+        # 快慢或网络决定：导出是批处理 + 后台线程，且队列满时 OTel
+        # ``BatchProcessor.emit`` 明确是**丢弃**（``Queue full, dropping``）而非阻塞
+        # —— 上报永远不会反压业务路径。本项目 happy path 只在请求/任务边界打日志
+        # （无循环内逐条日志），故成本是 O(请求数)。
         logger.add(**logfire.loguru_handler(), level=level)
     logging.basicConfig(handlers=[InterceptHandler()], level=0, force=True)
 

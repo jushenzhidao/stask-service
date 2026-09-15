@@ -86,6 +86,36 @@ def test_setup_logging_wires_the_same_level_into_every_sink(monkeypatch):
         setup_logging()          # logger.remove() 是全局状态，跑完复原
 
 
+def test_no_sink_is_enqueued(monkeypatch):
+    """所有 loguru sink 一律**同步**挂载——``enqueue=True`` 对本项目是负优化。
+
+    反直觉但实测（2026-09-16，loguru 0.7 / logfire 5.0.0）：
+
+    - **更慢**：调用线程净增 114us/call，比同步的 79us 还多 34us。loguru 的
+      enqueue 走 ``multiprocessing.SimpleQueue``（``loguru/_handler.py`` 的
+      ``self._enqueue`` 分支），**每条消息在调用线程要 pickle 一次**；
+    - **且丢内容**：sink 换线程后 logfire 的 loguru 桥接回溯不到调用方栈帧
+      （``LoguruInspectionFailed``），``logfire.logging_args`` 静默丢失 ——
+      位置参数里的字段在看板上直接没了。
+    - 换不来任何东西：导出本就在后台批处理线程上（``BatchSpanProcessor``），
+      且队列满时 OTel ``BatchProcessor.emit`` 是**丢弃**而非阻塞。
+
+    谁要推翻这条，先推翻上面两条实测。同时断言 sink 数量，避免「SDK sink
+    根本没挂上」让用例空过。
+    """
+    from app import observability
+
+    monkeypatch.setattr(observability, "_configured", True)
+    try:
+        setup_logging()
+        handlers = list(logger._core.handlers.values())
+        assert len(handlers) == 2, f"期望 stderr + SDK 两个 sink，实得 {len(handlers)}"
+        assert all(h._enqueue is False for h in handlers), "有 sink 被改成 enqueue=True"
+    finally:
+        observability._configured = False
+        setup_logging()
+
+
 # ---------------------------------------------------------------------------
 # 请求/响应摘要（截断但不脱敏）
 # ---------------------------------------------------------------------------
