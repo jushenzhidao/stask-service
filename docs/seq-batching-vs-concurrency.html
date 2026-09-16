@@ -1,0 +1,95 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>攒批 vs 并发 · 分发时序图</title>
+<script src="https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.min.js"></script>
+<style>
+  :root { color-scheme: light; }
+  body {
+    font-family: -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+    margin: 0; padding: 32px; background: #f7f8fa; color: #1f2329;
+  }
+  .wrap { max-width: 960px; margin: 0 auto; background: #fff;
+          border: 1px solid #e5e6eb; border-radius: 12px; padding: 28px 32px;
+          box-shadow: 0 1px 3px rgba(0,0,0,.06); }
+  h1 { font-size: 20px; margin: 0 0 4px; }
+  .sub { color: #86909c; font-size: 13px; margin-bottom: 20px; }
+  .note { background: #fff7e8; border: 1px solid #ffd591; border-radius: 8px;
+          padding: 12px 16px; font-size: 13px; line-height: 1.7; margin-top: 20px; }
+  .note b { color: #d4380d; }
+  .legend { display: flex; flex-wrap: wrap; gap: 8px 18px; margin: 16px 0 4px; font-size: 13px; }
+  .legend span { display: inline-flex; align-items: center; gap: 6px; }
+  .dot { width: 10px; height: 10px; border-radius: 50%; display: inline-block; }
+  code { background: #f2f3f5; padding: 1px 5px; border-radius: 4px; font-size: 12px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>攒批（batch=100） vs 并发上限（limit_global=10）· 分发时序图</h1>
+  <div class="sub">两类机制正交：<b>batch 决定「何时尝试放行这一批」</b>，<b>槽上限决定「同时真正打到上游的最多几条」</b>。100 条先被批次原子摘出，逐条抢槽，≤10 条入队，其余退避/重入批，槽空出再 drip。</div>
+
+  <div class="legend">
+    <span><i class="dot" style="background:#165dff"></i>批次 / 放行（batching + dispatch）</span>
+    <span><i class="dot" style="background:#00b42a"></i>三层槽（slots）</span>
+    <span><i class="dot" style="background:#ff7d00"></i>执行 / 上游（worker + upstream）</span>
+    <span><i class="dot" style="background:#86909c"></i>重排通道（Redis st:due）</span>
+  </div>
+
+  <div class="mermaid">
+sequenceDiagram
+    autonumber
+    participant C as 客户端 / 提交
+    participant B as batching（批次）
+    participant T as ticker（tick）
+    participant D as dispatch.release
+    participant S as slots（三层槽）
+    participant W as worker（执行）
+    participant U as 上游
+    participant R as Redis（st:due）
+
+    Note over C,B: 提交 batch=100，limit_global=10
+    C->>B: join_batch → batch_state=waiting
+    B->>B: st:batch:{key} 成员 + st:batch:due 到期
+    Note over T: 每 ~15s × 4 轮（覆盖约 60s）
+    T->>B: due_keys() 命中 → release_model(key)
+    B->>B: LUA_BATCH_CLAIM 原子摘出整批 100 个成员
+    loop 每条 one(task_id)，Semaphore(8) 限「释放动作」并发
+        T->>D: release(task_id)
+        D->>D: claim_for_release（DB 抢占，幂等）
+        D->>S: acquire_layered(limit_global=10)
+        alt 抢到槽（mask≠0）
+            S-->>D: OK
+            D->>D: 落 slot_flags + publish_execute
+            D->>W: 入队
+            W->>U: 调用上游（在途 ≤ 10）
+            U-->>W: 响应
+            W->>S: release_layered（归还槽）
+        else 没抢到（NO_SLOT）
+            S-->>D: 0
+            D->>D: unclaim_for_release（还原 waiting）
+            D->>R: requeue 指数退避 2/4/8/16/32…±10% 抖动
+        end
+    end
+    Note over T,R: 下一轮 ticker 捞 st:due；槽已释放则再放 ≤10 条
+    Note over C,U: 100 条最终按「并发上限 10」逐批 drip 打完\n吞吐 = 10 ÷ 单任务时长，与 batch 大小无关
+  </div>
+
+  <div class="note">
+    <b>关键澄清：</b>
+    <ul style="margin:8px 0 0; padding-left:20px;">
+      <li><code>batch_release_concurrency=8</code> 限制的是「释放尝试」的并发度（防打爆 DB/连接池），<b>不是</b>打到上游的在途数。</li>
+      <li>真正打到上游的在途数 = 三层槽占用数，由 <code>st:gslot:{model}</code>（limit_global）和/或 <code>st:slot:{th}</code>（max_slots）决定。</li>
+      <li>抢不到槽的任务进 <code>st:due</code>；ticker 下一轮 <code>admit_due</code> 在 <code>batch_enabled</code> 且 <code>batch≥2</code> 时会把它<b>重新入批</b>（回到 waiting 等下个 N/T），而非按退避秒数精确重试。即饥饿任务最坏要等一个 <code>batch_wait</code> 周期才被重新尝试。</li>
+      <li>外层天花板：要让 <code>limit_global=10</code> 真正生效，<code>MAX_SLOTS</code>（token 层，默认 10）必须 &gt; 10，否则 token 层先到顶、模型全局层形同虚设。</li>
+    </ul>
+  </div>
+</div>
+
+<script>
+  mermaid.initialize({ startOnLoad: true, theme: "default",
+    themeVariables: { fontFamily: "-apple-system, PingFang SC, Microsoft YaHei, sans-serif" } });
+</script>
+</body>
+</html>

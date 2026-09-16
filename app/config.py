@@ -200,8 +200,8 @@ class Settings(BaseSettings):
     batch_enabled: bool = True
     #: 整批放行时的有界并发（与 sweeper 同量级，避免放行瞬间打满连接池）
     batch_release_concurrency: int = 8
-    #: 放行时占不到槽的退避上限（秒）。指数退避：30/60/120/240/…封顶本值，
-    #: 带 ±10% 抖动防整批同相重试形成惊群。
+    #: 放行时占不到槽的退避上限（秒）。指数退避：2/4/8/16/32/64/…（2**attempts，
+    #: 封顶本值），带 ±10% 抖动防整批同相重试形成惊群。
     batch_backoff_max_seconds: int = 300
     #: ``X-Batch-Wait`` 的上限（秒），同时是「客户端只给 N 不给 T」时的兜底等待
     #: （R-17/AC-57：客户端的 N 声明不能变成无限等待）。
