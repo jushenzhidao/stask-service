@@ -3,22 +3,158 @@ name: build
 on:
   push:
     branches: [main]
-    tags: ["v*"]
+    # 只监听「版本 tag」形态：万一有人手打 latest 这类滚动指针，
+    # 不会把它当成一次正式发布（本仓库目前没有 git 侧的 latest，
+    # 镜像侧的 latest 由下面的 metadata-action 生成）。
+    tags: ["v[0-9]*.[0-9]*.[0-9]*"]
   pull_request:
     branches: [main]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "要补发的 tag（必须已存在；镜像会按它重新构建）"
+        required: true
+
+# 两次 push 并发会竞争同一个版本号与 tag。这里排队而不是取消：取消会把
+# 「镜像已推进 registry、git tag 还没打」的半成品留在中间态。
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
 
 jobs:
+  # ---- 版本解析：三个入口在这里归一 --------------------------------------
+  # push main（自增 patch）/ 人工 tag（不递增）/ 派发补发。后续所有 job 只消费
+  # 这里的输出，于是「镜像 tag、git tag、Release 标题」三者同源，不会各算各的。
+  resolve:
+    runs-on: ubuntu-latest
+    outputs:
+      mode: ${{ steps.ver.outputs.mode }}
+      version: ${{ steps.ver.outputs.version }}
+      tag: ${{ steps.ver.outputs.tag }}
+      commit: ${{ steps.ver.outputs.commit }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # 三个入口各取各的 ref。push main 必须用 github.sha —— github.ref 是
+          # **会移动的分支指针**，而这次发布后面还要等 bump/test/双架构构建
+          # （数分钟），期间任何一次 push 都会让检出落到更新的提交上，tag 就
+          # 打在了「不是本次触发发布」的那一个上（这个坑实测踩过）。
+          ref: ${{ inputs.tag || (startsWith(github.ref, 'refs/tags/') && github.ref || github.sha) }}
+          # 浅克隆拿不到历史 tag，版本号会永远从 v0.0.1 起算
+          fetch-depth: 0
+      - name: Resolve version
+        id: ver
+        env:
+          EVENT: ${{ github.event_name }}
+          REF: ${{ github.ref }}
+          INPUT_TAG: ${{ inputs.tag }}
+          HEAD_MSG: ${{ github.event.head_commit.message || '' }}
+          SKIP_MARKER: "[skip release]"
+        run: |
+          set -euo pipefail
+          MODE=skip
+          TAG=""
+          if [ "$EVENT" = "pull_request" ]; then
+            MODE=pr
+          elif [ -n "$INPUT_TAG" ]; then
+            MODE=tag; TAG="$INPUT_TAG"
+          elif [ "${REF#refs/tags/}" != "$REF" ]; then
+            MODE=tag; TAG="${REF#refs/tags/}"
+          elif printf '%s' "$HEAD_MSG" | grep -qF "$SKIP_MARKER"; then
+            MODE=skip
+          else
+            MODE=auto
+          fi
+
+          VERSION=""
+          if [ "$MODE" = "auto" ]; then
+            # 用 --sort=-v:refname 而不是 git describe：后者取「最近可达的 tag」，
+            # 有合并历史时会挑错版本；而字典序会把 v1.9.0 判成新于 v1.10.0。
+            PREV="$(git tag -l 'v[0-9]*.[0-9]*.[0-9]*' --sort=-v:refname | head -n1)"
+            # 冷启动：仓库一个版本 tag 都没有时从 0.0.0 起算
+            PREV="${PREV:-v0.0.0}"
+            CORE="${PREV#v}"
+            MAJOR="${CORE%%.*}"
+            REST="${CORE#*.}"
+            MINOR="${REST%%.*}"
+            PATCH="${REST#*.}"
+            # 剥掉预发布/构建后缀，否则 $(( )) 直接报错
+            PATCH="${PATCH%%[-+]*}"
+            VERSION="${MAJOR}.${MINOR}.$((PATCH + 1))"
+            TAG="v${VERSION}"
+          elif [ "$MODE" = "tag" ]; then
+            VERSION="${TAG#v}"
+          fi
+
+          {
+            echo "mode=$MODE"
+            echo "version=$VERSION"
+            echo "tag=$TAG"
+            echo "commit=$(git rev-parse HEAD)"
+          } >> "$GITHUB_OUTPUT"
+          echo "resolve: mode=$MODE version=$VERSION tag=$TAG"
+
+  # ---- 把版本写进代码：**必须在构建之前** --------------------------------
+  # 本仓库的版本号唯一事实源是 app/__init__.py 的 __version__（.env.example 的
+  # APP_VERSION 由 tests/test_spec_contract.py 守着与它一致）。所以「自增版本」
+  # 不可能只打一个 tag —— tag 与代码一漂移，/healthz 与 OpenAPI 的 version 就报
+  # 旧值。这一步改写两处文件并提交回主干，镜像里跑的才是新版本号。
+  #
+  # 提交信息带 skip 标记：GITHUB_TOKEN 推的提交本来就不会触发 workflow，但将来
+  # 若换成 PAT，这条兜底能防止自激。
+  bump:
+    needs: resolve
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write          # 提交并推回主干
+    outputs:
+      commit: ${{ steps.bump.outputs.commit }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.resolve.outputs.commit }}
+          fetch-depth: 0
+      - name: Bump version files
+        id: bump
+        env:
+          MODE: ${{ needs.resolve.outputs.mode }}
+          VERSION: ${{ needs.resolve.outputs.version }}
+        run: |
+          set -euo pipefail
+          if [ "$MODE" != "auto" ]; then
+            echo "mode=${MODE}：人工 tag / PR / 跳过 都不自增版本"
+            echo "commit=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          python3 scripts/bump_version.py "$VERSION"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add app/__init__.py .env.example
+          git commit -m "chore(release): v${VERSION} [skip release]"
+          # 主干可能在本次 run 期间前进过（并发 push）：先 rebase 再推。
+          # 冲突即失败退出——宁可不发这一版，也不要推一个错的版本上去。
+          git fetch origin main
+          git rebase origin/main
+          git push origin HEAD:main
+          echo "commit=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
   test:
+    needs: bump
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.bump.outputs.commit }}
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
       - name: Install
         run: pip install -e ".[dev]"
       - name: Lint
-        run: python -m ruff check app tests
+        run: python -m ruff check app tests scripts gunicorn.conf.py
       - name: Type check
         run: python -m mypy app/
       - name: Test
@@ -31,8 +167,10 @@ jobs:
   # ——每次 push 都付这个代价不可接受。本仓库是 public，ARM runner 免费。
   # 要加平台改这个矩阵；新增平台记得选对应的原生 runner。
   build-and-push:
-    needs: test
-    if: github.event_name == 'push'
+    needs: [resolve, bump, test]
+    # PR 不推镜像；带 skip 标记的提交（纯文档/CI）也不必重建 —— 代码没变，
+    # 重建只会产生一个内容相同的新 digest 并覆盖 latest。
+    if: github.event_name != 'pull_request' && needs.resolve.outputs.mode != 'skip'
     strategy:
       fail-fast: false
       matrix:
@@ -47,6 +185,8 @@ jobs:
       packages: write
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.bump.outputs.commit }}
       - uses: docker/setup-buildx-action@v3
       - uses: docker/login-action@v3
         with:
@@ -62,6 +202,7 @@ jobs:
             type=semver,pattern={{version}}
             type=sha,format=short
             type=raw,value=latest,enable={{is_default_branch}}
+            type=raw,value=${{ needs.resolve.outputs.version }}
       - id: build
         uses: docker/build-push-action@v6
         with:
@@ -73,7 +214,7 @@ jobs:
           outputs: type=image,name=ghcr.io/${{ github.repository }},push-by-digest=true,name-canonical=true,push=true
           # 每个平台独立缓存 scope，避免互相污染
           cache-from: type=gha,scope=${{ matrix.platform }}
-          cache-to: type=gha,mode=max,scope=${{ matrix.platform }}
+          cache-to: type=gha,scope=${{ matrix.platform }}
       - name: Export digest
         run: |
           mkdir -p /tmp/digests
@@ -88,8 +229,8 @@ jobs:
 
   # 把两个平台的 digest 合成一个 manifest list，再把 tag 指过去。
   merge:
-    needs: build-and-push
-    if: github.event_name == 'push'
+    needs: [resolve, bump, build-and-push]
+    if: github.event_name != 'pull_request' && needs.resolve.outputs.mode != 'skip'
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -115,6 +256,7 @@ jobs:
             type=semver,pattern={{version}}
             type=sha,format=short
             type=raw,value=latest,enable={{is_default_branch}}
+            type=raw,value=${{ needs.resolve.outputs.version }}
       - name: Create manifest list and push
         working-directory: /tmp/digests
         run: |
@@ -124,4 +266,69 @@ jobs:
       - name: Inspect result
         run: |
           docker buildx imagetools inspect \
-            ghcr.io/${{ github.repository }}:${{ steps.meta.outputs.version }}
+            ghcr.io/${{ github.repository }}:${{ needs.resolve.outputs.version }}
+
+  # ---- 打 tag + 建 Release：**在镜像推完之后** ---------------------------
+  # 「先镜像、后 tag」的顺序是有意的：构建失败时不会留下「有 tag、没镜像」的
+  # 半成品。auto 模式才打 tag（人工 tag 已经存在，补发也是给已有 tag 补镜像）。
+  #
+  # 为什么不拆成独立的 release.yml：GITHUB_TOKEN 推送的事件**不会触发**其他
+  # workflow，拆开会出现「tag 有了、版本镜像没建」的静默半成品 —— 镜像构建
+  # 必须与版本解析在同一个 run 里。
+  release:
+    needs: [resolve, bump, merge]
+    if: ${{ needs.resolve.outputs.mode == 'auto' || needs.resolve.outputs.mode == 'tag' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.bump.outputs.commit }}
+          fetch-depth: 0
+      - name: Create and push tag
+        if: needs.resolve.outputs.mode == 'auto'
+        env:
+          TAG: ${{ needs.resolve.outputs.tag }}
+        run: |
+          set -euo pipefail
+          if git rev-parse -q --verify "refs/tags/${TAG}" >/dev/null; then
+            echo "tag ${TAG} 已存在（并发或人工已打）——不覆盖，直接失败"
+            exit 1
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -a "${TAG}" -m "stask-service ${TAG}"
+          git push origin "${TAG}"
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.resolve.outputs.tag }}
+          VERSION: ${{ needs.resolve.outputs.version }}
+        run: |
+          set -euo pipefail
+          # 幂等：同一个 tag 重跑（失败重试、改完 workflow 补跑）不该变红
+          if gh release view "${TAG}" >/dev/null 2>&1; then
+            echo "release ${TAG} 已存在——跳过创建"
+            exit 0
+          fi
+          if PREV="$(git describe --tags --abbrev=0 --match 'v[0-9]*.[0-9]*.[0-9]*' "${TAG}^" 2>/dev/null)"; then
+            RANGE="${PREV}..${TAG}"
+          else
+            RANGE="${TAG}"          # 首个 release：没有上一个 tag 可比
+          fi
+          {
+            echo "## 变更"
+            echo
+            git log "$RANGE" --no-merges --max-count=50 --pretty='- %s (%h)' \
+              | grep -v '^- chore(release):' || true
+            echo
+            echo "## 镜像"
+            echo
+            echo '```'
+            echo "docker pull ghcr.io/${GITHUB_REPOSITORY}:${VERSION}"
+            echo '```'
+            echo
+            echo "linux/amd64 + linux/arm64 多架构 manifest。"
+          } > /tmp/notes.md
+          gh release create "${TAG}" --title "${TAG}" --notes-file /tmp/notes.md
