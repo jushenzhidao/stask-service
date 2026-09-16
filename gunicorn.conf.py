@@ -46,7 +46,15 @@ _DB_WEB_SHARE = float(os.environ.get("DB_WEB_CONNECTION_SHARE", "0.5"))
 _BY_BUDGET = max(1, int(_DB_BUDGET * _DB_WEB_SHARE) // _DB_PER_WORKER)
 _BY_CPU = min(16, multiprocessing.cpu_count() * 2 + 1)
 # 最少 2 个：单 worker 在 max_requests 回收或崩溃重启的窗口里就是单点
-workers = _env_int("GUNICORN_WORKERS", 0) or max(2, min(_BY_CPU, _BY_BUDGET))
+_BY_AUTO = max(2, min(_BY_CPU, _BY_BUDGET))
+workers = _env_int("GUNICORN_WORKERS", 0) or _BY_AUTO
+
+#: 手设 ``GUNICORN_WORKERS`` 时的告警系数：web 侧连接峰值乘上它仍超过总预算，
+#: 就说明留给 worker 进程 / new-api / 管理连接的余量已被吃光。
+#: 取 1.5 = 允许 web 吃掉 2/3 预算，比 ``DB_WEB_CONNECTION_SHARE`` 的 1/2
+#: 宽松一档——既容得下「想给 web 多分一点」的合理偏好，也拦得住
+#: 「手设 8 而预算只有 151」这类会把共享 MySQL 打爆的写法。
+_DB_ALERT_FACTOR = 1.5
 
 # ---- 约束 2 / 3：超时由长轮询窗口推导 ----
 _POLL_WAIT = _env_int("POLL_WAIT_MAX_SECONDS", 60)
@@ -85,6 +93,37 @@ errorlog = "-"
 loglevel = os.environ.get("LOG_LEVEL", "info").lower()
 
 
+def _warn_if_db_overcommitted(server) -> None:
+    """手设 ``GUNICORN_WORKERS`` 会绕过上面的预算推导，这里在启动时补核一遍。
+
+    ``workers`` 优先取 env，所以「改 GUNICORN_WORKERS 要重算连接数」这条纪律
+    此前只写在 ``.env`` 注释里，没有任何东西在拦：实际出现过 ``8``（推导值应为
+    3）→ web 侧峰值 8 × 20 = 160 个连接，加 worker 进程共 180 > 151，而同一段
+    注释还按 workers=3 算着「合计 80 < 151 × 0.8」，**注释与配置互相矛盾却都
+    看着合理**。这种超支不会立刻报错，要等压力上来打爆共享 MySQL 才暴露，
+    届时 new-api 自己也连不上（级联故障）。
+
+    判据 ``web 侧连接 × _DB_ALERT_FACTOR > DB_MAX_CONNECTIONS``。**自动推导
+    出来的值也照查**——「最少 2 个 worker」是硬下限，预算配得极小时它会顶破
+    预算，那同样是配置错误，不该因为没手设就放过。只 warning 不阻断，是因为
+    预算数字是运维填的：宁可让人在启动日志里看到一条明确告警，也不把服务的
+    启动权收走（与 ``app/main.py`` 的分级校验同一取舍，那边只有安全项才升级）。
+    """
+    web_conns = workers * _DB_PER_WORKER
+    if web_conns * _DB_ALERT_FACTOR <= _DB_BUDGET:
+        return
+    suggest = max(1, int(_DB_BUDGET / (_DB_ALERT_FACTOR * workers)))
+    server.log.warning(
+        "DB 连接预算超支：GUNICORN_WORKERS=%s × 每 worker 连接上限 %s = web 侧 %s，"
+        "×%.1f 安全系数 = %.0f > DB_MAX_CONNECTIONS=%s——worker 进程（另需 %s 个连接）"
+        "与 new-api、管理连接已无余量，压力下会打爆共享 MySQL 并级联拖垮上游。"
+        "两条出路：删掉 GUNICORN_WORKERS 交给自动推导（=%s），"
+        "或把 DB_POOL_SIZE+DB_MAX_OVERFLOW 降到 %s 以内。",
+        workers, _DB_PER_WORKER, web_conns, _DB_ALERT_FACTOR,
+        web_conns * _DB_ALERT_FACTOR, _DB_BUDGET, _DB_PER_WORKER, _BY_AUTO, suggest,
+    )
+
+
 def on_starting(server):
     server.log.info(
         "stask-service master starting: workers=%s (cpu上限=%s db预算上限=%s "
@@ -96,6 +135,7 @@ def on_starting(server):
             "graceful_timeout(%s) 逼近 timeout(%s)：慢请求可能还没走完就被强杀",
             graceful_timeout, timeout,
         )
+    _warn_if_db_overcommitted(server)
 
 
 def worker_exit(server, worker):
