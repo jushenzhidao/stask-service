@@ -268,3 +268,48 @@ def test_no_orphan_public_classes():
         "确实要保留（如为未实现需求预留）请加进 _ORPHAN_CLASS_ALLOWLIST "
         "并写明理由：\n  " + "\n  ".join(offenders)
     )
+
+
+#: python-dotenv 的解析坑：**空值 + 行内注释**这一种形态，注释会被整段当成值
+#: （实测：``KEY=  # 说明`` → ``'# 说明'``；而 ``KEY=value  # 说明`` 正常剥离成
+#: ``'value'``）。只认「``=`` 后是空白 + ``#``」，纯空 ``KEY=`` 与空白结尾都不算。
+_EMPTY_VALUE_WITH_COMMENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=[ \t]+#")
+
+
+def test_env_files_have_no_empty_value_with_inline_comment():
+    """``.env.example`` 与 ``.env``（若存在）不得出现「空值 + 行内注释」。
+
+    2026-09-16 实测踩中：``CALLBACK_SECRET=               # HMAC-SHA256 密钥…``
+    解析出来的值是 ``'# HMAC-SHA256 密钥…'``，**不是空串**。后果不是显示问题，
+    而是一道安全防线被静默绕过：``main._check_callback_secret`` 以「非空」为通过
+    条件，于是 ``APP_ENV=prod`` 下本该**阻断启动**的校验放行；更糟的是
+    ``notify.sign`` 会拿这串**公开的注释文本**当 HMAC 密钥去签名 —— 回调带着
+    ``X-Stask-Signature`` 头、验签方看起来一切正常，而任何读过源码的人都能
+    伪造「任务已完成」的回调。
+
+    为什么值得一条机械门禁：这个写法**看起来完全正常**（注释还对齐得整整齐齐），
+    评审时不会有人怀疑；而它只在键为空时才发作，于是越是「想把说明写清楚」的
+    人越容易踩中。同类键（``*_SECRET`` / ``*_ALLOWLIST`` / 各种开关）几乎都是
+    「空 = 关闭」语义，失效方向永远是**静默打开**。
+
+    判据刻意收窄到「``=`` 后是空白 + ``#``」：``KEY=``（纯空）、``KEY=  ``（空白
+    结尾）、``KEY=value  # 说明``（有值）都安全，不误报。
+    """
+    targets = [ROOT / ".env.example"]
+    local = ROOT / ".env"
+    if local.is_file():
+        # .env 是 gitignored 的本地文件，CI 里不存在；本地跑时顺带体检
+        targets.append(local)
+
+    offenders = []
+    for path in targets:
+        for lineno, line in enumerate(
+            path.read_text(encoding="utf-8").splitlines(), start=1
+        ):
+            if _EMPTY_VALUE_WITH_COMMENT.match(line):
+                offenders.append(f"{path.name}:{lineno}  {line.split('#')[0].strip()}")
+    assert not offenders, (
+        "以下行的「空值 + 行内注释」会被 python-dotenv 解析成注释文本（而非空串），"
+        "让「空 = 关闭」的开关静默失效。把注释移到上一行即可：\n  "
+        + "\n  ".join(offenders)
+    )

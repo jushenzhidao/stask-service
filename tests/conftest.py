@@ -13,12 +13,25 @@
 from __future__ import annotations
 
 import json
+import os
 import time
 from collections.abc import Iterator
 from typing import Any
 
 import pytest
 import respx
+
+#: **必须在任何 `import app.main` 之前生效**：`app.main` 在模块级就跑启动校验
+#: （``create_app()`` 里那几条 fail-closed 检查），而 ``tests/test_misc.py`` 是在
+#: 模块级 import 它的 —— 那一刻 fixture 还没机会执行，``settings`` 单例读的是
+#: **开发者本机的 ``.env``**。
+#:
+#: 2026-09-16 实测踩中：本机 ``.env`` 改成 ``APP_ENV=prod`` 之后，``CALLBACK_SECRET``
+#: 真的为空了（同一天修掉了「空值 + 行内注释被 python-dotenv 解析成注释文本」的 bug，
+#: 此前那个假值一直让它非空），于是 collection 阶段直接 RuntimeError、整个套件跑不起来。
+#: 钉成 ``test``（宽松环境）让测试与开发者本机配置解耦；要覆盖严格环境的分支，用
+#: monkeypatch 改 ``settings.app_env``（见 ``test_settings`` fixture）。
+os.environ["APP_ENV"] = "test"
 
 # ---------------------------------------------------------------------------
 # FakeRedis
