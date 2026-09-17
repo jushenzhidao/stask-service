@@ -61,9 +61,9 @@ make up          # 起全套（web + worker + redis）
 
 | Method | Path | 说明 |
 |---|---|---|
-| POST/PUT | `/async/{path}` | 提交。202 + `{task_id,status,replayed}` + `Location` 头，**默认不去重**；带 `Idempotency-Key` 头才幂等 |
-| GET | `/async/{path}/{task_id}` | 查询。202 进行中 / 200 原文回放 / 重放上游错误码；`?wait=60` 长轮询 |
-| DELETE | `/async/{path}/{task_id}` | 取消。排队中 → CANCELED；执行中 → 409 |
+| POST/PUT | `/async/{path}` | 提交。202 + `{task_id,status,created_at,updated_at,replayed}` + `Location` 头，**默认不去重**；带 `Idempotency-Key` 头才幂等 |
+| GET | `/async/{path}/{task_id}` | 查询。202 进行中 / 200 原文回放（JSON 体顶层注入 `status`）/ 重放上游错误码；`?wait=60` 长轮询 |
+| DELETE | `/async/{path}/{task_id}` | 取消。排队中 → `canceled`；执行中 → 409 |
 | GET | `/healthz/live` `/healthz/ready` | 探针 |
 | GET | `/ops/stats` `/ops/tasks/{id}` | 观测（带 Bearer 即可，脱敏） |
 | POST | `/ops/sweep/stale` `/ops/slots/recalibrate` | 手工触发兜底任务 |
@@ -77,13 +77,22 @@ curl -X POST https://api.example.com/async/v1/images/generations \
   -H "X-Callback-Url: https://myapp.com/hook" \
   -H "X-Upstream-Base-Url: https://newapi.com" \
   -d '{"model":"dall-e-3","prompt":"a red cube","n":1}'
-# → 202 {"task_id":"dall_e_3_ab12...","status":"QUEUED","scheduled_at":0,
+# → 202 {"task_id":"dall_e_3_ab12...","status":"queued","scheduled_at":0,
 #        "batch_key":"","batch_state":"","replayed":false}
 #   Location: /async/v1/images/generations/dall_e_3_ab12...
+#   X-Stask-Task-Status: queued
 
 curl "https://api.example.com/async/v1/images/generations/dall_e_3_ab12...?wait=60"
-# → 200 + 与直接调同步接口**字节级一致**的响应体
+# → 200 + 上游原文；JSON 体顶层注入 status（非 JSON 体如音频/图片保持字节级一致）
 ```
+
+**状态形态**：对外（响应体 / 回调体 / `X-Stask-Task-Status` 头）恒为小写
+`queued` / `in_progress` / `success` / `failure` / `canceled`；库内 `tasks.status`
+恒为大写 new-api 原生枚举（上游看板按大写读）。判定口径与错误码清单见
+`docs/SPEC.md` §5「状态形态」。
+
+**不提供兼容模式**：不双写两种大小写、不做路径版本化、入参也不做大小写宽松解析。
+按大写比较 `status` 的客户端需要自行适配（比较前统一小写即可）。
 
 - `X-Upstream-Base-Url` 可选（默认读 env `UPSTREAM_BASE_URL`），host 必须
   在 allowlist 内。
@@ -242,7 +251,7 @@ curl -X POST "$BASE/async/v1/images/generations" ... \
 | `platform='stask'`（非 suno/mj） | `GetTaskAdaptorFunc` 返回 nil，原生任务轮询天然跳过 |
 | `channel_id` = **new-api 中真实存在的渠道**（`CHANNEL_ID`，占位渠道可禁用） | 轮询按渠道分组；渠道必须存在——CacheGetChannel 失败先于 adaptor nil 检查，会把整组任务批量误判 FAILURE |
 | `quota = 0` | 上游 24h 超时清理即便动到本行，退款也是 0，零资金影响 |
-| `status`/`progress` 原生枚举 | 共享表对上游看板/巡检工具可读 |
+| `status`/`progress` 原生枚举（**库内大写**） | 共享表对上游看板/巡检工具可读；对外小写形态只出现在响应与回调，不落库 |
 | 生命期 6h（`TASK_MAX_LIFETIME_SECONDS`）| 先于上游 24h 清理线自行收敛，正常情况上游永远碰不到我们的活跃行 |
 
 写读侧 WHERE 恒带 `platform`，绝不动别人的行。
@@ -300,7 +309,7 @@ app/
     ├── idem.py         显式幂等（Idempotency-Key → 确定 task_id + 创建窗口占位）
     ├── submit.py       提交链路（失败即回滚）
     ├── execute.py      worker 执行（派发锁 + 分流）
-    ├── flow.py         查询 / 字节级回放 / 长轮询 / 取消
+    ├── flow.py         查询 / 回放（JSON 注入 status）/ 状态头 / 长轮询 / 取消
     ├── sweeper.py      卡死收敛 / 超龄判死 / 槽位校准 / 结果清理
     ├── taskstore/      tasks 表原生 SQL（数据访问单点；按读/写/投影切成子模块）
     ├── dynconf.py      运行时配置白名单（Redis > env > 默认）

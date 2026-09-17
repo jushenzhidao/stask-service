@@ -304,7 +304,7 @@ async def test_cancel_leaves_the_explicit_batch_not_the_model_batch(
 
     resp = client.delete(f"{PATH}/{task_id}")
     assert resp.status_code == 200
-    assert resp.json()["status"] == "CANCELED"
+    assert resp.json()["status"] == "canceled"
 
     assert int(await patch_redis.zcard(K_BATCH.format(key="mine-01")) or 0) == 0, (
         "取消的成员必须从自己那个批次里摘掉"

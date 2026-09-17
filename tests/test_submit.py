@@ -20,9 +20,12 @@ def test_submit_returns_202_with_location(client, task_store, queue_events):
 
     payload = resp.json()
     task_id = payload["task_id"]
-    assert payload["status"] == "QUEUED"
+    assert payload["status"] == "queued"
     assert task_id.startswith("dall_e_3_")
     assert resp.headers["location"] == f"{PATH}/{task_id}"
+    # 状态旁路头：客户端不必再从 HTTP 码 + body 形态反推状态
+    assert resp.headers["x-stask-task-status"] == "queued"
+    assert resp.headers["x-stask-task-id"] == task_id
 
     row = task_store.rows[task_id]
     assert row["status"] == "QUEUED"
@@ -150,7 +153,8 @@ def test_replay_reports_real_status_and_created_at(client, task_store):
     headers = {**AUTH, "Idempotency-Key": "terminal-1"}
     first = client.post(PATH, json=BODY, headers=headers).json()
     tid = first["task_id"]
-    assert first["status"] == "QUEUED"
+    assert first["status"] == "queued"
+    assert first["replayed"] is False
 
     # 让行进入终态（等价于 worker 落终态），并把创建时刻改成明显的过去值
     row = task_store.rows[tid]
@@ -163,9 +167,12 @@ def test_replay_reports_real_status_and_created_at(client, task_store):
     body = replay.json()
 
     assert body["task_id"] == tid and body["replayed"] is True
-    assert body["status"] == "FAILURE", "回放不得把终态任务报成 QUEUED"
+    assert body["status"] == "failure", "回放不得把终态任务报成 queued"
     assert body["created_at"] == 1_600_000_000, "回放不得用回放时刻冒充创建时刻"
     assert len(task_store.rows) == 1, "回放绝不新建任务"
+    # 回放必须自曝身份：否则客户端只看 202 会以为这是一笔新任务
+    assert replay.headers["x-stask-idempotent-replay"] == "true"
+    assert replay.headers["x-stask-task-status"] == "failure"
 
 
 def test_replay_row_vanished_returns_409(client, task_store, monkeypatch):
@@ -378,11 +385,11 @@ def test_enqueue_failure_rolls_back(client, monkeypatch, patch_redis, task_store
     assert "aborted" in row["fail_reason"]
 
     # 同 key 重试回放到该 FAILURE 而非重建；**回放必须把 FAILURE 如实报出来**
-    # （报成 QUEUED 会让客户端以为重试又排上了队，于是无限重试同一条死任务）
+    # （报成 queued 会让客户端以为重试又排上了队，于是无限重试同一条死任务）
     resp2 = client.post(PATH, json=BODY, headers=headers)
     assert resp2.json()["replayed"] is True
     assert resp2.json()["task_id"] == row["task_id"]
-    assert resp2.json()["status"] == "FAILURE"
+    assert resp2.json()["status"] == "failure"
     assert resp2.json()["created_at"] == row["created_at"]
 
 

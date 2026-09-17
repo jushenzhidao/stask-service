@@ -18,6 +18,7 @@ import re
 from urllib.parse import urlsplit
 
 from app.config import settings
+from app.errors import ErrorCode
 
 #: task_id 形态：{model_slug}_{uuid4hex}。查询/取消端点从 path 末段取
 #: 候选串时先用它预筛——避免把 ``/async/v1/images/generations`` 这种
@@ -57,14 +58,16 @@ def check_path(path: str) -> None:
     """
     for deny in settings.async_deny_prefixes:
         if deny and path.startswith(deny):
-            raise AdmissionError(403, f"path not allowed: {deny}", "path_denied")
+            raise AdmissionError(403, f"path not allowed: {deny}",
+                                 ErrorCode.PATH_DENIED)
     allows = settings.async_allow_prefixes
     if not allows:
-        raise AdmissionError(403, "no async path configured", "path_not_allowed")
+        raise AdmissionError(403, "no async path configured",
+                             ErrorCode.PATH_NOT_ALLOWED)
     for allow in allows:
         if allow and path.startswith(allow):
             return
-    raise AdmissionError(403, "path not in allowlist", "path_not_allowed")
+    raise AdmissionError(403, "path not in allowlist", ErrorCode.PATH_NOT_ALLOWED)
 
 
 def _host_matches(host: str) -> bool:
@@ -104,21 +107,22 @@ def resolve_upstream(header_value: str | None) -> str:
 
     if parts.scheme not in ("http", "https"):
         raise AdmissionError(400, "upstream scheme must be http or https",
-                             "upstream_invalid_scheme")
+                             ErrorCode.UPSTREAM_INVALID_SCHEME)
     # userinfo（user:pass@host）会让 host 解析产生歧义，也是 SSRF 常用绕过手法
     if parts.username or parts.password or "@" in parts.netloc:
         raise AdmissionError(400, "upstream must not contain userinfo",
-                             "upstream_userinfo")
+                             ErrorCode.UPSTREAM_USERINFO)
     if not parts.hostname:
-        raise AdmissionError(400, "upstream host missing", "upstream_invalid")
+        raise AdmissionError(400, "upstream host missing",
+                             ErrorCode.UPSTREAM_INVALID)
     if parts.query or parts.fragment:
         raise AdmissionError(400, "upstream must not contain query or fragment",
-                             "upstream_invalid")
+                             ErrorCode.UPSTREAM_INVALID)
 
     host = parts.netloc.lower()
     if not _host_matches(host):
         raise AdmissionError(400, f"upstream host not in allowlist: {host}",
-                             "upstream_not_allowed")
+                             ErrorCode.UPSTREAM_NOT_ALLOWED)
 
     return f"{parts.scheme}://{host}{parts.path.rstrip('/')}"
 

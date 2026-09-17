@@ -39,6 +39,8 @@ from __future__ import annotations
 import datetime as dt
 from collections.abc import Mapping
 
+from app.errors import ErrorCode
+
 #: 令牌 TTL 里必须为「执行 + 收尾」留出的余量（秒）。
 #: 与 ``modelpolicy._TOKENCEILING_MARGIN`` 同源同义：等待类机制都不能把
 #: 令牌 TTL 吃干，否则最后一段等待必然以 token_missing 收场。
@@ -92,19 +94,19 @@ def _parse_int(raw: str) -> int:
     if not text:
         raise ScheduleError(
             "X-Delay-Seconds must be a non-negative integer",
-            "invalid_delay", HEADER_DELAY,
+            ErrorCode.INVALID_DELAY, HEADER_DELAY,
         )
     try:
         value = int(text, 10)
     except ValueError as exc:
         raise ScheduleError(
             f"X-Delay-Seconds must be a non-negative integer, got {raw!r}",
-            "invalid_delay", HEADER_DELAY,
+            ErrorCode.INVALID_DELAY, HEADER_DELAY,
         ) from exc
     if value < 0:
         raise ScheduleError(
             f"X-Delay-Seconds must be non-negative, got {value}",
-            "invalid_delay", HEADER_DELAY,
+            ErrorCode.INVALID_DELAY, HEADER_DELAY,
         )
     return value
 
@@ -115,7 +117,7 @@ def _parse_after(raw: str, now: int) -> int:
     if not text:
         raise ScheduleError(
             "X-Execute-After must be a unix timestamp or RFC3339 datetime",
-            "invalid_execute_after", HEADER_EXECUTE_AFTER,
+            ErrorCode.INVALID_EXECUTE_AFTER, HEADER_EXECUTE_AFTER,
         )
 
     # 先试 unix 秒（纯数字）
@@ -133,7 +135,7 @@ def _parse_after(raw: str, now: int) -> int:
             raise ScheduleError(
                 f"X-Execute-After is not a valid unix timestamp or RFC3339 "
                 f"datetime: {raw!r}",
-                "invalid_execute_after", HEADER_EXECUTE_AFTER,
+                ErrorCode.INVALID_EXECUTE_AFTER, HEADER_EXECUTE_AFTER,
             ) from exc
         if parsed.tzinfo is None:
             parsed = parsed.replace(tzinfo=dt.UTC)
@@ -158,7 +160,7 @@ def parse(
     if delay_raw is not None and after_raw is not None:
         raise ScheduleError(
             "X-Delay-Seconds and X-Execute-After are mutually exclusive",
-            "conflicting_schedule_headers", HEADER_DELAY,
+            ErrorCode.CONFLICTING_SCHEDULE_HEADERS, HEADER_DELAY,
         )
 
     if delay_raw is not None:
@@ -168,7 +170,7 @@ def parse(
         if seconds > max_delay:
             raise ScheduleError(
                 f"delay {seconds}s exceeds max_delay_seconds ({max_delay}s)",
-                "delay_too_long", HEADER_DELAY,
+                ErrorCode.DELAY_TOO_LONG, HEADER_DELAY,
             )
         return now + seconds
 
@@ -181,7 +183,7 @@ def parse(
             raise ScheduleError(
                 f"X-Execute-After is {delta}s in the future, which exceeds "
                 f"max_delay_seconds ({max_delay}s)",
-                "delay_too_long", HEADER_EXECUTE_AFTER,
+                ErrorCode.DELAY_TOO_LONG, HEADER_EXECUTE_AFTER,
             )
         return scheduled_at
 

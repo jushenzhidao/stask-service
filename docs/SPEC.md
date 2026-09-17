@@ -129,9 +129,9 @@ metrics 默认**关**（无消费方）；停机 flush 在 `web lifespan` 与 `w
 
 | Method | Path | 功能 | 认证 | 请求 | 响应 |
 |---|---|---|---|---|---|
-| POST/PUT | `/async/{path:path}` | 提交任务 | Bearer | 原文 path/query/body；头 `Idempotency-Key`、`X-Callback-Url`、`X-Upstream-Base-Url`、`X-Delay-Seconds`、`X-Execute-After`、`X-Batch-Size`、`X-Batch-Wait`、`X-Batch-Key` | `202 {task_id,status,created_at,scheduled_at,batch_key,batch_state,replayed}` + `Location` |
-| GET | `/async/{path:path}`（末段为 task_id） | 查询/回放 | 无（task_id 即凭证） | `?wait=0..60` | `202` 进行中 / `200` 原生回放或 CANCELED 视图 / 重放上游错误码 / `410` 结果已清理 |
-| DELETE | `/async/{path:path}`（末段为 task_id） | 取消 | 无 | - | `200 {task_id,status:CANCELED}` / `409` |
+| POST/PUT | `/async/{path:path}` | 提交任务 | Bearer | 原文 path/query/body；头 `Idempotency-Key`、`X-Callback-Url`、`X-Upstream-Base-Url`、`X-Delay-Seconds`、`X-Execute-After`、`X-Batch-Size`、`X-Batch-Wait`、`X-Batch-Key` | `202 {task_id,status,created_at,updated_at,scheduled_at,batch_key,batch_state,replayed}` + `Location` + 状态头 |
+| GET | `/async/{path:path}`（末段为 task_id） | 查询/回放 | 无（task_id 即凭证） | `?wait=0..60` | `202` 进行中 / `200` 原生回放（JSON 体顶层注入 `status`）或 CANCELED 视图 / 重放上游错误码 / `410` 结果已清理；**三条分支均带状态头** |
+| DELETE | `/async/{path:path}`（末段为 task_id） | 取消 | 无 | - | `200 {task_id,status}` （`status` 恒 `canceled`） / `409` |
 | 其他方法 | `/async/{path:path}` | 方法准入 | - | - | `405` |
 | GET | `/healthz/live` | 存活探针（无依赖） | 无 | - | `200 {"status":"ok"}` |
 | GET | `/healthz/ready` | 就绪探针（DB / Redis 检查 + 配置上报） | 无 | - | `200`/`503` + checks |
@@ -169,13 +169,58 @@ metrics 默认**关**（无消费方）；停机 flush 在 `web lifespan` 与 `w
 `/admin/api/schedule` **必须挂在管理面**：批次归组键在 `token_model` 维度下含
 token_hash 前缀、也可能是客户端自定义串，暴露给任意已鉴权调用者等于泄露别人家的 key 指纹。
 
-错误响应统一 `{"error": {"message","type","param","code"}}`。
+错误响应统一 `{"error": {"message","type","param","code"}}`；**终态** JSON 响应体顶层另有 `status`。
+`error.code` 的**全部**取值见 `app/errors.py` 的 `ErrorCode`（单一事实源，由
+`tests/test_guards.py` 的门禁禁止裸字面量回流）。
+
+### 状态形态（锁定）
+
+- **对外**（HTTP 响应体、回调体、状态头）恒为**小写**：`queued` / `in_progress` /
+  `success` / `failure` / `canceled`；
+- **库内** `tasks.status` 列恒为**大写** new-api 原生枚举（ADR-006：上游看板与
+  SQL 巡检按大写读）。两套形态由 `app/schemas.py` 的 `public_status` 单点转换，
+  绝不可把小写值写回库或写进状态影子缓存——CAS 的 `status IN (...)` 大小写敏感，
+  写错会静默匹配不到任何行（表现是状态卡死，不报错）；
+- 三条响应分支**都**带状态头，二进制结果体（音频/图片）靠它获取机器可读状态：
+
+| 头 | 值 |
+|---|---|
+| `X-Stask-Task-Status` | 小写状态形态 |
+| `X-Stask-Task-Id` | task_id |
+| `X-Stask-Upstream-Status` | 上游状态码；本地失败（`upstream_status=0`）时省略 |
+| `X-Stask-Result-Expired` | `410` 时置 `true` |
+| `X-Stask-Idempotent-Replay` | 幂等回放时置 `true` |
+
+**不提供兼容模式**（2026-09-17 裁决）：不做双形态（同一响应同时给出两种大小写）、
+不做路径 / 参数版本化、不做入参大小写宽松解析。旧的按大写比较的客户端**必须**自行适配。
+任何「为了兼容而同时输出两套形态」的改动都不要提——两套形态一旦并存就会各自漂移，
+「唯一事实源」这句话也就失去了意义。
+
+**客户端判定矩阵**：
+
+| 情形 | HTTP | 响应体 |
+|---|---|---|
+| 排队 / 计划中 / 批次等待 | `202` | `status` = `queued` |
+| 执行中 | `202` | `status` = `in_progress` |
+| 成功 | `200` | 上游原文；JSON 体顶层注入 `status` = `success` |
+| 失败（有上游响应） | 重放上游码 | 上游原文；JSON 体顶层注入 `status` = `failure` |
+| 失败（无上游响应） | `502`，或 `upstream_status>=400` 时用该码 | `error.code` = `upstream_no_body`，顶层 `status` = `failure` |
+| 结果已过 TTL | `410` | `error.code` = `result_expired`，顶层 `status` = 任务真实状态 |
+| 已取消 | `200` | `status` = `canceled` |
+
+**状态注入的作用范围**：仅 **JSON** 结果体注入顶层 `status`（判定以 `Content-Type`
+为准，不做内容嗅探）；非 JSON 体（音频/图片/纯文本）保持**字节级一致**，状态只走
+响应头。往二进制体里加字段等于损坏制品，故这是硬边界。
+JSON 体的**其他**键值全部保留；顶层 `status` **冲突时以本服务的实际状态为准**
+（客户端要的正是它），上游原值不会丢失——`data.upstream_response` 里仍是不含注入的
+原样副本，管理面可查。判定失败（解析不出对象/不是 JSON）一律退回原样，回放路径
+**绝不**因为注入失败而报错。
 
 **幂等回放的回报口径**（`POST` 带 `Idempotency-Key` 命中已有 task_id 时）：
-响应里的 `status` / `created_at` / `scheduled_at` / `batch_key` / `batch_state`
+响应里的 `status` / `created_at` / `updated_at` / `scheduled_at` / `batch_key` / `batch_state`
 **全部是库里那一行的原始值**，本次请求携带的调度头与分批头一律不生效，
 `replayed=true` 标明这是回放。含义：若命中的任务已经结束（FAILURE/SUCCESS/CANCELED），
-响应里就是那个**终态**——不得粉饰成 `QUEUED`，也不得用回放时刻冒充创建时刻；
+响应里就是那个**终态**——不得粉饰成 `queued`，也不得用回放时刻冒充创建时刻；
 否则客户端会把一条早已死掉的任务当成"刚入队、正在跑"，在同一个 key 上无限重试。
 （要真正发起一次新的尝试，客户端必须换一个 `Idempotency-Key` 或去掉该头。）
 
@@ -196,8 +241,8 @@ token_hash 前缀、也可能是客户端自定义串，暴露给任意已鉴权
 | 列 | 说明 |
 |---|---|
 | `task_id` / `platform` / `action` | 见上 |
-| `status` | `QUEUED` / `IN_PROGRESS` / `SUCCESS` / `FAILURE` / `CANCELED`（new-api 原生枚举） |
-| `progress` | new-api 兼容列，本服务恒 `'0%'` |
+| `status` | **库内**为 `QUEUED` / `IN_PROGRESS` / `SUCCESS` / `FAILURE` / `CANCELED`（new-api 原生枚举）；对外一律小写，见 §5「状态形态」 |
+| `progress` | new-api 兼容列。入队 `'0%'`，**任一终态置 `'100%'`**（含 FAILURE / CANCELED——停在 `0%` 会让看板以为任务还在跑） |
 | `fail_reason` | 失败原因；new-api 的 `GetResultURL()` 先读 `result_url`，为空才回落它 |
 | `user_id` | 归属信息，**可为 0**（`AUTH_MODE=generic` 时为 0）；不参与计费 |
 | `channel_id` / `quota` | 见上 |
@@ -297,13 +342,14 @@ token_hash 前缀、也可能是客户端自定义串，暴露给任意已鉴权
 | AC-16b | 分流 | When 连接层失败（请求**未到达**上游，重试零副作用），系统**必须**按 `RETRY_MAX_CONNECT`（默认 2）退避重试；耗尽后落 `FAILURE`（`upstream unreachable`） | P0 |
 | AC-17 | 分流 | When 上游调用超时或传输中断（请求已发出、结果拿不回），系统**必须**落 `FAILURE`（`upstream timeout/broken`）、`upstream_status=0`，且**不得**重试 | P0 |
 | AC-18 | 释放 | When 任务进入终态，系统**必须**按 `slot_flags` 掩码**恰好**归还它占过的层、清除令牌会话；**绝不**按当前配置重算层数（那会还掉别人的槽） | P0 |
-| AC-19 | 查询 | While 任务为 `QUEUED` / `IN_PROGRESS`，系统**必须**返回 `202` + `{task_id,status,created_at}` | P0 |
-| AC-20 | 回放 | While 任务为 SUCCESS，系统**必须**返回 `200` + 字节级一致的上游响应体与原 Content-Type | P0 |
-| AC-21 | 回放 | While 任务为 FAILURE 且有上游状态码，系统**必须**重放该状态码与原文 | P0 |
-| AC-22 | 回放 | If 结果已被 TTL 清理，系统**必须**返回 `410` + `{"error":{...}}` | P0 |
-| AC-22b | 回放 | While 任务为 CANCELED，系统**必须**返回 `200` + 状态视图（它从未调用上游，无原文可放，也不是失败） | P0 |
+| AC-19 | 查询 | While 任务为 `QUEUED` / `IN_PROGRESS`，系统**必须**返回 `202` + `{task_id,status,created_at,updated_at}`，`status` 为**小写**形态，并带 `X-Stask-Task-Status` 头 | P0 |
+| AC-20 | 回放 | While 任务为 SUCCESS 且上游响应为 **JSON**，系统**必须**返回 `200` + 原 Content-Type，**保留上游原文的全部键值**并在顶层追加 `status`（小写）；上游响应为**非 JSON**（音频/图片/纯文本）时**必须**字节级原样回放、**不得**注入任何字段 | P0 |
+| AC-20b | 回放 | 三条响应分支（202 进行中 / 200 回放 / 重放错误码与 410）**必须**一律带 `X-Stask-Task-Status` 与 `X-Stask-Task-Id` 头——二进制结果体承载不了 `status` 字段，头是客户端获取机器可读状态的唯一通道 | P0 |
+| AC-21 | 回放 | While 任务为 FAILURE 且有上游状态码，系统**必须**重放该状态码与原文；JSON 原文的键值**必须**原样保留并顶层追加 `status`=`failure` | P0 |
+| AC-22 | 回放 | If 结果已被 TTL 清理，系统**必须**返回 `410` + `{"error":{...},"status":<任务真实状态>}` + `X-Stask-Result-Expired: true` | P0 |
+| AC-22b | 回放 | While 任务为 CANCELED，系统**必须**返回 `200` + 状态视图（`status`=`canceled`；它从未调用上游，无原文可放，也不是失败） | P0 |
 | AC-23 | 长轮询 | While `?wait=N`（0<N≤60）且任务在窗口内转终态，系统**必须**立即返回终态响应 | P1 |
-| AC-24 | 取消 | While 任务为 `QUEUED`，系统**必须**迁移为 `CANCELED` 并按掩码释放槽，零资金动作 | P0 |
+| AC-24 | 取消 | While 任务为 `QUEUED`，系统**必须**迁移为 `CANCELED`（库内大写）并按掩码释放槽，零资金动作；对外响应 `status`=`canceled` | P0 |
 | AC-25 | 取消 | While 任务为 `IN_PROGRESS`，系统**必须**返回 `409` | P0 |
 | AC-26 | 兜底收敛 | While 任务超龄无进展、派发锁已过期且 `dispatch_epoch=0`（消息丢失），系统**必须**重投，且**必须**按是否持槽分流：已持槽（`slot_flags>0`）直接重投，未持槽（批次成员 / 计划任务）走 `dispatch.release` 占槽——**不得**绕过三层闸门直接投递 | P0 |
 | AC-27 | 兜底收敛 | While 任务超龄无进展、派发锁已过期且 `dispatch_epoch>0`（已派发过，结果不可得），系统**必须**判死 `FAILURE`，**不得**重投 | P0 |
@@ -637,6 +683,8 @@ curl -s "http://127.0.0.1:8000/admin/api/schedule" -H "X-Admin-Key: $ADMIN_KEY" 
 | **2026-09-13** | **`taskstore.py` 拆成包（纯结构变更）** | 单文件 1163 行，远超可读区间；文件内原有的「写 / 读」两处分节注释已经暗示了真实的关注点边界 | `app/services/taskstore.py` → `app/services/taskstore/`：`__init__.py`（**全量再导出**原命名空间，契约不变）+ `_base` / `_projection` / `_write` / `_batch` / `_read` / `_sweeper` / `_admin_query`，**最大单文件 255 行**。每个函数体经 AST 比对**逐字未变**、54 个顶层名字零丢失。配套：`conftest` 的测试替身改为 patch「包 + `pkgutil` 自动枚举的子模块」（包内跨模块调用的绑定在子模块命名空间里，只 patch 包够不着 → 会静默打真库）；注册表守卫补「再导出完整性」与「再导出但包外无调用方」两条；孤儿守卫的限定前缀改为「消费者实际会写的包名」；同步 README 文件树、`models.py` docstring、PRD / ARCH 的路径引用 |
 
 | **2026-09-13** | **生产「忘配就静默失去保护」三面收口（P4）** | 复核发现致命启动校验在**生产默认不生效**：`Dockerfile` 不注入任何 ENV、compose 也不设 `APP_ENV`，容器里 `APP_ENV` 恒为配置默认值 `dev` → `CHANNEL_ID` / taskiq-admin 两条 fail-fast 形同虚设；且 `_STRICT_ENVS` 是 **fail-open**（`APP_ENV=prodd` 拼错即静默宽松）；另有 `CALLBACK_SECRET` 为空时回调**不带签名**，与 AC-29「必须签名」直接冲突且无任何启动提醒 | ① `main.py` 的严格判定改为 **fail-closed**（`_LENIENT_ENVS` 白名单之外一律严格，含拼错与置空）；② 新增 `_check_callback_secret()`：严格环境空密钥阻断启动（沿用 `CHANNEL_ID` 同一口径）；③ `Dockerfile` 加 `ENV APP_ENV=prod`（镜像即生产产物）；④ compose 加 `APP_ENV: ${APP_ENV:?...}`（沿用既有必填惯用法，缺失即解析失败）；⑤ AC-29 措辞补上该前置条件；⑥ `.env.example` 写明 fail-closed 语义与生产必须显式声明 |
+
+| **2026-09-17** | **对外状态形态统一（小写 + 状态旁路头 + 终态 JSON 注入 `status`）** | 客户端此前无法机械读取任务状态：三条响应分支里只有 202 与 CANCELED 在 body 里带 `status`，成功/失败走回放、body 里没有该字段，客户端只能靠「HTTP 码 + body 形态」二分猜；二进制结果体（音频/图片）根本没有承载 `status` 的位置；提交响应的 202 还可能代表「命中终态回放」（AC-60b），语义过载。另有两处既存缺陷：SPEC §6 写 `progress` 恒 `0%` 而代码在任一终态置 `100%`（文档漂移）；`error.code` 有 8 处裸字面量散在 4 个文件，「本服务可能返回哪些码」无法枚举 | ① `app/schemas.py` 增 `public_status`：大写原生枚举 → 客户端小写形态的**单点**映射（库内与状态影子缓存恒大写，绝不可写回——CAS 的 `status IN (...)` 大小写敏感，写错会静默匹配不到行）；② 三条分支都挂 `X-Stask-Task-Status` / `X-Stask-Task-Id` / `X-Stask-Upstream-Status` / `X-Stask-Result-Expired` / `X-Stask-Idempotent-Replay`（响应头不在 AC-20 承诺内，二进制体靠它取状态）；③ 终态 **JSON** 结果体顶层注入 `status`，**非 JSON 体保持字节级一致**（判定以 `Content-Type` 为准，不做内容嗅探；注入即损坏二进制制品）；本地失败与 410 的 error 形制补顶层 `status`；④ 202 视图与提交响应补 `updated_at`（客户端据此区分「持续推进」与「卡死」）；⑤ `app/errors.py` 增 `ErrorCode` 收敛全部错误码，`tests/test_guards.py::test_error_codes_are_centralized` 以 AST 禁止裸字面量回流（含 f-string 静态片段——纯文本匹配必然漏，已用变异探针自证）；⑥ 修订 AC-19 / AC-20 / AC-21 / AC-22 / AC-22b / AC-24，新增 AC-20b，补 §5「状态形态」与「客户端判定矩阵」，修正 §6 `progress` 漂移；⑦ 回调体同步小写（HTTP 响应与回调是同一对外口径），内部 taskiq 摘要保持大写；⑧ **不做兼容模式**——不双写两种形态、不做路径 / 参数版本化、不做入参大小写宽松解析（裁决「无需兼容旧版本」），旧客户端须自行适配 |
 
 > **历史行保留原样（append-only）。** 上表中 `ref_price` / ADR-003、`SUBMITTED`、
 > `reconcile_*`、`inflight_slot` 等描述所对应的机制均已失效——去计费化（v0.2 起）

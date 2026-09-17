@@ -14,6 +14,9 @@
   sweep_stale 兜底重投覆盖，不需要独立状态表达；
 - new-api 的 ``ToVideoStatus`` 把 QUEUED 归为 queued，共享表里的行对
   上游工具（看板、SQL 巡检）保持可读（ADR-006）。
+
+**大小写分层（两套形态、一个事实源）**：库内与内部传递恒为大写原生枚举；
+客户端与回调接收方看到的恒为小写，由 ``public_status()`` 单点转换。
 """
 
 from __future__ import annotations
@@ -32,10 +35,35 @@ CANCELED = "CANCELED"
 
 #: 活跃（非终态）——CAS 迁移的合法起点
 ACTIVE: tuple[str, ...] = (QUEUED, IN_PROGRESS)
-#: worker 领取前的可取消状态
+#: worker 领取前的可取消状态（语义是「可取消」而非「待处理」——它正是 cancel
+#: 与 execute 两条 CAS 路径的分界）
 PENDING: tuple[str, ...] = (QUEUED,)
 #: 终态——不可逆
 TERMINAL: tuple[str, ...] = (SUCCESS, FAILURE, CANCELED)
+
+#: 库内大写原生枚举 → **客户端小写形态**的**唯一**映射（勿在别处另写一份）。
+#:
+#: 分界很关键：``tasks`` 表与 new-api 共写，落库值与 Redis/回调无关的一切内部
+#: 传递恒为大写原生枚举（ADR-006：上游看板与 SQL 巡检按大写读）；小写只发生在
+#: **对外塑形**这一步，即 HTTP 响应体与回调体。因此本映射**绝不可**用于写库、
+#: 写 ``statuscache`` 或参与 CAS——``status IN :froms`` 是大小写敏感的，
+#: 一旦有值以小写写回，CAS 会静默匹配不到任何行（不报错，表现为状态卡死）。
+_PUBLIC_STATUS: dict[str, str] = {
+    QUEUED: "queued",
+    IN_PROGRESS: "in_progress",
+    SUCCESS: "success",
+    FAILURE: "failure",
+    CANCELED: "canceled",
+}
+
+
+def public_status(status: str) -> str:
+    """对外状态形态：小写（客户端与回调接收方看到的值）。
+
+    未知值退化为 ``lower()`` 而非报错：``tasks`` 表与 new-api 共写，上游工具
+    可能写入本服务枚举之外的值，此时把原值小写返回，比让查询路径抛 500 更合适。
+    """
+    return _PUBLIC_STATUS.get(status, status.lower())
 
 
 class SubmitPlan(BaseModel):

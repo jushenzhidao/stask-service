@@ -305,7 +305,7 @@ async def test_cancel_delayed_task_unqueues(client, task_store, patch_redis):
 
     resp = client.delete(f"{PATH}/{task_id}")
     assert resp.status_code == 200
-    assert resp.json()["status"] == "CANCELED"
+    assert resp.json()["status"] == "canceled"
     assert float(await patch_redis.zscore(K_DUE, task_id) or 0) == 0
 
 
@@ -420,7 +420,7 @@ def test_response_unchanged_when_no_new_headers(client, task_store):
     assert body["batch_key"] == "", "无批次 → 空串（PRD R-20）"
     assert body["batch_state"] == "", "无批次 → 空串（PRD R-20）"
     assert body["replayed"] is False
-    # 既有字段语义不变
-    assert body["status"] == "QUEUED"
-    assert set(body) >= {"task_id", "status", "created_at", "replayed"}
+    # 既有字段语义不变（形态自 2026-09-17 起统一为小写）
+    assert body["status"] == "queued"
+    assert set(body) >= {"task_id", "status", "created_at", "updated_at", "replayed"}
     assert resp.headers["Location"].endswith(body["task_id"])

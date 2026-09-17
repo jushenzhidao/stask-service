@@ -46,6 +46,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from app.config import settings
+from app.errors import ErrorCode
 from app.logging import log
 from app.redis import (
     K_BATCH,
@@ -140,22 +141,22 @@ def parse_overrides(
 
     size: int | None = None
     if size_raw is not None:
-        size = _parse_positive_int(size_raw, code="invalid_batch_size",
+        size = _parse_positive_int(size_raw, code=ErrorCode.INVALID_BATCH_SIZE,
                                   header=HEADER_SIZE)
         if size > MAX_BATCH:
             raise BatchParamError(
                 f"X-Batch-Size {size} exceeds the maximum {MAX_BATCH}",
-                "invalid_batch_size", HEADER_SIZE,
+                ErrorCode.INVALID_BATCH_SIZE, HEADER_SIZE,
             )
 
     wait: int | None = None
     if wait_raw is not None:
-        wait = _parse_positive_int(wait_raw, code="invalid_batch_size",
+        wait = _parse_positive_int(wait_raw, code=ErrorCode.INVALID_BATCH_SIZE,
                                    header=HEADER_WAIT)
         if wait > max_wait:
             raise BatchParamError(
                 f"X-Batch-Wait {wait}s exceeds max_batch_wait_seconds ({max_wait}s)",
-                "batch_wait_too_long", HEADER_WAIT,
+                ErrorCode.BATCH_WAIT_TOO_LONG, HEADER_WAIT,
             )
 
     key: str | None = None

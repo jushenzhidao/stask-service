@@ -18,9 +18,9 @@ from fastapi.responses import JSONResponse, Response
 
 from app.deps import ratelimit
 from app.deps.auth import Caller, require_caller
-from app.errors import error_body
+from app.errors import ErrorCode, error_body
 from app.logging import log
-from app.schemas import QUEUED, SubmitPlan
+from app.schemas import QUEUED, SubmitPlan, public_status
 from app.services import (
     admission,
     batching,
@@ -46,7 +46,8 @@ def _normalize_path(path: str) -> str:
     """路由捕获的 path 不含前导斜杠，补上；同时拒绝路径穿越。"""
     normalized = "/" + path.lstrip("/")
     if ".." in normalized:
-        raise AdmissionError(400, "path traversal is not allowed", "path_traversal")
+        raise AdmissionError(400, "path traversal is not allowed",
+                             ErrorCode.PATH_TRAVERSAL)
     return normalized
 
 
@@ -196,11 +197,11 @@ async def submit_task(path: str, request: Request) -> Response:
         raise HTTPException(
             429,
             error_body(str(exc), "rate_limit_error",
-                       code=f"{exc.layer}_slot_exhausted"),
+                       code=ErrorCode.slot_exhausted(exc.layer)),
             headers={"Retry-After": str(await submit.retry_after_seconds(config))},
         ) from exc
 
-    # 幂等回放必须回报**库里那一行的原始事实**（排期 / 状态 / 创建时刻），
+    # 幂等回放必须回报**库里那一行的原始事实**（排期 / 状态 / 创建与更新时刻），
     # 不得因本次请求而重新排期（AC-60），也不得把终态任务粉饰成"新任务在排队"。
     #
     # 恒定 `status: QUEUED` 曾把客户端推进死循环：任务早已 FAILURE，客户端拿
@@ -211,6 +212,7 @@ async def submit_task(path: str, request: Request) -> Response:
     stored: dict[str, Any] = {}
     status = QUEUED
     created_at = taskstore.now()
+    updated_at = created_at
     if replayed:
         # 本次请求带的调度头/分批头一律不生效，所以回头读库里那一行，
         # 而不是用本次请求算出来的值（AC-60）。
@@ -226,7 +228,7 @@ async def submit_task(path: str, request: Request) -> Response:
                 409,
                 error_body(
                     "idempotency replay target no longer exists; resend to recreate it",
-                    "invalid_request_error", code="replay_target_missing",
+                    "invalid_request_error", code=ErrorCode.REPLAY_TARGET_MISSING,
                 ),
             )
         stored = existing.get("data") or {}
@@ -235,14 +237,17 @@ async def submit_task(path: str, request: Request) -> Response:
         # 创建时刻同理：`now()` 会用回放时刻冒充原始时刻，让一个几天前
         # 就结束的任务看起来是刚创建的。
         created_at = int((existing or {}).get("created_at") or 0) or created_at
+        updated_at = int((existing or {}).get("updated_at") or 0) or created_at
 
     location = f"/async{upstream_path}/{task_id}"
     return JSONResponse(
         status_code=202,
         content={
             "task_id": task_id,
-            "status": status,
+            # 对外小写形态；库内那一行恒为大写原生枚举（ADR-006 共存约束）
+            "status": public_status(status),
             "created_at": created_at,
+            "updated_at": updated_at,
             "scheduled_at": scheduled_at,
             "batch_key": stored.get("batch_key", "") or result.batch_key,
             # 与查询视图同口径：内部状态名不外漏（PRD R-20）
@@ -250,7 +255,10 @@ async def submit_task(path: str, request: Request) -> Response:
                 stored.get("batch_state", "") or result.batch_state),
             "replayed": replayed,
         },
-        headers={"Location": location},
+        headers={
+            **flow.status_headers(task_id, status, replayed=replayed),
+            "Location": location,
+        },
     )
 
 
@@ -275,7 +283,7 @@ async def get_task(
             422,
             error_body(
                 f"Input should be less than or equal to {config.poll_wait_max_seconds}",
-                "invalid_request_error", code="validation_error", param="wait",
+                "invalid_request_error", code=ErrorCode.VALIDATION, param="wait",
             ),
         )
     return await flow.view(task_id, wait_seconds=wait, config=config)

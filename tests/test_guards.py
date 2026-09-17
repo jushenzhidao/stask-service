@@ -313,3 +313,62 @@ def test_env_files_have_no_empty_value_with_inline_comment():
         "让「空 = 关闭」的开关静默失效。把注释移到上一行即可：\n  "
         + "\n  ".join(offenders)
     )
+
+
+#: ``error.code`` 的单一事实源模块——只有它允许出现码字面量
+_ERROR_CODE_SOURCE = "errors.py"
+
+
+def _error_code_literals(path):
+    """文件里出现的**字符串字面量**（含 f-string 的静态片段）。
+
+    用 AST 而不是正则：f-string 里的 ``f"{layer}_slot_exhausted"`` 在文本上
+    是 ``_slot_exhausted"``，前面并没有左引号，**纯文本匹配必然漏掉它**——
+    而那正是本次收敛要消灭的写法。AST 还会自然忽略注释，不会因为
+    「注释里提了一句某个码」而误报。
+    """
+    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    return [
+        (node.lineno, node.value)
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Constant) and isinstance(node.value, str)
+    ]
+
+
+def test_error_codes_are_centralized():
+    """对外 ``error.code`` 必须全部来自 ``errors.ErrorCode``，不得散落字面量。
+
+    背景：收敛前有 8 处裸字面量散在 4 个文件（``upstream_no_body`` /
+    ``result_expired`` / ``replay_target_missing`` / ``invalid_batch_size`` /
+    ``f"{layer}_slot_exhausted"`` 等）。危害不是「不好看」：客户端按 ``code``
+    分支决定重试策略，而「本服务一共可能返回哪些码」在散落状态下**无法被枚举**
+    ——新增一个码不会有任何东西提示要同步文档，ADR/SPEC 会静默漂移。
+
+    与项目既有不变式一致（枚举/键集必须单一常量派生），故加机械门禁。
+    """
+    from app.errors import ErrorCode
+
+    values = {
+        value for name, value in vars(ErrorCode).items()
+        if not name.startswith("_") and isinstance(value, str)
+    }
+    assert len(values) >= 15, (
+        f"只从 ErrorCode 读到 {len(values)} 个码值，守卫定位可能已失效"
+        "（类结构变了？码被挪到别处了？）"
+    )
+    # 后缀是拼接模板的一部分，单独出现即说明有人在自己拼码
+    watched = values | {ErrorCode.SLOT_EXHAUSTED_SUFFIX}
+
+    offenders: list[str] = []
+    for path in ROOT.glob("app/**/*.py"):
+        if path.name == _ERROR_CODE_SOURCE:
+            continue
+        rel = str(path.relative_to(ROOT / "app"))
+        for lineno, literal in _error_code_literals(path):
+            if literal in watched:
+                offenders.append(f"{rel}:{lineno}  {literal!r}")
+
+    assert not offenders, (
+        "以下位置把 error.code 写成了字面量（应改为 ErrorCode.<NAME>）：\n  "
+        + "\n  ".join(offenders)
+    )

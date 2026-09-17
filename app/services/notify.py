@@ -27,6 +27,7 @@ import httpx
 
 from app.config import settings
 from app.logging import log
+from app.schemas import public_status
 from app.services import httpc, taskstore
 
 _SIGNATURE_HEADER = "X-Stask-Signature"
@@ -93,7 +94,8 @@ async def deliver(task_id: str, attempt: int = 1) -> dict[str, Any]:
 
     payload = {
         "task_id": task_id,
-        "status": task["status"],
+        # 与 HTTP 响应同一小写形态（回调接收方也是客户端）；库内那一行仍是大写
+        "status": public_status(str(task["status"])),
         "created_at": task.get("created_at", 0),
         "finish_time": task.get("finish_time", 0),
         "upstream_status": int(data.get("upstream_status") or 0),

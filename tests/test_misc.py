@@ -201,7 +201,10 @@ async def test_callback_delivery_signs_request(task_store, patch_redis,
     assert req.headers["x-stask-timestamp"].isdigit()
     payload = json.loads(req.content)
     assert payload["task_id"] == task_id
-    assert payload["status"] == "SUCCESS"
+    # 回调体也是「对外形态」：与 HTTP 响应同一小写口径
+    assert payload["status"] == "success"
+    # 库内那一行仍是大写原生枚举（两者不是同一个东西）
+    assert task_store.rows[task_id]["status"] == "SUCCESS"
     # 回调体绝不含结果原文（可能好几 MB）
     assert "upstream_response" not in payload
     assert task_store.rows[task_id]["data"]["callback_delivered"] is True
