@@ -10,10 +10,13 @@
 
 from __future__ import annotations
 
+import time
+
 import httpx
 import pytest
 from taskiq import TaskiqResult
 
+from app import queue as queue_mod
 from app.queue import OutcomeMiddleware
 from app.services import execute, slots, tokensession
 from app.services.outcome import Outcome, TaskExecutionError, preview
@@ -320,3 +323,38 @@ async def test_failed_outcome_does_not_trigger_redelivery(task_store, patch_redi
 
     assert again["stage"] == "lock_held"
     assert len(route.calls) == 1
+
+
+async def test_middleware_ignores_ok_false_without_outcome_shape(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    """``ok=False`` 但不是 Outcome 形状（无 stage/task_id）的摘要——如 notify
+    回调推送的失败统计——绝不能让 ``Outcome(**...)`` 抛 TypeError。
+
+    2026-10-09 生产实测：notify 的 ``{"ok": False, ...}`` 摘要触发
+    ``missing 1 required positional argument: 'stage'``，且该异常发生在
+    post_execute 里会吞掉后续 admin 上报（面板恒无完成记录）。
+    """
+    monkeypatch.setattr(queue_mod, "HEARTBEAT_PATH", str(tmp_path / "hb"))
+    result = _result({"ok": False, "attempts": 5, "error": "callback exhausted"})
+
+    await OutcomeMiddleware().post_execute(None, result)  # type: ignore[arg-type]
+
+    assert result.error is None
+    assert result.is_err is False
+
+
+async def test_heartbeat_touched_on_post_execute(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    """每次任务执行后心跳文件必须刷新——healthcheck 靠它区分「没活干」
+    与「消费者僵死还在堆积」（2026-10-09 事故的直接防线）。"""
+    hb = tmp_path / "hb"
+    monkeypatch.setattr(queue_mod, "HEARTBEAT_PATH", str(hb))
+
+    before = int(time.time())
+    await OutcomeMiddleware().post_execute(None, _result(None))  # type: ignore[arg-type]
+
+    assert hb.exists()
+    assert int(hb.read_text()) >= before
+    assert int(hb.read_text()) <= int(time.time()) + 1

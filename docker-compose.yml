@@ -78,6 +78,13 @@ services:
 
   worker:
     <<: *app-base
+    # autoheal 容器重启带此标签的 unhealthy 容器。配合下面的消费活性探活：
+    # 消费者僵死（心跳断 + 队列积压）时自动拉起，不再依赖人肉发现。
+    labels:
+      - autoheal=true
+    volumes:
+      # 探活脚本从 repo 挂载，改脚本不必重建镜像
+      - ./deploy/worker_healthcheck.py:/usr/local/bin/worker_healthcheck.py:ro
     # scheduler 合并进 worker 进程 —— 它必须单副本（多份会重复触发 cron）。
     # 扩 worker 副本时：把 scheduler 拆成独立 service，worker 只跑 `taskiq worker`。
     #
@@ -103,13 +110,16 @@ services:
         wait "$$sched" "$$wk" 2>/dev/null || true
         exit "$$rc"
     healthcheck:
-      # worker 无 HTTP 端口，探 Redis 连通性代替（进程死了容器也会退出重启）
-      test: ["CMD", "python", "-c",
-             "import socket,os;u=os.environ.get('REDIS_URL','redis://redis:6379/0');h=u.split('//')[1].split('/')[0];p=h.split(':');socket.create_connection((p[0],int(p[1]) if len(p)>1 else 6379),timeout=2)"]
+      # 消费活性探活（deploy/worker_healthcheck.py）：心跳新鲜（每任务刷新，
+      # cron tick 每 30s 兜底）即 healthy；心跳断再看队列 lag——有积压 = 消费者
+      # 僵死判 unhealthy 交 autoheal 重启，没积压 = 真没活干保守放行。
+      # 旧探活只测「连得上 Redis 的 TCP」，消费者停摆 8 小时也恒 healthy
+      # （2026-10-09 事故）。旧镜像无心跳文件时脚本自动回退进程检查。
+      test: ["CMD", "python", "/usr/local/bin/worker_healthcheck.py"]
       interval: 30s
-      timeout: 5s
+      timeout: 10s
       retries: 3
-      start_period: 15s
+      start_period: 30s
 
   redis:
     image: redis:7-alpine

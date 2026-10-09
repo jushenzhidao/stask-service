@@ -36,6 +36,7 @@ broker = **RedisStreamBroker**（Redis Stream + consumer group，at-least-once�
 
 from __future__ import annotations
 
+import time
 from typing import Any
 
 import dataclasses
@@ -53,6 +54,22 @@ from app.services.outcome import Outcome, TaskExecutionError
 #: ``Outcome`` 的字段名集合——从 admin 回填的 dict 重建对象时过滤未知键，
 #: 避免任务体与本模块版本不一致（滚动升级窗口）时 TypeError。
 _OUTCOME_FIELDS = frozenset(f.name for f in dataclasses.fields(Outcome))
+
+#: 消费活性心跳文件：``post_execute`` 每次任务执行后刷新。cron 任务
+#: （tick 每 30s 一条）保证低流量期心跳也持续新鲜——healthcheck 用它区分
+#: 「真的没活干」与「消费者僵死还在堆积」（2026-10-09 事故：worker 消费
+#: 停摆 8 小时而 TCP 探活恒 healthy）。写失败静默忽略：心跳是增强信号，
+#: 绝不能因文件系统问题影响任务执行；缺失时 healthcheck 回退进程检查。
+HEARTBEAT_PATH = "/dev/shm/stask_worker_heartbeat"
+
+
+def _touch_heartbeat() -> None:
+    """刷新 worker 心跳时间戳（Unix 秒），healthcheck 每 30s 读一次。"""
+    try:
+        with open(HEARTBEAT_PATH, "w", encoding="ascii") as fh:
+            fh.write(str(int(time.time())))
+    except OSError:
+        pass
 
 QUEUE_NAME = f"{settings.redis_key_prefix}:taskiq"
 SCHED_PREFIX = f"{settings.redis_key_prefix}:sched"
@@ -134,10 +151,20 @@ class OutcomeMiddleware(TaskiqMiddleware):
     """
 
     async def post_execute(self, message: TaskiqMessage, result: TaskiqResult[Any]) -> None:
+        _touch_heartbeat()
         if result.error is not None:
             return  # 真异常已有错误对象，别覆盖真实堆栈
         value = result.return_value
-        if not isinstance(value, dict) or value.get("ok") is not False:
+        # 只有 ``execute_task`` 返回的 Outcome dict（``task_id``/``stage`` 双必填，
+        # 缺一构造即 TypeError——2026-10-09 面板上 notify 失败摘要触发过）才翻译
+        # 成面板错误；其余任务（notify 摘要等）的失败形状各不相同，交给各自的
+        # 落库/回调逻辑呈现，这里保持静默。
+        if (
+            not isinstance(value, dict)
+            or value.get("ok") is not False
+            or "stage" not in value
+            or "task_id" not in value
+        ):
             return
         outcome = Outcome(**{k: v for k, v in value.items() if k in _OUTCOME_FIELDS})
         result.error = TaskExecutionError(outcome)
